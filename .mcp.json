@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "sherpa": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--directory", ".", "python", "-m", "sherpa.server"]
+    }
+  }
+}
