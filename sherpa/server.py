@@ -2,7 +2,7 @@
 
 from fastmcp import FastMCP
 
-from sherpa.indexer import get_all_tools, index_if_changed
+from sherpa.indexer import get_all_tools, index_if_changed, PROJECT_ROOT
 
 mcp = FastMCP("sherpa")
 
@@ -66,14 +66,17 @@ def tool_search(query: str) -> dict:
         {
             "name": t["name"],
             "description": t["description"],
-            "categories": t["categories"],
             "path": t["path"],
-            "secrets": t.get("secrets", []),
         }
         for _, t in top
     ]
 
-    return {"results": results, "total": len(scored)}
+    return {
+        "usage": "Run `uv run <base_path>/<path> --help` for args, then invoke.",
+        "base_path": str(PROJECT_ROOT),
+        "results": results,
+        "total": len(scored),
+    }
 
 
 if __name__ == "__main__":
