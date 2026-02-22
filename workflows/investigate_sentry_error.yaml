@@ -25,17 +25,19 @@ steps:
   - tool: null
     action: "Present the changes to the user for review. Incorporate any feedback or suggestions before proceeding."
   - tool: null
-    action: "Run the full test suite to check for regressions."
+    action: "Run the test suite for the affected service/module only, not the entire backend."
 
   # ── Commit & PR ──
   - tool: null
-    action: "Stage changes and prepare a single commit message starting with the Jira ticket key, e.g. 'KB-1234: Fix null pointer in payment handler'. Present the message to the user for review/amendment before committing."
+    action: "Check the current git branch. If not on 'dev-complete', ask the user whether to continue on the current branch or switch to dev-complete first before creating the feature branch."
   - tool: null
-    action: "Ask the user which branch to push to (or confirm a suggested branch name, e.g. kb-1234/fix-payment-npe)."
+    action: "Stage changes and prepare a single commit message starting with the Jira ticket key, e.g. 'KB-1234: Fix null pointer in payment handler'. Do NOT include Co-Authored-By lines or any Claude Code references. Present the message to the user for review/amendment before committing."
+  - tool: null
+    action: "Ask the user which branch to push to (or confirm a suggested branch name using the Jira ticket key, e.g. KB-1234)."
   - tool: null
     action: "Push the branch to the remote."
   - tool: null
-    action: "Open a pull request with gh, linking the Jira ticket and Sentry issue in the description."
+    action: "Open a pull request with gh, linking the Jira ticket and Sentry issue in the description. Do NOT include any 'Generated with Claude Code' lines or Claude references in the PR body."
   - tool: jira_issues
     action: "Transition the Jira ticket to 'Ready for Review'"
     args: "--action transition --issue <TICKET_KEY> --status 'Ready for Review'"

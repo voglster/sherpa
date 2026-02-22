@@ -221,6 +221,9 @@ def cmd_create(args: argparse.Namespace) -> None:
         if args.description:
             fields["description"] = _md_to_adf(args.description)
 
+        # Required custom field: Customer (multiselect, defaults to GRAVITATE)
+        fields["customfield_10118"] = [{"value": "GRAVITATE"}]
+
         # Auto-assign if default is set and no explicit opt-out
         assignee_email = _resolve_assignee(None)
         if assignee_email:
