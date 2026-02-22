@@ -1,0 +1,41 @@
+name: investigate_sentry_error
+description: Investigate a Sentry error, write a fix with tests, and open a pull request.
+categories: [sentry, jira, debugging, triage, error-tracking, git, pr]
+steps:
+  # ── Triage ──
+  - tool: sentry_issues
+    action: "Fetch the Sentry issue details using the URL or issue ID"
+    args: "--url <sentry_url>"
+  - tool: null
+    action: "Analyze the error message and stacktrace. Identify root cause, affected files, and severity."
+  - tool: jira_issues
+    action: "Search Jira for existing tickets matching this error"
+    args: "--action search --jql 'text ~ \"<error_summary>\"'"
+  - tool: null
+    action: "If a matching ticket exists, note the ticket key (e.g. KB-1234). Otherwise, create one in the next step."
+  - tool: jira_issues
+    action: "Create a new Jira issue with the error summary, stacktrace, and Sentry link"
+    args: "--action create --project <PROJECT> --summary '<summary>' --description '<details>'"
+
+  # ── Fix ──
+  - tool: null
+    action: "Write a failing unit test that reproduces the bug before making any code changes."
+  - tool: null
+    action: "Implement the fix. Run the new test to confirm it passes."
+  - tool: null
+    action: "Present the changes to the user for review. Incorporate any feedback or suggestions before proceeding."
+  - tool: null
+    action: "Run the full test suite to check for regressions."
+
+  # ── Commit & PR ──
+  - tool: null
+    action: "Stage changes and prepare a single commit message starting with the Jira ticket key, e.g. 'KB-1234: Fix null pointer in payment handler'. Present the message to the user for review/amendment before committing."
+  - tool: null
+    action: "Ask the user which branch to push to (or confirm a suggested branch name, e.g. kb-1234/fix-payment-npe)."
+  - tool: null
+    action: "Push the branch to the remote."
+  - tool: null
+    action: "Open a pull request with gh, linking the Jira ticket and Sentry issue in the description."
+  - tool: jira_issues
+    action: "Transition the Jira ticket to 'Ready for Review'"
+    args: "--action transition --issue <TICKET_KEY> --status 'Ready for Review'"

@@ -1,8 +1,8 @@
-"""Sherpa MCP server — exposes tool_search for discovering tools."""
+"""Sherpa MCP server — exposes tool_search for discovering tools and workflows."""
 
 from fastmcp import FastMCP
 
-from sherpa.indexer import get_all_tools, index_if_changed, PROJECT_ROOT
+from sherpa.indexer import get_all_tools, get_all_workflows, index_if_changed, PROJECT_ROOT
 
 mcp = FastMCP("sherpa")
 
@@ -53,26 +53,39 @@ def tool_search(query: str) -> dict:
         return {"results": [], "total": 0}
 
     tools = get_all_tools()
+    workflows = get_all_workflows()
+
     scored = []
     for tool in tools:
         s = _score_tool(tool, tokens)
         if s > 0:
-            scored.append((s, tool))
+            scored.append((s, "tool", tool))
+
+    for wf in workflows:
+        s = _score_tool(wf, tokens)
+        if s > 0:
+            scored.append((s, "workflow", wf))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     top = scored[:10]
 
-    results = [
-        {
-            "name": t["name"],
-            "description": t["description"],
-            "path": t["path"],
+    results = []
+    for _, item_type, item in top:
+        entry = {
+            "name": item["name"],
+            "description": item["description"],
+            "type": item_type,
+            "path": item["path"],
         }
-        for _, t in top
-    ]
+        if item_type == "workflow":
+            entry["steps"] = item["steps"]
+        results.append(entry)
 
     return {
-        "usage": "Run `uv run <base_path>/<path> --help` for args, then invoke.",
+        "usage": (
+            "For tools: run `uv run <base_path>/<path> --help` for args, then invoke. "
+            "For workflows: follow the steps in order, executing each tool as described."
+        ),
         "base_path": str(PROJECT_ROOT),
         "results": results,
         "total": len(scored),
