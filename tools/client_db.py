@@ -10,6 +10,12 @@ categories: [database, mongodb, clients, debugging]
 secrets:
   - MONGO_RO_USERNAME
   - MONGO_RO_PASSWORD
+usage: |
+  search <QUERY>
+  collections --instance <KEY>
+  find --instance <KEY> --db <DB> --collection <COLL> [--filter '{}'] [--projection '{}'] [--limit 10] [--sort '{}'] [--rw]
+  count --instance <KEY> --db <DB> --collection <COLL> [--filter '{}'] [--rw]
+  aggregate --instance <KEY> --db <DB> --collection <COLL> --pipeline '[...]' [--rw]
 """
 
 import argparse

@@ -16,6 +16,8 @@ description: One-line summary of what this tool does.
 categories: [category1, category2]
 secrets:
   - SECRET_KEY_NAME
+usage: |
+  subcommand <POSITIONAL_ARG> [--flag VALUE]
 """
 
 import argparse
@@ -24,6 +26,7 @@ import sys
 
 def main():
     parser = argparse.ArgumentParser(description="One-line summary.")
+    # For tools with subcommands, use add_subparsers instead
     parser.add_argument("--arg", required=True, help="Describe the arg")
     args = parser.parse_args()
 
@@ -44,6 +47,7 @@ The module docstring is YAML with these fields:
 | `description` | Yes | One-line human-readable summary. Searched by `tool_search`. |
 | `categories` | Yes | List of lowercase tags for search grouping. |
 | `secrets` | No | List of vault key names the tool requires. |
+| `usage` | No | Multi-line CLI usage examples showing subcommands and args. Returned in `tool_search` results. |
 
 ## Conventions
 

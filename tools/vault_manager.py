@@ -7,6 +7,11 @@
 name: vault_manager
 description: Manage secrets in the Sherpa vault (~/.sherpa/vault.json).
 categories: [sherpa, secrets, configuration]
+usage: |
+  set <KEY> <VALUE>
+  get <KEY>
+  list
+  delete <KEY>
 """
 
 import argparse

@@ -9,6 +9,9 @@ description: Run a Pomodoro timer that manages Slack status, presence, and DND a
 categories: [slack, productivity, pomodoro, focus]
 secrets:
   - SLACK_USER_TOKEN
+usage: |
+  start [--work 25] [--break 5] [--status 'Custom status text']
+  stop
 """
 
 import argparse

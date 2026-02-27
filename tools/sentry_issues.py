@@ -9,6 +9,9 @@ description: Fetch and resolve issues from a self-hosted Sentry instance by URL
 categories: [sentry, debugging, error-tracking, issues]
 secrets:
   - SENTRY_AUTH_TOKEN
+usage: |
+  fetch <SENTRY_URL> [--base-url URL]
+  resolve <SENTRY_URL> [--base-url URL]
 """
 
 import argparse

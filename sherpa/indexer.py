@@ -41,7 +41,7 @@ def _parse_tool_metadata(filepath: Path) -> dict | None:
     if not all(k in meta for k in ("name", "description", "categories")):
         return None
 
-    return {
+    result = {
         "name": meta["name"],
         "description": meta["description"],
         "categories": meta["categories"],
@@ -49,6 +49,9 @@ def _parse_tool_metadata(filepath: Path) -> dict | None:
         "path": str(filepath.relative_to(PROJECT_ROOT)),
         "mtime": filepath.stat().st_mtime,
     }
+    if meta.get("usage"):
+        result["usage"] = meta["usage"]
+    return result
 
 
 def _parse_workflow_metadata(filepath: Path) -> dict | None:

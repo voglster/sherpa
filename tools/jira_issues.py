@@ -11,6 +11,13 @@ secrets:
   - JIRA_URL
   - JIRA_USERNAME
   - JIRA_API_TOKEN
+usage: |
+  get <ISSUE_KEY>
+  create --summary '<title>' [--project KEY] [--type Bug] [--parent KB-123] [--sprint]
+  update <ISSUE_KEY> [--summary '...'] [--description '...'] [--assignee email] [--labels L1 L2]
+  transition <ISSUE_KEY> --status '<status>'
+  search [--jql '<JQL>'] [--project KEY] [--status '<status>'] [--mine] [--current-sprint]
+  sprints [--board ID]
 """
 
 import argparse

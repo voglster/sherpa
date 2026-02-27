@@ -77,13 +77,15 @@ def tool_search(query: str) -> dict:
             "type": item_type,
             "path": item["path"],
         }
+        if item.get("usage"):
+            entry["usage"] = item["usage"]
         if item_type == "workflow":
             entry["steps"] = item["steps"]
         results.append(entry)
 
     return {
         "usage": (
-            "For tools: run `uv run <base_path>/<path> --help` for args, then invoke. "
+            "For tools: use the 'usage' field for CLI syntax, or run `uv run <base_path>/<path> --help`. "
             "For workflows: follow the steps in order, executing each tool as described."
         ),
         "base_path": str(PROJECT_ROOT),
