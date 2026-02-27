@@ -16,6 +16,7 @@ usage: |
   create --summary '<title>' [--project KEY] [--type Bug] [--parent KB-123] [--sprint]
   update <ISSUE_KEY> [--summary '...'] [--description '...'] [--assignee email] [--labels L1 L2]
   transition <ISSUE_KEY> --status '<status>'
+  comment <ISSUE_KEY> --body '<markdown text>'
   search [--jql '<JQL>'] [--project KEY] [--status '<status>'] [--mine] [--current-sprint]
   sprints [--board ID]
 """
@@ -426,6 +427,19 @@ def cmd_sprints(args: argparse.Namespace) -> None:
     print(json.dumps({"board_id": board_id, "sprints": output}, indent=2))
 
 
+def cmd_comment(args: argparse.Namespace) -> None:
+    with _client() as client:
+        resp = client.post(
+            f"/rest/api/3/issue/{args.issue_key}/comment",
+            json={"body": _md_to_adf(args.body)},
+        )
+        if resp.status_code not in (200, 201):
+            print(f"Failed to add comment: {resp.status_code} {resp.text}", file=sys.stderr)
+            sys.exit(2)
+        comment = resp.json()
+    print(json.dumps({"key": args.issue_key, "comment_id": comment["id"]}))
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -473,9 +487,25 @@ def main():
     p.add_argument("--current-sprint", action="store_true", help="Only issues in my active sprint")
     p.add_argument("--max-results", type=int, default=20, help="Max results (default: 20)")
 
+    # comment
+    p = sub.add_parser("comment", help="Add a comment to an issue")
+    p.add_argument("issue_key", help="Issue key (e.g. KB-123)")
+    p.add_argument("--body", required=True, help="Comment body (markdown)")
+
     # sprints
     p = sub.add_parser("sprints", help="List active/future sprints for your board")
     p.add_argument("--board", type=int, default=None, help="Board ID (default: vault JIRA_DEFAULT_BOARD)")
+
+    # Check for admin commands before argparse rejects them
+    admin_commands = {"epic", "subtask", "complete-subtask", "assign-subtask"}
+    if len(sys.argv) > 1 and sys.argv[1] in admin_commands:
+        cmd = sys.argv[1]
+        print(
+            f"Hint: '{cmd}' is available in jira_admin. "
+            f"Run: uv run tools/jira_admin.py {cmd} --help",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     args = parser.parse_args()
 
@@ -492,6 +522,8 @@ def main():
             cmd_search(args)
         case "sprints":
             cmd_sprints(args)
+        case "comment":
+            cmd_comment(args)
         case _:
             parser.print_help()
             sys.exit(1)
