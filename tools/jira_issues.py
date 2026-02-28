@@ -14,7 +14,7 @@ secrets:
 usage: |
   get <ISSUE_KEY>
   create --summary '<title>' [--project KEY] [--type Bug] [--parent KB-123] [--sprint]
-  update <ISSUE_KEY> [--summary '...'] [--description '...'] [--assignee email] [--labels L1 L2]
+  update <ISSUE_KEY> [--summary '...'] [--description '...'] [--assignee name] [--labels L1 L2] [--sprint]
   transition <ISSUE_KEY> --status '<status>'
   comment <ISSUE_KEY> --body '<markdown text>'
   search [--jql '<JQL>'] [--project KEY] [--status '<status>'] [--mine] [--current-sprint]
@@ -30,6 +30,7 @@ from pathlib import Path
 import httpx
 
 VAULT_PATH = Path.home() / ".sherpa" / "vault.json"
+USER_CACHE_PATH = Path.home() / ".sherpa" / "jira_users.json"
 
 
 def _load_vault() -> dict:
@@ -235,9 +236,7 @@ def cmd_create(args: argparse.Namespace) -> None:
         # Auto-assign if default is set and no explicit opt-out
         assignee_email = _resolve_assignee(None)
         if assignee_email:
-            resp = client.get("/rest/api/3/user/search", params={"query": assignee_email})
-            if resp.status_code == 200 and resp.json():
-                fields["assignee"] = {"id": resp.json()[0]["accountId"]}
+            fields["assignee"] = {"id": _resolve_account_id(assignee_email)}
 
         resp = client.post("/rest/api/3/issue", json={"fields": fields})
         if resp.status_code not in (200, 201):
@@ -302,30 +301,86 @@ def cmd_update(args: argparse.Namespace) -> None:
     if args.assignee:
         fields["assignee"] = {"id": _resolve_account_id(args.assignee)}
 
-    if not fields:
+    if not fields and not args.sprint:
         print("No fields to update", file=sys.stderr)
         sys.exit(1)
 
     with _client() as client:
-        resp = client.put(f"/rest/api/3/issue/{args.issue_key}", json={"fields": fields})
-        if resp.status_code not in (200, 204):
-            print(f"Failed to update issue: {resp.status_code} {resp.text}", file=sys.stderr)
-            sys.exit(2)
+        if fields:
+            resp = client.put(f"/rest/api/3/issue/{args.issue_key}", json={"fields": fields})
+            if resp.status_code not in (200, 204):
+                print(f"Failed to update issue: {resp.status_code} {resp.text}", file=sys.stderr)
+                sys.exit(2)
+
+        if args.sprint:
+            board_id = _resolve_board(None)
+            sprint = _find_my_sprint(client, board_id)
+            if not sprint:
+                print("No matching active sprint found", file=sys.stderr)
+                sys.exit(2)
+            move_resp = client.post(
+                f"/rest/agile/1.0/sprint/{sprint['id']}/issue",
+                json={"issues": [args.issue_key]},
+            )
+            if move_resp.status_code not in (200, 204):
+                print(f"Failed to add to sprint: {move_resp.status_code} {move_resp.text}", file=sys.stderr)
+                sys.exit(2)
+            print(f"Added to sprint: {sprint['name']}", file=sys.stderr)
+
     print(json.dumps({"key": args.issue_key, "status": "updated"}))
 
 
-def _resolve_account_id(email: str) -> str:
-    """Look up a Jira account ID by email address."""
+def _load_user_cache() -> dict:
+    return json.loads(USER_CACHE_PATH.read_text()) if USER_CACHE_PATH.exists() else {}
+
+
+def _save_user_cache(cache: dict) -> None:
+    USER_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    USER_CACHE_PATH.write_text(json.dumps(cache, indent=2))
+
+
+def _resolve_account_id(query: str) -> str:
+    """Resolve a name, email, or partial match to a Jira accountId.
+
+    Checks the local alias cache first, then falls back to the Jira API.
+    Single API matches are auto-cached; multiple matches cause an error
+    listing the options so the caller can refine.
+    """
+    # Cache check
+    cache = _load_user_cache()
+    cached = cache.get(query.lower())
+    if cached:
+        return cached["accountId"]
+
+    # API search
     with _client() as client:
-        resp = client.get("/rest/api/3/user/search", params={"query": email})
+        resp = client.get("/rest/api/3/user/search", params={"query": query})
         if resp.status_code != 200:
             print(f"Failed to search users: {resp.status_code} {resp.text}", file=sys.stderr)
             sys.exit(2)
         users = resp.json()
-        if not users:
-            print(f"No user found for: {email}", file=sys.stderr)
-            sys.exit(2)
+
+    if not users:
+        print(f"No users found for '{query}'", file=sys.stderr)
+        sys.exit(2)
+
+    if len(users) == 1:
+        entry = {
+            "accountId": users[0]["accountId"],
+            "displayName": users[0].get("displayName", ""),
+            "email": users[0].get("emailAddress", ""),
+        }
+        cache[query.lower()] = entry
+        _save_user_cache(cache)
         return users[0]["accountId"]
+
+    # Multiple matches — list them and exit
+    print(f"Multiple users match '{query}'. Please refine:", file=sys.stderr)
+    for u in users:
+        name = u.get("displayName", "?")
+        email = u.get("emailAddress", "")
+        print(f"  - {name}  {email}", file=sys.stderr)
+    sys.exit(2)
 
 
 def cmd_transition(args: argparse.Namespace) -> None:
@@ -472,6 +527,7 @@ def main():
     p.add_argument("--description", default=None, help="New markdown description")
     p.add_argument("--assignee", default=None, help="Assignee email")
     p.add_argument("--labels", nargs="+", default=None, help="Labels to set")
+    p.add_argument("--sprint", action="store_true", help="Move issue to your active sprint")
 
     # transition
     p = sub.add_parser("transition", help="Move issue to a new status")

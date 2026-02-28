@@ -13,9 +13,14 @@ secrets:
   - JIRA_API_TOKEN
 usage: |
   epic <ISSUE_KEY> --epic <EPIC_KEY>
-  subtask <PARENT_KEY> --type dev|validate|bug [--assignee email] [--summary '...']
+  subtask <PARENT_KEY> --type dev|validate|bug [--assignee name] [--summary '...']
   complete-subtask <PARENT_KEY> --type dev|validate
-  assign-subtask <PARENT_KEY> --type dev|validate --assignee <email>
+  assign-subtask <PARENT_KEY> --type dev|validate --assignee <name>
+  users <query>           Search Jira users and cache the match
+  users <query> --select N  Pick result N from ambiguous search to cache
+  users --alias <name> --account-id <id>  Create a custom alias
+  users --list            Show all cached user aliases
+  users --clear           Clear the user cache
 """
 
 import argparse
@@ -26,6 +31,7 @@ from pathlib import Path
 import httpx
 
 VAULT_PATH = Path.home() / ".sherpa" / "vault.json"
+USER_CACHE_PATH = Path.home() / ".sherpa" / "jira_users.json"
 
 SUBTASK_TYPES = {
     "dev": {"summary": "Dev", "issuetype": "Internal Sub-task"},
@@ -72,16 +78,61 @@ def _resolve_project(args_project: str | None) -> str:
     sys.exit(1)
 
 
-def _resolve_account_id(client: httpx.Client, email: str) -> str:
-    resp = client.get("/rest/api/3/user/search", params={"query": email})
+def _load_user_cache() -> dict:
+    return json.loads(USER_CACHE_PATH.read_text()) if USER_CACHE_PATH.exists() else {}
+
+
+def _save_user_cache(cache: dict) -> None:
+    USER_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    USER_CACHE_PATH.write_text(json.dumps(cache, indent=2))
+
+
+def _cache_user(cache: dict, query: str, user: dict) -> None:
+    """Cache a user entry keyed by the original query."""
+    entry = {
+        "accountId": user["accountId"],
+        "displayName": user.get("displayName", ""),
+        "email": user.get("emailAddress", ""),
+    }
+    cache[query.lower()] = entry
+    _save_user_cache(cache)
+
+
+def _resolve_account_id(client: httpx.Client, query: str) -> str:
+    """Resolve a name, email, or partial match to a Jira accountId.
+
+    Checks the local alias cache first, then falls back to the Jira API.
+    Single API matches are auto-cached; multiple matches cause an error
+    listing the options so the caller can refine.
+    """
+    # Cache check
+    cache = _load_user_cache()
+    cached = cache.get(query.lower())
+    if cached:
+        return cached["accountId"]
+
+    # API search
+    resp = client.get("/rest/api/3/user/search", params={"query": query})
     if resp.status_code != 200:
         print(f"Failed to search users: {resp.status_code} {resp.text}", file=sys.stderr)
         sys.exit(2)
     users = resp.json()
+
     if not users:
-        print(f"No user found for: {email}", file=sys.stderr)
+        print(f"No users found for '{query}'", file=sys.stderr)
         sys.exit(2)
-    return users[0]["accountId"]
+
+    if len(users) == 1:
+        _cache_user(cache, query, users[0])
+        return users[0]["accountId"]
+
+    # Multiple matches — list them and exit
+    print(f"Multiple users match '{query}'. Please refine:", file=sys.stderr)
+    for u in users:
+        name = u.get("displayName", "?")
+        email = u.get("emailAddress", "")
+        print(f"  - {name}  {email}", file=sys.stderr)
+    sys.exit(2)
 
 
 def _find_subtask(client: httpx.Client, parent_key: str, type_key: str) -> dict | None:
@@ -129,7 +180,6 @@ def cmd_subtask(args: argparse.Namespace) -> None:
             "parent": {"key": args.parent_key},
             "summary": summary,
             "issuetype": {"name": cfg["issuetype"]},
-            "customfield_10118": [{"value": "GRAVITATE"}],
         }
 
         assignee_email = args.assignee
@@ -175,6 +225,80 @@ def cmd_complete_subtask(args: argparse.Namespace) -> None:
             print(f"Failed to transition: {resp.status_code} {resp.text}", file=sys.stderr)
             sys.exit(2)
     print(json.dumps({"key": key, "parent": args.parent_key, "status": "Done"}))
+
+
+def cmd_users(args: argparse.Namespace) -> None:
+    if args.clear:
+        if USER_CACHE_PATH.exists():
+            USER_CACHE_PATH.unlink()
+        print("User cache cleared.")
+        return
+
+    if args.list:
+        cache = _load_user_cache()
+        if not cache:
+            print("No cached users.")
+            return
+        for alias, info in cache.items():
+            print(f"  {alias} → {info['displayName']}  {info.get('email', '')}")
+        return
+
+    # Explicit alias: cache a known accountId under a short name
+    if args.alias:
+        if not args.account_id:
+            print("--alias requires --account-id", file=sys.stderr)
+            sys.exit(1)
+        cache = _load_user_cache()
+        cache[args.alias.lower()] = {
+            "accountId": args.account_id,
+            "displayName": args.alias,
+            "email": "",
+        }
+        _save_user_cache(cache)
+        print(f"Cached alias: {args.alias} → {args.account_id}")
+        return
+
+    if not args.query:
+        print("Provide a search query, --list, or --clear", file=sys.stderr)
+        sys.exit(1)
+
+    with _client() as client:
+        resp = client.get("/rest/api/3/user/search", params={"query": args.query})
+        if resp.status_code != 200:
+            print(f"Failed to search users: {resp.status_code} {resp.text}", file=sys.stderr)
+            sys.exit(2)
+        users = resp.json()
+
+    if not users:
+        print(f"No users found for '{args.query}'")
+        return
+
+    cache = _load_user_cache()
+    results = []
+    for idx, u in enumerate(users, 1):
+        results.append({
+            "index": idx,
+            "displayName": u.get("displayName", ""),
+            "email": u.get("emailAddress", ""),
+            "accountId": u["accountId"],
+        })
+
+    # --select N: pick from search results and cache
+    if args.select is not None:
+        if args.select < 1 or args.select > len(users):
+            print(f"--select must be between 1 and {len(users)}", file=sys.stderr)
+            sys.exit(1)
+        picked = users[args.select - 1]
+        _cache_user(cache, args.query, picked)
+        print(f"Cached: {args.query} → {picked.get('displayName', '')}", file=sys.stderr)
+        print(json.dumps(results[args.select - 1], indent=2))
+        return
+
+    if len(users) == 1:
+        _cache_user(cache, args.query, users[0])
+        print(f"Cached: {args.query} → {users[0].get('displayName', '')}", file=sys.stderr)
+
+    print(json.dumps(results, indent=2))
 
 
 def cmd_assign_subtask(args: argparse.Namespace) -> None:
@@ -230,7 +354,16 @@ def main():
     p = sub.add_parser("assign-subtask", help="Reassign a subtask by type")
     p.add_argument("parent_key", help="Parent issue key (e.g. KB-123)")
     p.add_argument("--type", required=True, choices=["dev", "validate"], help="Subtask type to reassign")
-    p.add_argument("--assignee", required=True, help="New assignee email")
+    p.add_argument("--assignee", required=True, help="New assignee (name, email, or alias)")
+
+    # users
+    p = sub.add_parser("users", help="Search Jira users and manage the alias cache")
+    p.add_argument("query", nargs="?", default=None, help="Name or email to search")
+    p.add_argument("--list", action="store_true", help="Show all cached user aliases")
+    p.add_argument("--clear", action="store_true", help="Clear the user cache")
+    p.add_argument("--select", type=int, default=None, help="Pick result N from a search to cache (1-based)")
+    p.add_argument("--alias", default=None, help="Create a custom alias name")
+    p.add_argument("--account-id", default=None, help="Account ID to pair with --alias")
 
     args = parser.parse_args()
 
@@ -243,6 +376,8 @@ def main():
             cmd_complete_subtask(args)
         case "assign-subtask":
             cmd_assign_subtask(args)
+        case "users":
+            cmd_users(args)
         case _:
             parser.print_help()
             sys.exit(1)
