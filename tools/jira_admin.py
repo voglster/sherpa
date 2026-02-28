@@ -5,8 +5,8 @@
 # ///
 """
 name: jira_admin
-description: Advanced Jira operations - epic assignment, subtask management, and workflow automation
-categories: [jira, admin, project-management, workflow, subtasks, epic]
+description: Advanced Jira operations - epic assignment, subtask management, issue linking, and workflow automation
+categories: [jira, admin, project-management, workflow, subtasks, epic, linking]
 secrets:
   - JIRA_URL
   - JIRA_USERNAME
@@ -21,6 +21,9 @@ usage: |
   users --alias <name> --account-id <id>  Create a custom alias
   users --list            Show all cached user aliases
   users --clear           Clear the user cache
+  link <ISSUE_KEY> --relates <TARGET>   Create a 'Relates' link
+  link <ISSUE_KEY> --blocks <TARGET>    Create a 'Blocks' link
+  link <ISSUE_KEY> --type <NAME> --to <TARGET>  Create a custom link type
 """
 
 import argparse
@@ -321,6 +324,29 @@ def cmd_assign_subtask(args: argparse.Namespace) -> None:
     print(json.dumps({"key": key, "parent": args.parent_key, "assignee": args.assignee}))
 
 
+def cmd_link(args: argparse.Namespace) -> None:
+    if args.relates:
+        link_type, target = "Relates", args.relates
+    elif args.blocks:
+        link_type, target = "Blocks", args.blocks
+    elif args.link_type and args.to:
+        link_type, target = args.link_type, args.to
+    else:
+        print("Provide --relates, --blocks, or --type with --to", file=sys.stderr)
+        sys.exit(1)
+
+    with _client() as client:
+        resp = client.post("/rest/api/3/issueLink", json={
+            "type": {"name": link_type},
+            "inwardIssue": {"key": target},
+            "outwardIssue": {"key": args.issue_key},
+        })
+        if resp.status_code not in (200, 201):
+            print(f"Failed to link: {resp.status_code} {resp.text}", file=sys.stderr)
+            sys.exit(2)
+    print(json.dumps({"source": args.issue_key, "target": target, "type": link_type}))
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -365,6 +391,14 @@ def main():
     p.add_argument("--alias", default=None, help="Create a custom alias name")
     p.add_argument("--account-id", default=None, help="Account ID to pair with --alias")
 
+    # link
+    p = sub.add_parser("link", help="Link two issues")
+    p.add_argument("issue_key", help="Source issue key")
+    p.add_argument("--relates", default=None, help="Target for 'Relates' link")
+    p.add_argument("--blocks", default=None, help="Target for 'Blocks' link")
+    p.add_argument("--type", default=None, dest="link_type", help="Custom link type name")
+    p.add_argument("--to", default=None, help="Target for custom --type link")
+
     args = parser.parse_args()
 
     match args.command:
@@ -378,6 +412,8 @@ def main():
             cmd_assign_subtask(args)
         case "users":
             cmd_users(args)
+        case "link":
+            cmd_link(args)
         case _:
             parser.print_help()
             sys.exit(1)

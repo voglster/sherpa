@@ -287,6 +287,26 @@ def cmd_get(args: argparse.Namespace) -> None:
             "updated": fields.get("updated"),
             "description_text": _adf_to_text(fields.get("description")),
         }
+        links = []
+        for link in fields.get("issuelinks", []):
+            link_type = link.get("type", {})
+            if "outwardIssue" in link:
+                issue = link["outwardIssue"]
+                links.append({
+                    "direction": link_type.get("outward", ""),
+                    "key": issue["key"],
+                    "summary": issue["fields"].get("summary", ""),
+                    "status": issue["fields"].get("status", {}).get("name", ""),
+                })
+            elif "inwardIssue" in link:
+                issue = link["inwardIssue"]
+                links.append({
+                    "direction": link_type.get("inward", ""),
+                    "key": issue["key"],
+                    "summary": issue["fields"].get("summary", ""),
+                    "status": issue["fields"].get("status", {}).get("name", ""),
+                })
+        output["links"] = links
         print(json.dumps(output, indent=2))
 
 
