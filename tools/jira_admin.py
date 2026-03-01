@@ -24,6 +24,7 @@ usage: |
   link <ISSUE_KEY> --relates <TARGET>   Create a 'Relates' link
   link <ISSUE_KEY> --blocks <TARGET>    Create a 'Blocks' link
   link <ISSUE_KEY> --type <NAME> --to <TARGET>  Create a custom link type
+  weblink <ISSUE_KEY> --url <URL> [--title '...']  Attach an external URL to an issue
 """
 
 import argparse
@@ -347,6 +348,19 @@ def cmd_link(args: argparse.Namespace) -> None:
     print(json.dumps({"source": args.issue_key, "target": target, "type": link_type}))
 
 
+def cmd_weblink(args: argparse.Namespace) -> None:
+    title = args.title or args.url
+    with _client() as client:
+        resp = client.post(
+            f"/rest/api/3/issue/{args.issue_key}/remotelink",
+            json={"object": {"url": args.url, "title": title}},
+        )
+        if resp.status_code not in (200, 201):
+            print(f"Failed to add web link: {resp.status_code} {resp.text}", file=sys.stderr)
+            sys.exit(2)
+    print(json.dumps({"key": args.issue_key, "url": args.url, "title": title}))
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -399,6 +413,12 @@ def main():
     p.add_argument("--type", default=None, dest="link_type", help="Custom link type name")
     p.add_argument("--to", default=None, help="Target for custom --type link")
 
+    # weblink
+    p = sub.add_parser("weblink", help="Attach an external URL to an issue")
+    p.add_argument("issue_key", help="Issue key (e.g. KB-123)")
+    p.add_argument("--url", required=True, help="URL to attach")
+    p.add_argument("--title", default=None, help="Link title (defaults to the URL)")
+
     args = parser.parse_args()
 
     match args.command:
@@ -414,6 +434,8 @@ def main():
             cmd_users(args)
         case "link":
             cmd_link(args)
+        case "weblink":
+            cmd_weblink(args)
         case _:
             parser.print_help()
             sys.exit(1)

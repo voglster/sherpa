@@ -307,6 +307,16 @@ def cmd_get(args: argparse.Namespace) -> None:
                     "status": issue["fields"].get("status", {}).get("name", ""),
                 })
         output["links"] = links
+
+        # Fetch remote (web) links
+        rl_resp = client.get(f"/rest/api/3/issue/{args.issue_key}/remotelink")
+        web_links = []
+        if rl_resp.status_code == 200:
+            for rl in rl_resp.json():
+                obj = rl.get("object", {})
+                web_links.append({"title": obj.get("title", ""), "url": obj.get("url", "")})
+        output["web_links"] = web_links
+
         print(json.dumps(output, indent=2))
 
 
