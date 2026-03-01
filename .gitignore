@@ -20,5 +20,9 @@ vault.db
 *.swp
 *.swo
 
+# Scratch files
+gemini-share-*.md
+gemini_share_to_md.py
+
 # OS
 .DS_Store

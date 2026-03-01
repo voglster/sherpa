@@ -230,8 +230,11 @@ def cmd_create(args: argparse.Namespace) -> None:
         if args.description:
             fields["description"] = _md_to_adf(args.description)
 
-        # Required custom field: Customer (multiselect, defaults to GRAVITATE)
-        fields["customfield_10118"] = [{"value": "GRAVITATE"}]
+        # Required custom field: Customer (multiselect)
+        customer_field = _load_default("JIRA_CUSTOMER_FIELD_ID")
+        customer_value = _load_default("JIRA_CUSTOMER_VALUE")
+        if customer_field and customer_value:
+            fields[customer_field] = [{"value": customer_value}]
 
         # Auto-assign if default is set and no explicit opt-out
         assignee_email = _resolve_assignee(None)

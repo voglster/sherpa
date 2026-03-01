@@ -165,7 +165,7 @@ def cmd_epic(args: argparse.Namespace) -> None:
     with _client() as client:
         resp = client.put(
             f"/rest/api/3/issue/{args.issue_key}",
-            json={"fields": {"customfield_10014": args.epic}},
+            json={"fields": {_load_default("JIRA_EPIC_FIELD_ID") or "customfield_10014": args.epic}},
         )
         if resp.status_code not in (200, 204):
             print(f"Failed to set epic: {resp.status_code} {resp.text}", file=sys.stderr)

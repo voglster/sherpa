@@ -9,6 +9,7 @@ description: Fetch and resolve issues from a self-hosted Sentry instance by URL
 categories: [sentry, debugging, error-tracking, issues]
 secrets:
   - SENTRY_AUTH_TOKEN
+  - SENTRY_BASE_URL
 usage: |
   fetch <SENTRY_URL> [--base-url URL]
   resolve <SENTRY_URL> [--base-url URL]
@@ -24,7 +25,6 @@ from urllib.parse import urlparse, parse_qs
 import httpx
 
 VAULT_PATH = Path.home() / ".sherpa" / "vault.json"
-DEFAULT_BASE_URL = "https://sentry-dev.gravitate.energy"
 
 
 def _load_secret(key: str) -> str:

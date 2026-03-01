@@ -11,7 +11,7 @@ secrets:
   - SLACK_USER_TOKEN
 usage: |
   send --channel <name/id> --text 'Hello team!'
-  send --channel general --text 'Hey @(nathan salyar) check this out'
+  send --channel general --text 'Hey @(jane doe) check this out'
   dm --user <name/id> --text 'Hey, quick question...'
   channels [--filter general] [--refresh]
   users [--filter swap] [--refresh]
