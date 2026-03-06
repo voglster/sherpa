@@ -10,9 +10,11 @@ categories: [slack, messaging, communication]
 secrets:
   - SLACK_USER_TOKEN
 usage: |
-  send --channel <name/id> --text 'Hello team!'
+  send --channel <name> --text 'Hello team!'
+  send --channel-id C01ABC23DEF --text 'Hello team!'
   send --channel general --text 'Hey @(jane doe) check this out'
-  dm --user <name/id> --text 'Hey, quick question...'
+  dm --user <name> --text 'Hey, quick question...'
+  dm --user-id U01ABC23DEF --text 'Hey, quick question...'
   channels [--filter general] [--refresh]
   users [--filter swap] [--refresh]
 notes: |
@@ -34,7 +36,7 @@ CACHE_DIR = Path.home() / ".sherpa" / "cache"
 SLACK_ID_RE = re.compile(r"^[CGUWDBT][A-Z0-9]{8,}$")
 JIRA_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
 MENTION_RE = re.compile(r"@\(([^)]+)\)")
-RATE_LIMIT_THRESHOLD = 5  # seconds — auto-retry if Retry-After <= this
+RATE_LIMIT_THRESHOLD = 30  # seconds — auto-retry if Retry-After <= this
 
 
 def _load_secret(key: str) -> str:
@@ -93,6 +95,7 @@ def _handle_rate_limit(resp: httpx.Response) -> None:
         print(f"Rate limited, retrying in {retry_after}s...", file=sys.stderr)
         raise _RateLimitRetry(retry_after)
     print(f"Rate limited by Slack. Try again in {retry_after} seconds.", file=sys.stderr)
+    print(f"RETRY_AFTER:{retry_after}", file=sys.stderr)
     sys.exit(2)
 
 
@@ -222,17 +225,12 @@ def _find_user_matches(users: list[dict], query: str) -> list[dict]:
 
 async def _resolve_mention(client: httpx.AsyncClient, headers: dict, query: str) -> str:
     """Resolve a @(name) mention to a Slack user ID. Errors on ambiguity."""
-    # Try cache first
+    # Try cache first, fetch only if no cache exists
     users = _load_cache("users")
     if not users:
         users = await _fetch_all_users(client, headers)
 
     matches = _find_user_matches(users, query)
-
-    # Cache miss — refresh and retry
-    if not matches and users == _load_cache("users"):
-        users = await _fetch_all_users(client, headers)
-        matches = _find_user_matches(users, query)
 
     if not matches:
         print(f"User not found for mention: @({query})", file=sys.stderr)
@@ -266,9 +264,16 @@ async def _linkify_mentions(client: httpx.AsyncClient, headers: dict, text: str)
     return text
 
 
+async def _channel_info(client: httpx.AsyncClient, headers: dict, channel_id: str) -> dict:
+    """Look up a single channel by ID — 1 API call instead of paginating all channels."""
+    data = await _slack_get(client, headers, "https://slack.com/api/conversations.info", {"channel": channel_id})
+    ch = data.get("channel", {})
+    return {"id": ch["id"], "name": ch.get("name", channel_id)}
+
+
 async def _resolve_channel(client: httpx.AsyncClient, headers: dict, query: str) -> dict:
     if SLACK_ID_RE.match(query):
-        return {"id": query, "name": query}
+        return await _channel_info(client, headers, query)
 
     # Try cache first
     cached = _load_cache("channels")
@@ -277,13 +282,16 @@ async def _resolve_channel(client: httpx.AsyncClient, headers: dict, query: str)
         if match:
             return match
 
-    # Cache miss — fetch fresh and retry
-    fresh = await _fetch_all_channels(client, headers)
-    match = _search_channels(fresh, query)
-    if match:
-        return match
+    # No cache at all — do initial fetch
+    if not cached:
+        fresh = await _fetch_all_channels(client, headers)
+        match = _search_channels(fresh, query)
+        if match:
+            return match
 
+    # Channel not found — give actionable advice
     print(f"Channel not found: {query}", file=sys.stderr)
+    print("Hint: use --channel-id <ID> to skip name lookup, or run 'channels --refresh' to rebuild the cache.", file=sys.stderr)
     sys.exit(2)
 
 
@@ -298,13 +306,15 @@ async def _resolve_user(client: httpx.AsyncClient, headers: dict, query: str) ->
         if match:
             return match
 
-    # Cache miss — fetch fresh and retry
-    fresh = await _fetch_all_users(client, headers)
-    match = _search_users(fresh, query)
-    if match:
-        return match
+    # No cache at all — do initial fetch
+    if not cached:
+        fresh = await _fetch_all_users(client, headers)
+        match = _search_users(fresh, query)
+        if match:
+            return match
 
     print(f"User not found: {query}", file=sys.stderr)
+    print("Hint: use --user-id <ID> to skip name lookup, or run 'users --refresh' to rebuild the cache.", file=sys.stderr)
     sys.exit(2)
 
 
@@ -321,7 +331,10 @@ async def _cmd_send(args: argparse.Namespace) -> None:
     token = _load_secret("SLACK_USER_TOKEN")
     headers = {"Authorization": f"Bearer {token}"}
     async with httpx.AsyncClient() as client:
-        channel = await _resolve_channel(client, headers, args.channel)
+        if args.channel_id:
+            channel = await _channel_info(client, headers, args.channel_id)
+        else:
+            channel = await _resolve_channel(client, headers, args.channel)
         text = _linkify_jira_keys(args.text)
         text = await _linkify_mentions(client, headers, text)
         data = await _slack_post(client, headers, "https://slack.com/api/chat.postMessage", {
@@ -339,7 +352,10 @@ async def _cmd_dm(args: argparse.Namespace) -> None:
     token = _load_secret("SLACK_USER_TOKEN")
     headers = {"Authorization": f"Bearer {token}"}
     async with httpx.AsyncClient() as client:
-        user = await _resolve_user(client, headers, args.user)
+        if args.user_id:
+            user = {"id": args.user_id, "name": args.user_id}
+        else:
+            user = await _resolve_user(client, headers, args.user)
         dm_channel_id = await _open_dm(client, headers, user["id"])
         text = _linkify_jira_keys(args.text)
         text = await _linkify_mentions(client, headers, text)
@@ -406,11 +422,15 @@ def main():
     subparsers = parser.add_subparsers(dest="command")
 
     send_parser = subparsers.add_parser("send", help="Post a message to a channel")
-    send_parser.add_argument("--channel", required=True, help="Channel name or ID")
+    send_ch = send_parser.add_mutually_exclusive_group(required=True)
+    send_ch.add_argument("--channel", help="Channel name (resolved via lookup)")
+    send_ch.add_argument("--channel-id", help="Channel ID (skips name resolution)")
     send_parser.add_argument("--text", required=True, help="Message text")
 
     dm_parser = subparsers.add_parser("dm", help="Send a direct message to a user")
-    dm_parser.add_argument("--user", required=True, help="Username, display name, or user ID")
+    dm_user = dm_parser.add_mutually_exclusive_group(required=True)
+    dm_user.add_argument("--user", help="Username or display name (resolved via lookup)")
+    dm_user.add_argument("--user-id", help="User ID (skips name resolution)")
     dm_parser.add_argument("--text", required=True, help="Message text")
 
     channels_parser = subparsers.add_parser("channels", help="List channels")
