@@ -24,5 +24,9 @@ vault.db
 gemini-share-*.md
 gemini_share_to_md.py
 
+# Playwright CLI
+.playwright-cli/
+.playwright/
+
 # OS
 .DS_Store
