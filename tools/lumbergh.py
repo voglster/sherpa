@@ -8,6 +8,7 @@ name: lumbergh
 description: Manage Lumbergh session todos, scratchpad, and prompts via the local API
 categories: [lumbergh, session, todos, scratchpad, prompts]
 usage: |
+  sessions list
   [--session NAME] todos list
   [--session NAME] todos add "text" [--description "desc"]
   [--session NAME] todos done <index>
@@ -26,6 +27,7 @@ import argparse
 import json
 import os
 import sys
+from difflib import SequenceMatcher
 
 import httpx
 
@@ -72,10 +74,57 @@ def _detect_session(client: httpx.Client) -> str:
     return best_name
 
 
+def _get_session_names(client: httpx.Client) -> list[str]:
+    resp = _request(client, "get", "/api/sessions")
+    sessions = resp.json().get("sessions", [])
+    return [s.get("name") for s in sessions if s.get("name")]
+
+
+def _fuzzy_match(name: str, candidates: list[str], threshold: float = 0.6) -> str | None:
+    """Return the best fuzzy match for name among candidates, or None."""
+    # Check substring match first (e.g. 'sherpa' in 'project-sherpa')
+    sub_matches = [c for c in candidates if name.lower() in c.lower()]
+    if len(sub_matches) == 1:
+        return sub_matches[0]
+
+    # Fall back to sequence similarity
+    best, best_score = None, 0.0
+    for c in candidates:
+        score = SequenceMatcher(None, name.lower(), c.lower()).ratio()
+        if score > best_score:
+            best, best_score = c, score
+    return best if best_score >= threshold else None
+
+
 def resolve_session(args: argparse.Namespace, client: httpx.Client) -> str:
     if args.session:
-        return args.session
+        names = _get_session_names(client)
+        if args.session in names:
+            return args.session
+        # Try fuzzy match
+        suggestion = _fuzzy_match(args.session, names)
+        if suggestion:
+            print(f"Session '{args.session}' not found. Using closest match: '{suggestion}'", file=sys.stderr)
+            return suggestion
+        print(f"Session '{args.session}' not found. Available sessions:", file=sys.stderr)
+        for n in names:
+            print(f"  - {n}", file=sys.stderr)
+        sys.exit(1)
     return _detect_session(client)
+
+
+# ---------------------------------------------------------------------------
+# Sessions
+# ---------------------------------------------------------------------------
+
+def cmd_sessions_list(client: httpx.Client, _args: argparse.Namespace) -> None:
+    resp = _request(client, "get", "/api/sessions")
+    sessions = resp.json().get("sessions", [])
+    for s in sessions:
+        name = s.get("name", "?")
+        workdir = s.get("workdir", "")
+        print(f"  - {name}  ({workdir})", file=sys.stderr)
+    print(json.dumps(sessions))
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +279,11 @@ def main():
 
     resource_sub = parser.add_subparsers(dest="resource")
 
+    # --- sessions ---
+    sessions_parser = resource_sub.add_parser("sessions", help="Manage sessions")
+    sessions_sub = sessions_parser.add_subparsers(dest="action")
+    sessions_sub.add_parser("list", help="List all sessions")
+
     # --- todos ---
     todos_parser = resource_sub.add_parser("todos", help="Manage session todos")
     todos_sub = todos_parser.add_subparsers(dest="action")
@@ -285,6 +339,16 @@ def main():
         sys.exit(1)
 
     with _client() as client:
+        # Sessions commands don't need a resolved session
+        if args.resource == "sessions":
+            match args.action:
+                case "list":
+                    cmd_sessions_list(client, args)
+                case _:
+                    sessions_parser.print_help()
+                    sys.exit(1)
+            return
+
         session = resolve_session(args, client)
 
         match (args.resource, args.action):
@@ -314,7 +378,7 @@ def main():
                 cmd_prompts_set(session, client, args)
             case (resource, None):
                 # No action given — print help for the resource subparser
-                {"todos": todos_parser, "scratchpad": scratch_parser, "prompts": prompts_parser}[resource].print_help()
+                {"todos": todos_parser, "scratchpad": scratch_parser, "prompts": prompts_parser, "sessions": sessions_parser}[resource].print_help()
                 sys.exit(1)
             case _:
                 parser.print_help()
