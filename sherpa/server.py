@@ -1,8 +1,13 @@
-"""Sherpa MCP server — exposes tool_search for discovering tools and workflows."""
+"""Sherpa MCP server — exposes tool_search and tool_run for discovering and executing tools."""
+
+import json
+import shlex
+import subprocess
 
 from fastmcp import FastMCP
+from pathlib import Path
 
-from sherpa.indexer import get_all_tools, get_all_workflows, index_if_changed, PROJECT_ROOT
+from sherpa.indexer import get_all_tools, get_all_workflows, get_tool_by_name, index_if_changed, PROJECT_ROOT
 
 mcp = FastMCP("sherpa")
 
@@ -75,7 +80,6 @@ def tool_search(query: str) -> dict:
             "name": item["name"],
             "description": item["description"],
             "type": item_type,
-            "path": item["path"],
         }
         if item.get("usage"):
             entry["usage"] = item["usage"]
@@ -85,12 +89,77 @@ def tool_search(query: str) -> dict:
 
     return {
         "usage": (
-            "For tools: use the 'usage' field for CLI syntax, or run `uv run <base_path>/<path> --help`. "
-            "For workflows: follow the steps in order, executing each tool as described."
+            "For tools: run via tool_run(tool_name, args). Use the 'usage' field for arg syntax, "
+            "or call tool_run(name, '--help') for full help. "
+            "For workflows: follow the steps in order, executing each tool via tool_run."
         ),
-        "base_path": str(PROJECT_ROOT),
         "results": results,
         "total": len(scored),
+    }
+
+
+@mcp.tool()
+def tool_run(tool_name: str, args: str = "") -> dict:
+    """Run a Sherpa tool by name.
+
+    Executes the tool as a subprocess and returns its output. Use tool_search
+    to discover available tools first.
+    """
+    index_if_changed()
+
+    tool = get_tool_by_name(tool_name)
+    if not tool:
+        return {"success": False, "error": f"Tool '{tool_name}' not found", "hint": "Use tool_search to find available tools."}
+
+    # Pre-check secrets
+    required_secrets = tool.get("secrets", [])
+    if required_secrets:
+        vault_path = Path.home() / ".sherpa" / "vault.json"
+        vault = json.loads(vault_path.read_text()) if vault_path.exists() else {}
+        missing = [s for s in required_secrets if s not in vault]
+        if missing:
+            return {
+                "success": False,
+                "error": f"Missing secrets: {', '.join(missing)}",
+                "hint": f"Set them with: tool_run('vault_manager', 'set <KEY> <VALUE>') for each missing key.",
+            }
+
+    cmd = ["uv", "run", str(PROJECT_ROOT / tool["path"])] + shlex.split(args)
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, cwd=PROJECT_ROOT)
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": f"Tool '{tool_name}' timed out after 120 seconds", "tool": tool_name}
+
+    stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
+
+    # Check for MISSING_SECRET in stderr as fallback
+    if result.returncode != 0 and stderr:
+        for line in stderr.splitlines():
+            if line.startswith("MISSING_SECRET:"):
+                key = line.split(":", 1)[1].strip()
+                return {
+                    "success": False,
+                    "error": f"Missing secret: {key}",
+                    "hint": f"Set it with: tool_run('vault_manager', 'set {key} <VALUE>')",
+                    "tool": tool_name,
+                }
+
+    # Try to parse stdout as JSON
+    output = stdout
+    if stdout:
+        try:
+            output = json.loads(stdout)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    return {
+        "success": result.returncode == 0,
+        "exit_code": result.returncode,
+        "output": output,
+        "stderr": stderr or None,
+        "tool": tool_name,
     }
 
 

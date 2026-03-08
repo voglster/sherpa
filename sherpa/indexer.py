@@ -177,6 +177,17 @@ def index_if_changed() -> bool:
     return False
 
 
+def get_tool_by_name(name: str) -> dict | None:
+    """Look up a single tool by exact name. Returns the tool record or None."""
+    if not DB_PATH.exists():
+        return None
+    from tinydb import where
+
+    db = TinyDB(DB_PATH)
+    results = db.search(where("name") == name)
+    return results[0] if results else None
+
+
 def get_all_tools() -> list[dict]:
     """Return all tool records from the TinyDB index."""
     if not DB_PATH.exists():

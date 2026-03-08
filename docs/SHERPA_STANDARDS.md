@@ -74,8 +74,8 @@ The module docstring is YAML with these fields:
 1. Create `tools/<name>.py` following the template above.
 2. Ensure `name` in YAML docstring matches the filename (without `.py`).
 3. Add only the deps the tool needs to the PEP 723 block.
-4. Test: `uv run tools/<name>.py --help`
-5. Test: run with valid args, verify JSON stdout.
+4. Test: `tool_run("<name>", "--help")`
+5. Test: run with valid args via `tool_run("<name>", "<args>")`, verify JSON output.
 6. The tool will be auto-indexed on the next `tool_search` call.
 
 ---
@@ -128,5 +128,5 @@ steps:
 2. Ensure `name` matches the filename (without `.yaml`).
 3. Include at least `name`, `description`, `categories`, and `steps`.
 4. Verify each `tool` reference matches an existing tool name (or use `null`).
-5. Test: `uv run tools/reindex.py` and confirm the workflow appears.
+5. Test: reindex and confirm the workflow appears.
 6. Test: search for a relevant keyword via `tool_search` and verify the workflow is returned.
