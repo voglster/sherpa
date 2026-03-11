@@ -1,6 +1,7 @@
 """Sherpa MCP server — exposes tool_search and tool_run for discovering and executing tools."""
 
 import json
+import os
 import shlex
 import subprocess
 
@@ -99,11 +100,18 @@ def tool_search(query: str) -> dict:
 
 
 @mcp.tool()
-def tool_run(tool_name: str, args: str = "") -> dict:
+def tool_run(tool_name: str, args: str = "", cwd: str = "") -> dict:
     """Run a Sherpa tool by name.
 
     Executes the tool as a subprocess and returns its output. Use tool_search
     to discover available tools first.
+
+    Args:
+        tool_name: Name of the tool to run.
+        args: CLI arguments to pass to the tool.
+        cwd: Optional caller working directory hint. Passed to the tool as
+             SHERPA_CALLER_CWD so tools like lumbergh can detect the correct
+             session even when executed from the MCP server's own directory.
     """
     index_if_changed()
 
@@ -126,8 +134,12 @@ def tool_run(tool_name: str, args: str = "") -> dict:
 
     cmd = ["uv", "run", str(PROJECT_ROOT / tool["path"])] + shlex.split(args)
 
+    env = None
+    if cwd:
+        env = {**os.environ, "SHERPA_CALLER_CWD": cwd}
+
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, cwd=PROJECT_ROOT)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, cwd=PROJECT_ROOT, env=env)
     except subprocess.TimeoutExpired:
         return {"success": False, "error": f"Tool '{tool_name}' timed out after 120 seconds", "tool": tool_name}
 

@@ -51,7 +51,7 @@ def _request(client: httpx.Client, method: str, path: str, **kwargs):
 
 
 def _detect_session(client: httpx.Client) -> str:
-    cwd = os.path.realpath(os.getcwd())
+    cwd = os.path.realpath(os.environ.get("SHERPA_CALLER_CWD", "") or os.getcwd())
     resp = _request(client, "get", "/api/sessions")
     sessions = resp.json().get("sessions", [])
 
