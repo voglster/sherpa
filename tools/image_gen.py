@@ -44,30 +44,46 @@ def cmd_generate(args: argparse.Namespace) -> None:
         if not image_path.exists():
             print(f"Image not found: {args.image}", file=sys.stderr)
             sys.exit(1)
-        raw_ref = types.RawReferenceImage(
-            reference_image=types.Image.from_file(str(image_path)),
-            reference_id=0,
-        )
+        ref_image = types.Image.from_file(location=str(image_path))
         if args.reference_type == "style":
-            ref_config = types.StyleReferenceConfig(reference_id=0)
+            reference_images = [
+                types.StyleReferenceImage(
+                    reference_image=ref_image,
+                    reference_id=0,
+                ),
+            ]
         else:
-            ref_config = types.SubjectReferenceConfig(reference_id=0)
-        reference_images = [raw_ref, ref_config]
+            reference_images = [
+                types.SubjectReferenceImage(
+                    reference_image=ref_image,
+                    reference_id=0,
+                ),
+            ]
         print(f"Using reference image: {args.image} ({args.reference_type})", file=sys.stderr)
 
     print(f"Generating image: {args.prompt!r}", file=sys.stderr)
-    config = types.GenerateImagesConfig(
-        number_of_images=args.count,
-        aspect_ratio=args.aspect,
-    )
-    if reference_images:
-        config.reference_images = reference_images
 
-    response = client.models.generate_images(
-        model="imagen-4.0-generate-001",
-        prompt=args.prompt,
-        config=config,
-    )
+    if reference_images:
+        config = types.EditImageConfig(
+            number_of_images=args.count,
+            aspect_ratio=args.aspect,
+        )
+        response = client.models.edit_image(
+            model="imagen-3.0-capability-001",
+            prompt=args.prompt,
+            reference_images=reference_images,
+            config=config,
+        )
+    else:
+        config = types.GenerateImagesConfig(
+            number_of_images=args.count,
+            aspect_ratio=args.aspect,
+        )
+        response = client.models.generate_images(
+            model="imagen-4.0-generate-001",
+            prompt=args.prompt,
+            config=config,
+        )
 
     if not response.generated_images:
         print("No images returned by the API", file=sys.stderr)
