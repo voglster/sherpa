@@ -146,9 +146,8 @@ def cmd_todos_add(session: str, client: httpx.Client, args: argparse.Namespace) 
     new_todo = {"text": args.text, "done": False}
     if args.description:
         new_todo["description"] = args.description
-    # Insert before completed todos so the UI sections stay correct
-    insert_at = next((i for i, t in enumerate(todos) if t.get("done")), len(todos))
-    todos.insert(insert_at, new_todo)
+    # Insert at the top of the list so newest todos appear first
+    todos.insert(0, new_todo)
     _request(client, "post", f"/api/sessions/{session}/todos", json={"todos": todos})
     print(f"Added todo #{len(todos)}", file=sys.stderr)
     print(json.dumps(new_todo))
