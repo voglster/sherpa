@@ -145,7 +145,7 @@ def cmd_todos_add(session: str, client: httpx.Client, args: argparse.Namespace) 
     todos = resp.json().get("todos", [])
     new_todo = {"text": args.text, "done": False}
     if args.description:
-        new_todo["description"] = args.description
+        new_todo["description"] = args.description.replace("\\n", "\n")
     # Insert at the top of the list so newest todos appear first
     todos.insert(0, new_todo)
     _request(client, "post", f"/api/sessions/{session}/todos", json={"todos": todos})
