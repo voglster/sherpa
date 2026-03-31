@@ -11,10 +11,13 @@ secrets:
   - SLACK_USER_TOKEN
 usage: |
   send --channel <name> --text 'Hello team!'
-  send --channel-id C01ABC23DEF --text 'Hello team!'
+  send --channel-id C01ABC23DEF --file /tmp/msg.txt
+  send --channel general --stdin < message.txt
   send --channel general --text 'Hey @(jane doe) check this out'
+  send --channel general --text 'reply' --thread 1774551827.458609
+  send --channel general --blocks /tmp/blocks.json --text 'fallback'
   dm --user <name> --text 'Hey, quick question...'
-  dm --user-id U01ABC23DEF --text 'Hey, quick question...'
+  dm --user-id U01ABC23DEF --file /tmp/msg.txt
   channels [--filter general] [--refresh]
   users [--filter swap] [--refresh]
 notes: |
@@ -324,6 +327,21 @@ async def _open_dm(client: httpx.AsyncClient, headers: dict, user_id: str) -> st
     return data["channel"]["id"]
 
 
+# --- Text resolution ---
+
+
+def _resolve_text(args: argparse.Namespace) -> str:
+    """Resolve message text from --text, --file, or --stdin."""
+    if getattr(args, "file", None):
+        return Path(args.file).read_text().strip()
+    if getattr(args, "stdin", False):
+        return sys.stdin.read().strip()
+    if getattr(args, "text", None):
+        return args.text
+    print("One of --text, --file, or --stdin is required", file=sys.stderr)
+    sys.exit(1)
+
+
 # --- Subcommands ---
 
 
@@ -335,12 +353,14 @@ async def _cmd_send(args: argparse.Namespace) -> None:
             channel = await _channel_info(client, headers, args.channel_id)
         else:
             channel = await _resolve_channel(client, headers, args.channel)
-        text = _linkify_jira_keys(args.text)
+        text = _linkify_jira_keys(_resolve_text(args))
         text = await _linkify_mentions(client, headers, text)
-        data = await _slack_post(client, headers, "https://slack.com/api/chat.postMessage", {
-            "channel": channel["id"],
-            "text": text,
-        })
+        payload = {"channel": channel["id"], "text": text}
+        if args.thread:
+            payload["thread_ts"] = args.thread
+        if args.blocks:
+            payload["blocks"] = json.loads(Path(args.blocks).read_text())
+        data = await _slack_post(client, headers, "https://slack.com/api/chat.postMessage", payload)
         print(json.dumps({
             "ok": True,
             "channel": channel.get("name", channel["id"]),
@@ -357,12 +377,14 @@ async def _cmd_dm(args: argparse.Namespace) -> None:
         else:
             user = await _resolve_user(client, headers, args.user)
         dm_channel_id = await _open_dm(client, headers, user["id"])
-        text = _linkify_jira_keys(args.text)
+        text = _linkify_jira_keys(_resolve_text(args))
         text = await _linkify_mentions(client, headers, text)
-        data = await _slack_post(client, headers, "https://slack.com/api/chat.postMessage", {
-            "channel": dm_channel_id,
-            "text": text,
-        })
+        payload = {"channel": dm_channel_id, "text": text}
+        if args.thread:
+            payload["thread_ts"] = args.thread
+        if args.blocks:
+            payload["blocks"] = json.loads(Path(args.blocks).read_text())
+        data = await _slack_post(client, headers, "https://slack.com/api/chat.postMessage", payload)
         print(json.dumps({
             "ok": True,
             "user": user.get("real_name", user.get("name", user["id"])),
@@ -425,13 +447,23 @@ def main():
     send_ch = send_parser.add_mutually_exclusive_group(required=True)
     send_ch.add_argument("--channel", help="Channel name (resolved via lookup)")
     send_ch.add_argument("--channel-id", help="Channel ID (skips name resolution)")
-    send_parser.add_argument("--text", required=True, help="Message text")
+    send_text = send_parser.add_mutually_exclusive_group()
+    send_text.add_argument("--text", help="Message text")
+    send_text.add_argument("--file", help="Read message text from a file")
+    send_text.add_argument("--stdin", action="store_true", help="Read message text from stdin")
+    send_parser.add_argument("--thread", default=None, help="Thread timestamp to reply to")
+    send_parser.add_argument("--blocks", default=None, help="Path to Block Kit JSON file")
 
     dm_parser = subparsers.add_parser("dm", help="Send a direct message to a user")
     dm_user = dm_parser.add_mutually_exclusive_group(required=True)
     dm_user.add_argument("--user", help="Username or display name (resolved via lookup)")
     dm_user.add_argument("--user-id", help="User ID (skips name resolution)")
-    dm_parser.add_argument("--text", required=True, help="Message text")
+    dm_text = dm_parser.add_mutually_exclusive_group()
+    dm_text.add_argument("--text", help="Message text")
+    dm_text.add_argument("--file", help="Read message text from a file")
+    dm_text.add_argument("--stdin", action="store_true", help="Read message text from stdin")
+    dm_parser.add_argument("--thread", default=None, help="Thread timestamp to reply to")
+    dm_parser.add_argument("--blocks", default=None, help="Path to Block Kit JSON file")
 
     channels_parser = subparsers.add_parser("channels", help="List channels")
     channels_parser.add_argument("--filter", default=None, help="Substring filter on channel name")
