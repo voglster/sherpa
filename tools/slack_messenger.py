@@ -146,7 +146,7 @@ async def _fetch_all_channels(client: httpx.AsyncClient, headers: dict) -> list[
     results = []
     cursor = None
     while True:
-        params = {"types": "public_channel,private_channel", "limit": 200}
+        params = {"types": "public_channel,private_channel", "limit": 200, "exclude_archived": True}
         if cursor:
             params["cursor"] = cursor
         data = await _slack_get(client, headers, "https://slack.com/api/conversations.list", params)
