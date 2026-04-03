@@ -52,13 +52,27 @@ def _load_secret(key: str) -> str:
 
 
 def _linkify_jira_keys(text: str) -> str:
-    """Replace Jira ticket keys (e.g. KB-12345) with Slack-formatted links."""
+    """Replace Jira ticket keys (e.g. KB-12345) with Slack-formatted links.
+
+    Skips keys that already appear inside a URL or Slack <link|label> block.
+    """
     vault = json.loads(VAULT_PATH.read_text()) if VAULT_PATH.exists() else {}
     jira_url = vault.get("JIRA_URL")
     if not jira_url:
         return text
     jira_url = jira_url.rstrip("/")
-    return JIRA_KEY_RE.sub(lambda m: f"<{jira_url}/browse/{m.group(1)}|{m.group(1)}>", text)
+
+    # Split on Slack link/URL tokens so we only touch plain-text segments.
+    # Matches Slack links <...> and bare URLs (http/https).
+    _link_re = re.compile(r"(<[^>]+>|https?://\S+)")
+    parts = _link_re.split(text)
+    for i, part in enumerate(parts):
+        if _link_re.match(part):
+            continue  # already a link — leave it alone
+        parts[i] = JIRA_KEY_RE.sub(
+            lambda m: f"<{jira_url}/browse/{m.group(1)}|{m.group(1)}>", part
+        )
+    return "".join(parts)
 
 
 # --- Cache helpers ---

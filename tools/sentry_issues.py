@@ -5,14 +5,14 @@
 # ///
 """
 name: sentry_issues
-description: Fetch and resolve issues from a self-hosted Sentry instance by URL
+description: Fetch and resolve issues from a self-hosted Sentry instance by URL or issue number
 categories: [sentry, debugging, error-tracking, issues]
 secrets:
   - SENTRY_AUTH_TOKEN
   - SENTRY_BASE_URL
 usage: |
-  fetch <SENTRY_URL> [--base-url URL]
-  resolve <SENTRY_URL> [--base-url URL]
+  fetch <ISSUE_NUMBER_OR_URL> [--base-url URL]
+  resolve <ISSUE_NUMBER_OR_URL> [--base-url URL]
 """
 
 import argparse
@@ -37,7 +37,16 @@ def _load_secret(key: str) -> str:
 
 
 def _parse_sentry_url(url: str) -> dict:
-    """Extract org slug, issue ID, environment, and base URL from a Sentry issue URL."""
+    """Extract issue ID, environment, and base URL from a Sentry issue URL or bare issue number."""
+    # Accept bare issue numbers (e.g. "9993")
+    if url.isdigit():
+        return {
+            "base_url": _load_secret("SENTRY_BASE_URL").rstrip("/"),
+            "org_slug": None,
+            "issue_id": url,
+            "environment": None,
+        }
+
     parsed = urlparse(url)
     base_url = f"{parsed.scheme}://{parsed.netloc}"
 
@@ -178,13 +187,13 @@ def main():
     parser = argparse.ArgumentParser(description="Fetch and resolve Sentry issues by URL.")
     subparsers = parser.add_subparsers(dest="command")
 
-    fetch_parser = subparsers.add_parser("fetch", help="Fetch issue details from a Sentry URL")
-    fetch_parser.add_argument("url", help="Full Sentry issue URL")
-    fetch_parser.add_argument("--base-url", default=None, help="Override Sentry base URL (default: extracted from URL)")
+    fetch_parser = subparsers.add_parser("fetch", help="Fetch issue details from Sentry")
+    fetch_parser.add_argument("url", help="Sentry issue URL or bare issue number (e.g. 9993)")
+    fetch_parser.add_argument("--base-url", default=None, help="Override Sentry base URL (default: extracted from URL or SENTRY_BASE_URL)")
 
-    resolve_parser = subparsers.add_parser("resolve", help="Resolve a Sentry issue by URL")
-    resolve_parser.add_argument("url", help="Full Sentry issue URL")
-    resolve_parser.add_argument("--base-url", default=None, help="Override Sentry base URL (default: extracted from URL)")
+    resolve_parser = subparsers.add_parser("resolve", help="Resolve a Sentry issue")
+    resolve_parser.add_argument("url", help="Sentry issue URL or bare issue number (e.g. 9993)")
+    resolve_parser.add_argument("--base-url", default=None, help="Override Sentry base URL (default: extracted from URL or SENTRY_BASE_URL)")
 
     args = parser.parse_args()
 
