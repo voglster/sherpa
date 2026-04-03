@@ -11,8 +11,10 @@ secrets:
   - SENTRY_AUTH_TOKEN
   - SENTRY_BASE_URL
 usage: |
-  fetch <ISSUE_NUMBER_OR_URL> [--base-url URL]
-  resolve <ISSUE_NUMBER_OR_URL> [--base-url URL]
+  fetch 9993
+  fetch https://sentry.example.com/organizations/myorg/issues/9993/?environment=production
+  resolve 9993
+  resolve https://sentry.example.com/organizations/myorg/issues/9993/ [--base-url URL]
 """
 
 import argparse
