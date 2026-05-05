@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["httpx"]
+# dependencies = ["httpx", "markdown-it-py"]
 # ///
 """
 name: jira_issues
@@ -31,6 +31,7 @@ import sys
 from pathlib import Path
 
 import httpx
+from markdown_it import MarkdownIt
 
 VAULT_PATH = Path.home() / ".sherpa" / "vault.json"
 USER_CACHE_PATH = Path.home() / ".sherpa" / "jira_users.json"
@@ -157,132 +158,233 @@ def _resolve_body(
 # Markdown -> Atlassian Document Format (ADF) converter (minimal)
 # ---------------------------------------------------------------------------
 
+_MD_PARSER = MarkdownIt("commonmark", {"breaks": False, "html": False}).enable("strikethrough")
+
+
 def _md_to_adf(text: str) -> dict:
-    """Convert simple markdown to ADF.
+    """Convert CommonMark markdown to ADF using markdown-it-py.
 
-    Block-level: blank lines separate blocks. Within a paragraph block,
-    consecutive non-blank lines are joined with hard breaks so multi-line
-    paragraphs survive the round-trip and render with proper vertical spacing.
-    Supports headings, paragraphs, code blocks, and bullet lists.
+    Supports: headings, paragraphs, hard/soft line breaks, bold/italic/strike,
+    inline code, links, bullet + ordered + nested lists, fenced + indented code
+    blocks, blockquotes, and thematic breaks. Unknown constructs (tables,
+    images) fall back to a best-effort textual representation.
     """
-    content = []
-    lines = text.split("\n")
-    i = 0
-    pending_para: list[str] = []
+    tokens = _MD_PARSER.parse(text or "")
+    content = _walk_blocks(tokens, 0, len(tokens))
+    if not content:
+        content = [{"type": "paragraph", "content": [{"type": "text", "text": ""}]}]
+    return {"version": 1, "type": "doc", "content": content}
 
-    def flush_para():
-        if not pending_para:
-            return
-        nodes = []
-        for idx, t in enumerate(pending_para):
-            if idx > 0:
-                nodes.append({"type": "hardBreak"})
-            nodes.append({"type": "text", "text": t})
-        content.append({"type": "paragraph", "content": nodes})
-        pending_para.clear()
 
-    while i < len(lines):
-        line = lines[i]
+def _find_close(tokens, start: int, open_type: str, close_type: str) -> int:
+    depth = 0
+    for k in range(start, len(tokens)):
+        if tokens[k].type == open_type:
+            depth += 1
+        elif tokens[k].type == close_type:
+            depth -= 1
+            if depth == 0:
+                return k
+    return len(tokens) - 1
 
-        # Fenced code block
-        if line.startswith("```"):
-            flush_para()
-            lang = line[3:].strip() or None
-            code_lines = []
-            i += 1
-            while i < len(lines) and not lines[i].startswith("```"):
-                code_lines.append(lines[i])
-                i += 1
-            i += 1  # skip closing ```
-            node = {
-                "type": "codeBlock",
-                "content": [{"type": "text", "text": "\n".join(code_lines)}],
-            }
-            if lang:
-                node["attrs"] = {"language": lang}
-            content.append(node)
-            continue
 
-        # Heading
-        m = re.match(r"^(#{1,6})\s+(.*)", line)
-        if m:
-            flush_para()
-            level = len(m.group(1))
-            content.append({
+def _walk_blocks(tokens, start: int, end: int) -> list:
+    nodes: list = []
+    i = start
+    while i < end:
+        t = tokens[i]
+        if t.type == "heading_open":
+            level = int(t.tag[1])
+            inline = tokens[i + 1].children or []
+            nodes.append({
                 "type": "heading",
                 "attrs": {"level": level},
-                "content": [{"type": "text", "text": m.group(2)}],
+                "content": _walk_inline(inline),
             })
+            i += 3
+        elif t.type == "paragraph_open":
+            inline = tokens[i + 1].children or []
+            content = _walk_inline(inline) or [{"type": "text", "text": ""}]
+            nodes.append({"type": "paragraph", "content": content})
+            i += 3
+        elif t.type in ("fence", "code_block"):
+            lang = (t.info or "").strip()
+            code = (t.content or "").rstrip("\n")
+            node: dict = {"type": "codeBlock"}
+            if lang:
+                node["attrs"] = {"language": lang}
+            if code:
+                node["content"] = [{"type": "text", "text": code}]
+            nodes.append(node)
             i += 1
-            continue
-
-        # Bullet list item (collect consecutive)
-        if re.match(r"^\s*[-*]\s+", line):
-            flush_para()
-            items = []
-            while i < len(lines) and re.match(r"^\s*[-*]\s+", lines[i]):
-                item_text = re.sub(r"^\s*[-*]\s+", "", lines[i])
-                items.append({
-                    "type": "listItem",
-                    "content": [{
-                        "type": "paragraph",
-                        "content": [{"type": "text", "text": item_text}],
-                    }],
-                })
-                i += 1
-            content.append({"type": "bulletList", "content": items})
-            continue
-
-        # Blank line — paragraph boundary
-        if not line.strip():
-            flush_para()
+        elif t.type == "bullet_list_open":
+            j = _find_close(tokens, i, "bullet_list_open", "bullet_list_close")
+            nodes.append({"type": "bulletList", "content": _walk_list_items(tokens, i + 1, j)})
+            i = j + 1
+        elif t.type == "ordered_list_open":
+            j = _find_close(tokens, i, "ordered_list_open", "ordered_list_close")
+            node = {"type": "orderedList", "content": _walk_list_items(tokens, i + 1, j)}
+            start_attr = (dict(t.attrs).get("start") if t.attrs else None)
+            if start_attr and str(start_attr) != "1":
+                node["attrs"] = {"order": int(start_attr)}
+            nodes.append(node)
+            i = j + 1
+        elif t.type == "blockquote_open":
+            j = _find_close(tokens, i, "blockquote_open", "blockquote_close")
+            inner = _walk_blocks(tokens, i + 1, j)
+            nodes.append({"type": "blockquote", "content": inner or [{"type": "paragraph", "content": [{"type": "text", "text": ""}]}]})
+            i = j + 1
+        elif t.type == "hr":
+            nodes.append({"type": "rule"})
             i += 1
-            continue
+        else:
+            i += 1
+    return nodes
 
-        # Accumulate into current paragraph
-        pending_para.append(line)
-        i += 1
 
-    flush_para()
+def _walk_list_items(tokens, start: int, end: int) -> list:
+    items = []
+    i = start
+    while i < end:
+        if tokens[i].type == "list_item_open":
+            j = _find_close(tokens, i, "list_item_open", "list_item_close")
+            inner = _walk_blocks(tokens, i + 1, j)
+            items.append({"type": "listItem", "content": inner or [{"type": "paragraph", "content": [{"type": "text", "text": ""}]}]})
+            i = j + 1
+        else:
+            i += 1
+    return items
 
-    return {"version": 1, "type": "doc", "content": content} if content else {
-        "version": 1, "type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": ""}]}],
-    }
 
+def _walk_inline(tokens) -> list:
+    nodes: list = []
+    mark_stack: list = []
+
+    def text_node(s: str) -> dict:
+        node = {"type": "text", "text": s}
+        if mark_stack:
+            node["marks"] = [dict(m) for m in mark_stack]
+        return node
+
+    for t in tokens:
+        ttype = t.type
+        if ttype == "text":
+            if t.content:
+                nodes.append(text_node(t.content))
+        elif ttype in ("softbreak", "hardbreak"):
+            nodes.append({"type": "hardBreak"})
+        elif ttype == "code_inline":
+            mark_stack.append({"type": "code"})
+            nodes.append(text_node(t.content))
+            mark_stack.pop()
+        elif ttype == "em_open":
+            mark_stack.append({"type": "em"})
+        elif ttype == "em_close":
+            mark_stack.pop()
+        elif ttype == "strong_open":
+            mark_stack.append({"type": "strong"})
+        elif ttype == "strong_close":
+            mark_stack.pop()
+        elif ttype == "s_open":
+            mark_stack.append({"type": "strike"})
+        elif ttype == "s_close":
+            mark_stack.pop()
+        elif ttype == "link_open":
+            href = (dict(t.attrs).get("href") if t.attrs else "") or ""
+            mark_stack.append({"type": "link", "attrs": {"href": href}})
+        elif ttype == "link_close":
+            mark_stack.pop()
+        elif ttype == "image":
+            alt = t.content or ""
+            if alt:
+                nodes.append(text_node(alt))
+    return nodes
+
+
+# ---------------------------------------------------------------------------
+# ADF -> markdown (for round-trip preview / cmd_get display)
+# ---------------------------------------------------------------------------
 
 def _adf_to_text(adf: dict | None) -> str:
-    """Flatten ADF to plain text for display. Blocks separated by blank lines."""
     if not adf:
         return ""
+    return "\n\n".join(_render_block(n) for n in adf.get("content", []) if _render_block(n) is not None)
 
-    def inline_text(nodes: list) -> str:
-        out = []
-        for c in nodes:
-            if c.get("type") == "hardBreak":
-                out.append("\n")
-            else:
-                out.append(c.get("text", ""))
-        return "".join(out)
 
-    parts = []
-    for node in adf.get("content", []):
-        ntype = node.get("type")
-        if ntype in ("paragraph", "heading"):
-            text = inline_text(node.get("content", []))
-            if ntype == "heading":
-                text = "#" * node.get("attrs", {}).get("level", 1) + " " + text
-            parts.append(text)
-        elif ntype == "codeBlock":
-            code = "".join(c.get("text", "") for c in node.get("content", []))
-            lang = node.get("attrs", {}).get("language", "")
-            parts.append(f"```{lang}\n{code}\n```")
-        elif ntype == "bulletList":
-            bullets = []
-            for item in node.get("content", []):
-                for p in item.get("content", []):
-                    bullets.append(f"- {inline_text(p.get('content', []))}")
-            parts.append("\n".join(bullets))
-    return "\n\n".join(parts)
+def _render_inline(nodes: list) -> str:
+    out = []
+    for c in nodes or []:
+        ctype = c.get("type")
+        if ctype == "hardBreak":
+            out.append("\n")
+            continue
+        if ctype != "text":
+            continue
+        text = c.get("text", "")
+        for mark in c.get("marks", []):
+            mtype = mark.get("type")
+            if mtype == "code":
+                text = f"`{text}`"
+            elif mtype == "strong":
+                text = f"**{text}**"
+            elif mtype == "em":
+                text = f"*{text}*"
+            elif mtype == "strike":
+                text = f"~~{text}~~"
+            elif mtype == "link":
+                href = mark.get("attrs", {}).get("href", "")
+                text = f"[{text}]({href})"
+        out.append(text)
+    return "".join(out)
+
+
+def _render_list_item(item: dict, prefix: str) -> str:
+    blocks = item.get("content", []) or []
+    if not blocks:
+        return prefix.rstrip()
+    lines: list[str] = []
+    indent = " " * len(prefix)
+    for idx, b in enumerate(blocks):
+        rendered = _render_block(b) or ""
+        block_lines = rendered.split("\n")
+        if idx == 0:
+            lines.append(prefix + block_lines[0])
+            for l in block_lines[1:]:
+                lines.append(indent + l)
+        else:
+            # Tight rendering for nested lists; blank separator for paragraphs.
+            if b.get("type") not in ("bulletList", "orderedList"):
+                lines.append("")
+            for l in block_lines:
+                lines.append(indent + l if l else "")
+    return "\n".join(lines)
+
+
+def _render_block(node: dict) -> str:
+    ntype = node.get("type")
+    if ntype == "paragraph":
+        return _render_inline(node.get("content", []))
+    if ntype == "heading":
+        level = node.get("attrs", {}).get("level", 1)
+        return f"{'#' * level} {_render_inline(node.get('content', []))}"
+    if ntype == "codeBlock":
+        code = "".join(c.get("text", "") for c in node.get("content", []))
+        lang = node.get("attrs", {}).get("language", "")
+        return f"```{lang}\n{code}\n```"
+    if ntype == "bulletList":
+        return "\n".join(_render_list_item(item, "- ") for item in node.get("content", []))
+    if ntype == "orderedList":
+        start = node.get("attrs", {}).get("order", 1)
+        return "\n".join(
+            _render_list_item(item, f"{idx}. ")
+            for idx, item in enumerate(node.get("content", []), start=start)
+        )
+    if ntype == "blockquote":
+        inner = "\n\n".join(_render_block(c) for c in node.get("content", []))
+        return "\n".join(f"> {ln}" if ln else ">" for ln in inner.split("\n"))
+    if ntype == "rule":
+        return "---"
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +405,21 @@ def _find_my_sprint(client: httpx.Client, board_id: int) -> dict | None:
             return match
     # Fall back to first active sprint if no prefix configured or no match
     return sprints[0] if sprints else None
+
+
+def _echo_roundtrip(client: httpx.Client, issue_key: str) -> None:
+    """Fetch the issue and print description_text round-trip preview to stderr."""
+    try:
+        resp = client.get(f"/rest/api/3/issue/{issue_key}", params={"fields": "description"})
+        if resp.status_code != 200:
+            return
+        adf = resp.json().get("fields", {}).get("description")
+        rendered = _adf_to_text(adf)
+    except Exception:
+        return
+    print(f"--- Round-trip preview ({issue_key}) ---", file=sys.stderr)
+    print(rendered, file=sys.stderr)
+    print("--- end preview ---", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +491,9 @@ def cmd_create(args: argparse.Namespace) -> None:
                     print(f"Failed to add to sprint: {move_resp.status_code} {move_resp.text}", file=sys.stderr)
                 else:
                     print(f"Added to sprint: {sprint['name']}", file=sys.stderr)
+
+        if description is not None and not args.no_echo:
+            _echo_roundtrip(client, issue_key)
 
         print(json.dumps({"key": issue_key, "id": issue["id"], "self": issue["self"]}))
 
@@ -480,6 +600,9 @@ def cmd_update(args: argparse.Namespace) -> None:
                 print(f"Failed to add to sprint: {move_resp.status_code} {move_resp.text}", file=sys.stderr)
                 sys.exit(2)
             print(f"Added to sprint: {sprint['name']}", file=sys.stderr)
+
+        if description is not None and not args.no_echo:
+            _echo_roundtrip(client, args.issue_key)
 
     print(json.dumps({"key": args.issue_key, "status": "updated"}))
 
@@ -687,6 +810,7 @@ def main():
     p.add_argument("--parent", default=None, help="Parent issue key for subtasks (e.g. KB-41269)")
     p.add_argument("--sprint", action="store_true", help="Add to your active sprint")
     p.add_argument("--dry-run", action="store_true", help="Print the rendered ADF payload without calling Jira")
+    p.add_argument("--no-echo", action="store_true", help="Skip the round-trip description preview after create")
 
     # get
     p = sub.add_parser("get", help="Fetch issue details by key")
@@ -703,6 +827,7 @@ def main():
     p.add_argument("--labels", nargs="+", default=None, help="Labels to set")
     p.add_argument("--sprint", action="store_true", help="Move issue to your active sprint")
     p.add_argument("--dry-run", action="store_true", help="Print the rendered payload without calling Jira")
+    p.add_argument("--no-echo", action="store_true", help="Skip the round-trip description preview after update")
 
     # transition
     p = sub.add_parser("transition", help="Move issue to a new status")
