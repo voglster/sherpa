@@ -13,12 +13,15 @@ secrets:
   - JIRA_API_TOKEN
 usage: |
   get <ISSUE_KEY>
-  create --summary '<title>' [--project KEY] [--type Bug] [--parent KB-123] [--sprint]
-  update <ISSUE_KEY> [--summary '...'] [--description '...'] [--assignee name] [--labels L1 L2] [--sprint]
+  create --summary '<title>' [--description '...'|--description-file PATH|--description-stdin]
+         [--project KEY] [--type Bug] [--parent KB-123] [--sprint] [--dry-run]
+  update <ISSUE_KEY> [--summary '...'] [--description '...'|--description-file PATH|--description-stdin]
+         [--assignee name] [--labels L1 L2] [--sprint] [--dry-run]
   transition <ISSUE_KEY> --status '<status>'
-  comment <ISSUE_KEY> --body '<markdown text>'
+  comment <ISSUE_KEY> [--body '...'|--body-file PATH|--body-stdin] [--dry-run]
   search [--jql '<JQL>'] [--project KEY] [--status '<status>'] [--mine] [--current-sprint]
   sprints [--board ID]
+  Body input: --description / --body accept '@PATH' shorthand to read from a file.
 """
 
 import argparse
@@ -90,19 +93,100 @@ def _resolve_assignee(args_assignee: str | None) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Body input resolution (inline / file / stdin / @PATH)
+# ---------------------------------------------------------------------------
+
+_SHELL_SUBST_RE = re.compile(r"^\s*\$\([^)]*\)\s*$|^\s*\$\(cat\b")
+
+
+def _resolve_body(
+    *,
+    inline: str | None,
+    file_path: str | None,
+    use_stdin: bool,
+    label: str,
+) -> str | None:
+    """Resolve a free-text body from one of: inline (--description / --body),
+    a file (--description-file / --body-file or `@PATH` shorthand on inline),
+    or stdin (--description-stdin / --body-stdin).
+
+    Returns None if no source provided. Errors if more than one is provided
+    or if the resolved body looks like an unexpanded shell substitution.
+    """
+    sources_used = sum(x is not None and x is not False for x in (inline, file_path, use_stdin or None))
+    # @PATH shorthand on the inline arg redirects to file
+    if inline and inline.startswith("@") and not file_path and not use_stdin:
+        file_path = inline[1:]
+        inline = None
+        sources_used = 1
+
+    if sources_used == 0:
+        return None
+    if sources_used > 1:
+        print(
+            f"Provide only one of --{label}, --{label}-file, --{label}-stdin",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if file_path:
+        try:
+            body = Path(file_path).read_text()
+        except OSError as e:
+            print(f"Failed to read {file_path}: {e}", file=sys.stderr)
+            sys.exit(1)
+    elif use_stdin:
+        body = sys.stdin.read()
+    else:
+        body = inline or ""
+
+    if not body.strip():
+        print(f"--{label} body is empty or whitespace", file=sys.stderr)
+        sys.exit(1)
+    if _SHELL_SUBST_RE.search(body.strip().splitlines()[0] if body.strip() else ""):
+        print(
+            f"--{label} body looks like an unexpanded shell substitution "
+            f"(starts with $(...)). Did you mean --{label}-file PATH?",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return body
+
+
+# ---------------------------------------------------------------------------
 # Markdown -> Atlassian Document Format (ADF) converter (minimal)
 # ---------------------------------------------------------------------------
 
 def _md_to_adf(text: str) -> dict:
-    """Convert simple markdown to ADF. Supports headings, paragraphs, code blocks, and bullet lists."""
+    """Convert simple markdown to ADF.
+
+    Block-level: blank lines separate blocks. Within a paragraph block,
+    consecutive non-blank lines are joined with hard breaks so multi-line
+    paragraphs survive the round-trip and render with proper vertical spacing.
+    Supports headings, paragraphs, code blocks, and bullet lists.
+    """
     content = []
     lines = text.split("\n")
     i = 0
+    pending_para: list[str] = []
+
+    def flush_para():
+        if not pending_para:
+            return
+        nodes = []
+        for idx, t in enumerate(pending_para):
+            if idx > 0:
+                nodes.append({"type": "hardBreak"})
+            nodes.append({"type": "text", "text": t})
+        content.append({"type": "paragraph", "content": nodes})
+        pending_para.clear()
+
     while i < len(lines):
         line = lines[i]
 
         # Fenced code block
         if line.startswith("```"):
+            flush_para()
             lang = line[3:].strip() or None
             code_lines = []
             i += 1
@@ -122,6 +206,7 @@ def _md_to_adf(text: str) -> dict:
         # Heading
         m = re.match(r"^(#{1,6})\s+(.*)", line)
         if m:
+            flush_para()
             level = len(m.group(1))
             content.append({
                 "type": "heading",
@@ -133,6 +218,7 @@ def _md_to_adf(text: str) -> dict:
 
         # Bullet list item (collect consecutive)
         if re.match(r"^\s*[-*]\s+", line):
+            flush_para()
             items = []
             while i < len(lines) and re.match(r"^\s*[-*]\s+", lines[i]):
                 item_text = re.sub(r"^\s*[-*]\s+", "", lines[i])
@@ -147,17 +233,17 @@ def _md_to_adf(text: str) -> dict:
             content.append({"type": "bulletList", "content": items})
             continue
 
-        # Blank line — skip
+        # Blank line — paragraph boundary
         if not line.strip():
+            flush_para()
             i += 1
             continue
 
-        # Plain paragraph
-        content.append({
-            "type": "paragraph",
-            "content": [{"type": "text", "text": line}],
-        })
+        # Accumulate into current paragraph
+        pending_para.append(line)
         i += 1
+
+    flush_para()
 
     return {"version": 1, "type": "doc", "content": content} if content else {
         "version": 1, "type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": ""}]}],
@@ -165,26 +251,38 @@ def _md_to_adf(text: str) -> dict:
 
 
 def _adf_to_text(adf: dict | None) -> str:
-    """Flatten ADF to plain text for display."""
+    """Flatten ADF to plain text for display. Blocks separated by blank lines."""
     if not adf:
         return ""
+
+    def inline_text(nodes: list) -> str:
+        out = []
+        for c in nodes:
+            if c.get("type") == "hardBreak":
+                out.append("\n")
+            else:
+                out.append(c.get("text", ""))
+        return "".join(out)
+
     parts = []
     for node in adf.get("content", []):
         ntype = node.get("type")
         if ntype in ("paragraph", "heading"):
-            text = "".join(c.get("text", "") for c in node.get("content", []))
+            text = inline_text(node.get("content", []))
             if ntype == "heading":
                 text = "#" * node.get("attrs", {}).get("level", 1) + " " + text
             parts.append(text)
         elif ntype == "codeBlock":
             code = "".join(c.get("text", "") for c in node.get("content", []))
-            parts.append(f"```\n{code}\n```")
+            lang = node.get("attrs", {}).get("language", "")
+            parts.append(f"```{lang}\n{code}\n```")
         elif ntype == "bulletList":
+            bullets = []
             for item in node.get("content", []):
                 for p in item.get("content", []):
-                    text = "".join(c.get("text", "") for c in p.get("content", []))
-                    parts.append(f"- {text}")
-    return "\n".join(parts)
+                    bullets.append(f"- {inline_text(p.get('content', []))}")
+            parts.append("\n".join(bullets))
+    return "\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -213,22 +311,33 @@ def _find_my_sprint(client: httpx.Client, board_id: int) -> dict | None:
 
 def cmd_create(args: argparse.Namespace) -> None:
     project = _resolve_project(args.project)
+    description = _resolve_body(
+        inline=args.description,
+        file_path=args.description_file,
+        use_stdin=args.description_stdin,
+        label="description",
+    )
 
     # When creating under a parent, default to "Bug subtask" unless explicitly overridden
     issue_type = args.type
     if args.parent and issue_type == "Bug":
         issue_type = "Bug subtask"
 
+    fields: dict = {
+        "project": {"key": project},
+        "summary": args.summary,
+        "issuetype": {"name": issue_type},
+    }
+    if args.parent:
+        fields["parent"] = {"key": args.parent}
+    if description is not None:
+        fields["description"] = _md_to_adf(description)
+
+    if args.dry_run:
+        print(json.dumps({"fields": fields, "sprint": bool(args.sprint)}, indent=2))
+        return
+
     with _client() as client:
-        fields: dict = {
-            "project": {"key": project},
-            "summary": args.summary,
-            "issuetype": {"name": issue_type},
-        }
-        if args.parent:
-            fields["parent"] = {"key": args.parent}
-        if args.description:
-            fields["description"] = _md_to_adf(args.description)
 
         # Required custom field: Customer (multiselect) — top-level issues only
         if not args.parent:
@@ -325,11 +434,18 @@ def cmd_get(args: argparse.Namespace) -> None:
 
 
 def cmd_update(args: argparse.Namespace) -> None:
+    description = _resolve_body(
+        inline=args.description,
+        file_path=args.description_file,
+        use_stdin=args.description_stdin,
+        label="description",
+    )
+
     fields: dict = {}
     if args.summary:
         fields["summary"] = args.summary
-    if args.description:
-        fields["description"] = _md_to_adf(args.description)
+    if description is not None:
+        fields["description"] = _md_to_adf(description)
     if args.labels:
         fields["labels"] = args.labels
     if args.assignee:
@@ -338,6 +454,10 @@ def cmd_update(args: argparse.Namespace) -> None:
     if not fields and not args.sprint:
         print("No fields to update", file=sys.stderr)
         sys.exit(1)
+
+    if args.dry_run:
+        print(json.dumps({"issue_key": args.issue_key, "fields": fields, "sprint": bool(args.sprint)}, indent=2))
+        return
 
     with _client() as client:
         if fields:
@@ -517,10 +637,25 @@ def cmd_sprints(args: argparse.Namespace) -> None:
 
 
 def cmd_comment(args: argparse.Namespace) -> None:
+    body = _resolve_body(
+        inline=args.body,
+        file_path=args.body_file,
+        use_stdin=args.body_stdin,
+        label="body",
+    )
+    if body is None:
+        print("Provide --body, --body-file, or --body-stdin", file=sys.stderr)
+        sys.exit(1)
+
+    adf = _md_to_adf(body)
+    if args.dry_run:
+        print(json.dumps({"issue_key": args.issue_key, "body": adf}, indent=2))
+        return
+
     with _client() as client:
         resp = client.post(
             f"/rest/api/3/issue/{args.issue_key}/comment",
-            json={"body": _md_to_adf(args.body)},
+            json={"body": adf},
         )
         if resp.status_code not in (200, 201):
             print(f"Failed to add comment: {resp.status_code} {resp.text}", file=sys.stderr)
@@ -545,10 +680,13 @@ def main():
     p = sub.add_parser("create", help="Create an issue (optionally in your active sprint)")
     p.add_argument("--project", default=None, help="Project key (default: vault JIRA_DEFAULT_PROJECT)")
     p.add_argument("--summary", required=True, help="Issue summary/title")
-    p.add_argument("--description", default=None, help="Markdown description")
+    p.add_argument("--description", default=None, help="Markdown description (or '@PATH' to read from file)")
+    p.add_argument("--description-file", default=None, help="Read markdown description from file")
+    p.add_argument("--description-stdin", action="store_true", help="Read markdown description from stdin")
     p.add_argument("--type", default="Bug", help="Issue type (default: Bug, or Bug subtask when --parent is set)")
     p.add_argument("--parent", default=None, help="Parent issue key for subtasks (e.g. KB-41269)")
     p.add_argument("--sprint", action="store_true", help="Add to your active sprint")
+    p.add_argument("--dry-run", action="store_true", help="Print the rendered ADF payload without calling Jira")
 
     # get
     p = sub.add_parser("get", help="Fetch issue details by key")
@@ -558,10 +696,13 @@ def main():
     p = sub.add_parser("update", help="Update fields on an existing issue")
     p.add_argument("issue_key", help="Issue key (e.g. KB-123)")
     p.add_argument("--summary", default=None, help="New summary")
-    p.add_argument("--description", default=None, help="New markdown description")
+    p.add_argument("--description", default=None, help="New markdown description (or '@PATH' to read from file)")
+    p.add_argument("--description-file", default=None, help="Read new markdown description from file")
+    p.add_argument("--description-stdin", action="store_true", help="Read new markdown description from stdin")
     p.add_argument("--assignee", default=None, help="Assignee email")
     p.add_argument("--labels", nargs="+", default=None, help="Labels to set")
     p.add_argument("--sprint", action="store_true", help="Move issue to your active sprint")
+    p.add_argument("--dry-run", action="store_true", help="Print the rendered payload without calling Jira")
 
     # transition
     p = sub.add_parser("transition", help="Move issue to a new status")
@@ -580,7 +721,10 @@ def main():
     # comment
     p = sub.add_parser("comment", help="Add a comment to an issue")
     p.add_argument("issue_key", help="Issue key (e.g. KB-123)")
-    p.add_argument("--body", required=True, help="Comment body (markdown)")
+    p.add_argument("--body", default=None, help="Comment body markdown (or '@PATH' to read from file)")
+    p.add_argument("--body-file", default=None, help="Read comment body from file")
+    p.add_argument("--body-stdin", action="store_true", help="Read comment body from stdin")
+    p.add_argument("--dry-run", action="store_true", help="Print the rendered ADF payload without calling Jira")
 
     # sprints
     p = sub.add_parser("sprints", help="List active/future sprints for your board")
