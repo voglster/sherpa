@@ -48,6 +48,19 @@ def _env(monkeypatch, run, issue=None):
         monkeypatch.setenv("FLEET_ISSUE", str(issue))
 
 
+def test_default_kickoff_requires_auto_close_keyword_in_body():
+    prompt = fleet._kickoff_prompt("2", "run-x", "main", prompt_file=None)
+    assert "Closes #2" in prompt
+    assert "Fixes #2" in prompt
+    assert "does NOT auto-close" in prompt
+
+
+def test_prompt_file_override_bypasses_default_kickoff(tmp_path):
+    override = tmp_path / "kickoff.txt"
+    override.write_text("do the thing")
+    assert fleet._kickoff_prompt("2", "run-x", "main", prompt_file=str(override)) == "do the thing"
+
+
 def test_register_and_status_are_atomic_field_writes(run_ctx):
     client, run = run_ctx
     fleet._register_worker(client, run, "1")

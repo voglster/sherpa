@@ -308,6 +308,9 @@ def _kickoff_prompt(issue: str, run: str, base: str, prompt_file: str | None) ->
         f"Your worktree is checked out on branch issue-{issue}.\n"
         "Work the issue, committing as you go. When you need a human/overseer decision, run:\n"
         f"  sherpa fleet ask \"<your question>\"\n"
+        f"Your final commit message BODY must contain 'Closes #{issue}' (or 'Fixes #{issue}') "
+        "so the issue auto-closes when the overseer pushes. A bare '(#<issue>)' in the subject "
+        "line does NOT auto-close the issue.\n"
         "When the work is complete and committed, run:\n"
         "  sherpa fleet report --state ready --commit $(git rev-parse HEAD)\n"
         "then STOP. Do not push; the overseer lands the batch."
@@ -361,7 +364,8 @@ def cmd_spawn(args) -> int:
         "redis_url": redis_url,
     }
     if args.dry_run:
-        print(json.dumps({"dry_run": True, **plan}))
+        kickoff = None if args.no_kickoff else _kickoff_prompt(issue, run, base, args.prompt)
+        print(json.dumps({"dry_run": True, **plan, "kickoff": kickoff}))
         return 0
 
     # The Stop hook and worker report/ask all shell out to `sherpa`; fail before
