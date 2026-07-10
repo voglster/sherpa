@@ -263,6 +263,83 @@ def test_inbox_cursor_advances(run_ctx, monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["messages"] == []
 
 
+class _FakeTmux:
+    """Records tmux calls and replays a scripted sequence of pane captures."""
+
+    def __init__(self, captures):
+        self._captures = list(captures)
+        self.calls = []
+        self.pastes = 0
+        self.enters = 0
+
+    def tmux(self, *args, check=True):
+        self.calls.append(args)
+        if args[0] == "paste-buffer":
+            self.pastes += 1
+        if args[0] == "send-keys" and args[-1] == "Enter":
+            self.enters += 1
+        return argparse.Namespace(stdout="", returncode=0)
+
+    def capture(self, target):
+        return self._captures.pop(0) if len(self._captures) > 1 else self._captures[0]
+
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    monkeypatch.setattr(fleet.time, "sleep", lambda *_: None)
+
+
+def _wire(monkeypatch, fake):
+    monkeypatch.setattr(fleet, "_tmux", fake.tmux)
+    monkeypatch.setattr(fleet, "_tmux_capture", fake.capture)
+
+
+def test_pane_ready_and_active_markers():
+    assert fleet._pane_ready("...\n? for shortcuts")
+    assert not fleet._pane_ready("Do you trust the files in this folder?")
+    assert fleet._pane_active("✻ Thinking… (esc to interrupt)")
+    assert not fleet._pane_active("? for shortcuts")
+
+
+def test_paste_kickoff_waits_for_ready_then_confirms(monkeypatch, no_sleep):
+    fake = _FakeTmux(["booting plugins…", "? for shortcuts", "esc to interrupt"])
+    _wire(monkeypatch, fake)
+    result = fleet._paste_kickoff("w", "hello", boot_wait=0, poll_interval=0)
+    assert result == "confirmed"
+    assert fake.pastes == 1
+
+
+def test_paste_kickoff_retries_once_when_first_paste_swallowed(monkeypatch, no_sleep):
+    # Ready immediately, but the pane never shows activity after the first paste;
+    # after the retry it does.
+    captures = ["? for shortcuts", "? for shortcuts", "esc to interrupt"]
+    fake = _FakeTmux(captures)
+    _wire(monkeypatch, fake)
+    result = fleet._paste_kickoff(
+        "w", "hello", boot_wait=0, activity_timeout=0, poll_interval=0
+    )
+    assert result == "confirmed"
+    assert fake.pastes == 2
+
+
+def test_paste_kickoff_reports_unconfirmed_after_two_failed_pastes(monkeypatch, no_sleep):
+    fake = _FakeTmux(["? for shortcuts"])  # ready, but never active
+    _wire(monkeypatch, fake)
+    result = fleet._paste_kickoff(
+        "w", "hello", boot_wait=0, activity_timeout=0, poll_interval=0
+    )
+    assert result == "unconfirmed"
+    assert fake.pastes == 2
+
+
+def test_paste_kickoff_reports_never_ready_when_prompt_absent(monkeypatch, no_sleep):
+    fake = _FakeTmux(["Do you trust the files in this folder?"])
+    _wire(monkeypatch, fake)
+    result = fleet._paste_kickoff(
+        "w", "hello", boot_wait=0, ready_timeout=0, activity_timeout=0, poll_interval=0
+    )
+    assert result == "never-ready"
+    assert fake.pastes == 2  # still pastes as a best effort
 def test_interrupt_send_resets_state_to_working(run_ctx, monkeypatch):
     """`send --interrupt` re-tasks the worker, so its stale reported state
     (e.g. ready) flips to working — the overseer shouldn't have to re-inspect

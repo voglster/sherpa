@@ -453,22 +453,108 @@ def cmd_spawn(args) -> int:
     target = f"{session}:{window}" if session else window
     _tmux("send-keys", "-t", target, f"{env_prefix} {launch}", "Enter")
 
+    kickoff = None
     if not args.no_kickoff and launch == "claude":
         prompt = _kickoff_prompt(issue, run, base, args.prompt)
-        _paste_kickoff(target, prompt, boot_wait=args.boot_wait)
+        kickoff = _paste_kickoff(
+            target,
+            prompt,
+            boot_wait=args.boot_wait,
+            ready_timeout=args.ready_timeout,
+        )
+        if kickoff != "confirmed":
+            _write_status(
+                client,
+                run,
+                issue,
+                {"msg": f"kickoff {kickoff}: verify pane, may need `fleet send --interrupt`"},
+            )
 
-    print(json.dumps({"spawned": True, "target": target, "settings": str(settings_path), **plan}))
+    out = {"spawned": True, "target": target, "settings": str(settings_path), **plan}
+    if kickoff is not None:
+        out["kickoff"] = kickoff
+    print(json.dumps(out))
     print(f"spawned worker for issue {issue} in tmux window {window}", file=sys.stderr)
     return 0
 
 
-def _paste_kickoff(target: str, prompt: str, boot_wait: float = 6.0) -> None:
-    """Bracketed paste is REQUIRED — a raw multi-line send submits at the first newline."""
-    time.sleep(boot_wait)  # let claude boot its TUI
-    _tmux("set-buffer", prompt)
-    _tmux("paste-buffer", "-p", "-t", target)  # -p = bracketed paste
-    time.sleep(0.4)
-    _tmux("send-keys", "-t", target, "Enter")
+# Footer hint claude prints once its main input prompt is up and ready for a
+# paste — absent during plugin load and the folder-trust onboarding modal.
+_READY_MARKERS = ("? for shortcuts",)
+# Shown while claude is processing a submitted prompt (the "thinking" indicator).
+_ACTIVE_MARKERS = ("esc to interrupt",)
+
+
+def _tmux_capture(target: str) -> str:
+    proc = _tmux("capture-pane", "-p", "-t", target, check=False)
+    return proc.stdout or ""
+
+
+def _pane_ready(text: str) -> bool:
+    return any(m in text for m in _READY_MARKERS)
+
+
+def _pane_active(text: str) -> bool:
+    return any(m in text for m in _ACTIVE_MARKERS)
+
+
+def _poll_pane(target: str, predicate, timeout: float, interval: float) -> bool:
+    """Capture the pane until `predicate(text)` holds or `timeout` elapses."""
+    deadline = time.time() + timeout
+    while True:
+        if predicate(_tmux_capture(target)):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(interval)
+
+
+def _paste_kickoff(
+    target: str,
+    prompt: str,
+    boot_wait: float = 6.0,
+    ready_timeout: float = 90.0,
+    activity_timeout: float = 15.0,
+    poll_interval: float = 0.5,
+) -> str:
+    """Deliver the kickoff via bracketed paste, robust to slow first-launch.
+
+    Bracketed paste is REQUIRED — a raw multi-line send submits at the first newline.
+    First launch can be slow (plugin load, folder-trust onboarding); a fixed wait then
+    a blind paste can fire before the input is ready and get swallowed with no error,
+    leaving the worker stuck 'booting'. So: poll for the ready prompt, paste, confirm
+    claude started processing, and retry once if it didn't.
+
+    Returns "confirmed", "unconfirmed", or "never-ready".
+    """
+    if boot_wait > 0:
+        time.sleep(boot_wait)  # let claude start its TUI before we begin polling
+    ready = _poll_pane(target, _pane_ready, timeout=ready_timeout, interval=poll_interval)
+    if not ready:
+        print(
+            f"KICKOFF_NOT_READY: claude's input prompt never appeared on {target} within "
+            f"{ready_timeout:.0f}s (slow boot or a folder-trust modal?). Pasting anyway — "
+            "capture the pane and redeliver with `fleet send` if it doesn't land.",
+            file=sys.stderr,
+        )
+
+    for attempt in (1, 2):
+        _tmux("set-buffer", prompt)
+        _tmux("paste-buffer", "-p", "-t", target)  # -p = bracketed paste
+        time.sleep(0.4)
+        _tmux("send-keys", "-t", target, "Enter")
+        if _poll_pane(target, _pane_active, timeout=activity_timeout, interval=poll_interval):
+            return "confirmed"
+        if attempt == 1:
+            print(f"kickoff paste not confirmed on {target}; retrying once", file=sys.stderr)
+
+    print(
+        f"KICKOFF_UNCONFIRMED: pasted the kickoff to {target} but never saw claude start "
+        'processing. Capture the pane; if the prompt is still empty, redeliver with '
+        '`fleet send <issue> "<prompt>" --interrupt`.',
+        file=sys.stderr,
+    )
+    return "never-ready" if not ready else "unconfirmed"
 
 
 def _fmt_age(updated_at: str | None) -> str:
@@ -1000,7 +1086,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_spawn.add_argument("--launch", help="Command to launch (default: claude)")
     p_spawn.add_argument("--no-kickoff", action="store_true", help="Skip pasting the kickoff prompt")
     p_spawn.add_argument("--focus", action="store_true", help="Switch tmux to the new window (default: create it detached so it never steals focus / races your typing)")
-    p_spawn.add_argument("--boot-wait", type=float, default=6.0, help="Seconds to wait for claude to boot before paste")
+    p_spawn.add_argument("--boot-wait", type=float, default=6.0, help="Seconds to settle before polling for claude's prompt")
+    p_spawn.add_argument("--ready-timeout", type=float, default=90.0, help="Max seconds to wait for claude's prompt before pasting anyway")
     p_spawn.add_argument("--dry-run", action="store_true", help="Print the plan without doing anything")
     p_spawn.set_defaults(func=cmd_spawn)
 
