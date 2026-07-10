@@ -32,6 +32,9 @@ usage: |
   Config:
     FLEET_REDIS_URL env or vault key (default redis://localhost:6379). Everything is
     namespaced fleet:<run>:... so concurrent runs never collide.
+
+  KNOWN FOLLOW-UP: `send --interrupt` sends tmux `Escape` + bracketed-paste nudge; the
+  exact key/timing against a live claude TUI mid-generation still needs validation/tuning.
 """
 
 from __future__ import annotations
@@ -50,6 +53,8 @@ import redis
 VAULT_PATH = Path.home() / ".sherpa" / "vault.json"
 STATE_PATH = Path.home() / ".sherpa" / "fleet.json"
 DEFAULT_REDIS_URL = "redis://localhost:6379"
+
+DEFAULT_SMOKE = "cd e2e && uv run pytest tests/ui/test_smoke.py"
 
 VALID_STATES = {
     "booting",
@@ -681,6 +686,165 @@ def cmd_inbox(args) -> int:
     return 0
 
 
+def _issue_commits(base_ref: str, branch: str, repo: str) -> list[str]:
+    """Commits on `branch` not yet on `base_ref`, oldest first (cherry-pick order)."""
+    out = _git("rev-list", "--reverse", f"{base_ref}..{branch}", cwd=repo, check=False)
+    if out.returncode != 0:
+        return []
+    return [c for c in out.stdout.split() if c]
+
+
+def cmd_land(args) -> int:
+    """Assemble a batch branch, cherry-pick each worker, smoke-test, STOP for go, single push.
+
+    Issue order on the command line IS the cherry-pick order — put the churny/biggest last.
+    """
+    client = _connect()
+    run = _resolve_run(args)
+    repo = _repo_root()
+    issues = [str(i) for i in args.issues]
+    base = args.onto or "dev"
+    base_ref = f"origin/{base}"
+    batch = f"batch-{run}"
+    smoke = args.smoke or DEFAULT_SMOKE
+
+    fetch = _git("fetch", "origin", base, cwd=repo, check=False)
+    if fetch.returncode != 0:
+        print(f"FETCH_ERROR: git fetch origin {base}: {fetch.stderr.strip()}", file=sys.stderr)
+        return 2
+
+    co = _git("checkout", "-B", batch, base_ref, cwd=repo, check=False)
+    if co.returncode != 0:
+        print(f"CHECKOUT_ERROR: {co.stderr.strip()}", file=sys.stderr)
+        return 2
+
+    picked: dict[str, list[str]] = {}
+    for issue in issues:
+        branch = f"issue-{issue}"
+        commits = _issue_commits(base_ref, branch, repo)
+        if not commits:
+            print(f"warning: issue {issue} ({branch}) has no commits ahead of {base_ref}", file=sys.stderr)
+        for commit in commits:
+            cp = _git("cherry-pick", commit, cwd=repo, check=False)
+            if cp.returncode != 0:
+                _git("cherry-pick", "--abort", cwd=repo, check=False)
+                print(
+                    f"CONFLICT: cherry-pick of {commit[:8]} (issue {issue}) failed and was "
+                    f"aborted. Resolve the ordering/conflict manually, then re-run.\n"
+                    f"{cp.stderr.strip()}",
+                    file=sys.stderr,
+                )
+                return 2
+        picked[issue] = commits
+
+    if not args.skip_smoke:
+        print(f"running smoke: {smoke}", file=sys.stderr)
+        result = subprocess.run(smoke, shell=True, cwd=repo)
+        if result.returncode != 0:
+            print(
+                f"SMOKE_FAILED (exit {result.returncode}) on the assembled tree — NOT pushing. "
+                f"Batch branch {batch} is left in place for inspection.",
+                file=sys.stderr,
+            )
+            return 2
+
+    if not args.push:
+        print(json.dumps({
+            "run": run, "batch": batch, "base": base, "picked": picked,
+            "smoke": "passed" if not args.skip_smoke else "skipped",
+            "next": f"human go required — re-run with --push to push {batch} -> origin/{base} (one CI build)",
+        }))
+        print(
+            f"\nSTOP — assembled {batch} ({sum(len(v) for v in picked.values())} commits) and "
+            f"smoke {'passed' if not args.skip_smoke else 'was skipped'}.\n"
+            f"Human go required. To complete the single push:\n"
+            f"  sherpa fleet land {' '.join(issues)} --onto {base} --push\n",
+            file=sys.stderr,
+        )
+        return 0
+
+    push = _git("push", "origin", f"{batch}:{base}", cwd=repo, check=False)
+    if push.returncode != 0:
+        print(f"PUSH_ERROR: {push.stderr.strip()}", file=sys.stderr)
+        return 2
+
+    # ff local base to match what we just pushed (best-effort)
+    ff_ok = False
+    if _git("checkout", base, cwd=repo, check=False).returncode == 0:
+        ff_ok = _git("merge", "--ff-only", batch, cwd=repo, check=False).returncode == 0
+    else:
+        ff_ok = _git("checkout", "-b", base, "--track", base_ref, cwd=repo, check=False).returncode == 0
+
+    for issue in issues:
+        _register_worker(client, run, issue)
+        _write_status(client, run, issue, {"state": "landed"})
+        _emit_event(client, run, issue, "land", {"state": "landed", "batch": batch})
+
+    cleaned = []
+    if args.cleanup:
+        for issue in issues:
+            cleaned.append(_kill_one(client, run, issue, repo, base, force=True))
+
+    print(json.dumps({
+        "run": run, "batch": batch, "base": base, "pushed": True,
+        "ff_local_base": ff_ok, "picked": picked, "cleaned": cleaned,
+    }))
+    print(f"pushed {batch} -> origin/{base} (single CI build). Landed: {', '.join(issues)}", file=sys.stderr)
+    if not args.cleanup:
+        print(f"cleanup when ready:  sherpa fleet kill {' '.join(issues)} --run {run}", file=sys.stderr)
+    return 0
+
+
+def _branch_merged(branch: str, base_ref: str, repo: str) -> bool:
+    return _git("merge-base", "--is-ancestor", branch, base_ref, cwd=repo, check=False).returncode == 0
+
+
+def _kill_one(client: redis.Redis, run: str, issue: str, repo: str, base: str, force: bool) -> dict:
+    status = client.hgetall(k_status(run, issue))
+    branch = status.get("branch") or f"issue-{issue}"
+    worktree = status.get("worktree")
+    window = status.get("window")
+    session = status.get("session") or ""
+    landed = status.get("state") == "landed"
+    merged = _branch_merged(branch, f"origin/{base}", repo)
+
+    if not (landed or merged or force):
+        return {"issue": issue, "killed": False, "reason": "not landed/merged; pass --force"}
+
+    if window and _tmux_available():
+        target = f"{session}:{window}" if session else window
+        _tmux("kill-window", "-t", target, check=False)
+    if worktree and os.path.isdir(worktree):
+        _git("worktree", "remove", "--force", worktree, cwd=repo, check=False)
+    _git("branch", "-D", branch, cwd=repo, check=False)
+
+    final_state = "landed" if (landed or merged) else "aborted"
+    _write_status(client, run, issue, {"state": final_state})
+    _emit_event(client, run, issue, "kill", {"state": final_state})
+    return {"issue": issue, "killed": True, "state": final_state}
+
+
+def cmd_kill(args) -> int:
+    client = _connect()
+    run = _resolve_run(args)
+    repo = _repo_root()
+    base = args.onto or "dev"
+    if args.all:
+        issues = sorted(client.smembers(k_workers(run)))
+    elif args.issues:
+        issues = [str(i) for i in args.issues]
+    else:
+        print("NO_TARGET: pass one or more <issue> or --all.", file=sys.stderr)
+        return 1
+
+    results = [_kill_one(client, run, str(i), repo, base, force=args.force) for i in issues]
+    print(json.dumps({"run": run, "results": results}))
+    skipped = [r for r in results if not r["killed"]]
+    if skipped:
+        print(f"skipped (use --force): {', '.join(r['issue'] for r in skipped)}", file=sys.stderr)
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -756,6 +920,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_inbox.add_argument("--issue", help="Issue id (default: FLEET_ISSUE)")
     p_inbox.add_argument("--json", action="store_true", help="JSON output")
     p_inbox.set_defaults(func=cmd_inbox)
+
+    p_land = sub.add_parser("land", help="Assemble + smoke + single-push a batch of workers")
+    p_land.add_argument("issues", nargs="+", help="Issues in cherry-pick order (churny/biggest LAST)")
+    p_land.add_argument("--onto", help="Base branch to land onto (default: dev)")
+    p_land.add_argument("--push", action="store_true", help="Complete the single push (default: STOP for human go)")
+    p_land.add_argument("--smoke", help=f"Combined smoke command (default: {DEFAULT_SMOKE!r})")
+    p_land.add_argument("--skip-smoke", action="store_true", help="Skip the smoke test (not recommended)")
+    p_land.add_argument("--cleanup", action="store_true", help="After a successful push, also kill the landed workers")
+    p_land.add_argument("--run", help="Run id")
+    p_land.set_defaults(func=cmd_land)
+
+    p_kill = sub.add_parser("kill", help="Tear down worker(s): tmux window + worktree + branch")
+    p_kill.add_argument("issues", nargs="*", help="Issues to kill")
+    p_kill.add_argument("--all", action="store_true", help="Kill every worker in the run")
+    p_kill.add_argument("--onto", help="Base branch to check merge status against (default: dev)")
+    p_kill.add_argument("--force", action="store_true", help="Kill even if the branch isn't landed/merged")
+    p_kill.add_argument("--run", help="Run id")
+    p_kill.set_defaults(func=cmd_kill)
 
     return parser
 
