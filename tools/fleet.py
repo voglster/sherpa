@@ -225,6 +225,32 @@ def _flatten(entries) -> list[dict]:
     return out
 
 
+def _blocking_xread(client, stream, start, block_ms, count, deadline):
+    """XREAD BLOCK that honors a wall-clock deadline instead of the client socket timeout.
+
+    A shared/managed FLEET_REDIS_URL usually carries a short `?socket_timeout=` (~60s),
+    which `from_url` applies and an explicit kwarg can't override. A raw
+    `XREAD BLOCK <block_ms>` longer than that trips a client-side socket read timeout
+    ("Timeout reading from socket") before the server returns. Re-issue the read on that
+    timeout — resuming from the same `start` id so nothing is missed — until `deadline`
+    (None = block forever). Returns the XREAD result, or None when the window elapses empty.
+    """
+    while True:
+        if deadline is None:
+            remaining_ms = block_ms
+        else:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            remaining_ms = max(1, int(remaining * 1000))
+        try:
+            return client.xread({stream: start}, block=remaining_ms, count=count)
+        except redis.exceptions.TimeoutError:
+            if deadline is None or time.monotonic() < deadline:
+                continue
+            return None
+
+
 # ---------------------------------------------------------------------------
 # git / tmux helpers
 # ---------------------------------------------------------------------------
@@ -567,11 +593,15 @@ def cmd_watch(args) -> int:
     if args.from_id is not None:
         start = "0-0" if args.from_id == "0" else args.from_id
     else:
-        start = _get_cursor(run) or "$"
+        # Resolve "new events only" to a concrete tail id (not "$") so that if a socket
+        # read times out and we re-issue below, we resume from exactly where we blocked
+        # and never miss an event that arrived during the reconnect gap.
+        start = _get_cursor(run) or _last_id(client, stream)
 
     block_ms = 0 if args.timeout is None else int(args.timeout * 1000)
+    deadline = None if args.timeout is None else time.monotonic() + args.timeout
     try:
-        result = client.xread({stream: start}, block=block_ms, count=args.count)
+        result = _blocking_xread(client, stream, start, block_ms, args.count, deadline)
     except redis.RedisError as exc:
         print(f"REDIS_ERROR: {exc}", file=sys.stderr)
         return 2
