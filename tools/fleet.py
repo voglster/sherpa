@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -111,25 +112,46 @@ def _mint_run_id() -> str:
     return f"{stamp}-{suffix}"
 
 
+def _repo_key() -> str:
+    """Abs repo root (git), or cwd if not a git repo — the key for the stored run default."""
+    try:
+        return _git("rev-parse", "--show-toplevel").stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return os.getcwd()
+
+
+def _store_run(run: str) -> str:
+    state = _load_state()
+    state.setdefault("repos", {})[_repo_key()] = run
+    _save_state(state)
+    return run
+
+
 def _resolve_run(args, *, mint: bool = False) -> str:
-    """--run > FLEET_RUN env > stored default > (mint if allowed)."""
+    """--run > FLEET_RUN env > stored default (keyed by repo root) > (mint if allowed)."""
     run = getattr(args, "run", None) or os.environ.get("FLEET_RUN")
     if run:
         return run
-    stored = _load_state().get("current_run")
+    stored = _load_state().get("repos", {}).get(_repo_key())
     if stored:
         return stored
     if mint:
-        run = _mint_run_id()
-        state = _load_state()
-        state["current_run"] = run
-        _save_state(state)
-        return run
+        return _store_run(_mint_run_id())
     print(
         "NO_RUN: no run id resolved. Pass --run, set FLEET_RUN, or run `fleet init`.",
         file=sys.stderr,
     )
     sys.exit(1)
+
+
+def _get_cursor(run: str) -> str | None:
+    return _load_state().get("cursors", {}).get(run)
+
+
+def _set_cursor(run: str, cursor_id: str) -> None:
+    state = _load_state()
+    state.setdefault("cursors", {})[run] = cursor_id
+    _save_state(state)
 
 
 def _resolve_issue(args) -> str:
@@ -183,6 +205,21 @@ def _register_worker(client: redis.Redis, run: str, issue: str) -> None:
     client.sadd(k_workers(run), issue)  # atomic
 
 
+def _last_id(client: redis.Redis, stream: str) -> str:
+    """Id of the last entry in a stream, or '0-0' if the stream is empty."""
+    tail = client.xrevrange(stream, count=1)
+    return tail[0][0] if tail else "0-0"
+
+
+def _flatten(entries) -> list[dict]:
+    """XREAD/XRANGE results → [{id, ...fields}] in arrival order."""
+    out = []
+    for _stream, items in entries:
+        for entry_id, fields in items:
+            out.append({"id": entry_id, **fields})
+    return out
+
+
 # ---------------------------------------------------------------------------
 # git / tmux helpers
 # ---------------------------------------------------------------------------
@@ -226,11 +263,8 @@ def _tmux_available() -> bool:
 # ---------------------------------------------------------------------------
 
 def cmd_init(args) -> int:
-    run = getattr(args, "run", None) or _mint_run_id()
-    state = _load_state()
-    state["current_run"] = run
-    _save_state(state)
-    print(json.dumps({"run": run, "redis_url": _redis_url(), "stored": str(STATE_PATH)}))
+    run = _store_run(getattr(args, "run", None) or _mint_run_id())
+    print(json.dumps({"run": run, "repo": _repo_key(), "redis_url": _redis_url(), "stored": str(STATE_PATH)}))
     print(f"fleet run: {run}", file=sys.stderr)
     return 0
 
@@ -299,6 +333,16 @@ def cmd_spawn(args) -> int:
         print(json.dumps({"dry_run": True, **plan}))
         return 0
 
+    # The Stop hook and worker report/ask all shell out to `sherpa`; fail before
+    # standing anything up if it can't resolve on PATH.
+    if not shutil.which("sherpa"):
+        print(
+            "SHERPA_NOT_ON_PATH: workers invoke `sherpa fleet ...`; install it "
+            "(uv tool install) and ensure it's on PATH before spawning.",
+            file=sys.stderr,
+        )
+        return 2
+
     # 1. Worktree (idempotent-ish: reuse if the path already exists)
     if not os.path.isdir(worktree):
         try:
@@ -318,7 +362,14 @@ def cmd_spawn(args) -> int:
         client,
         run,
         issue,
-        {"state": "booting", "branch": branch, "base": base, "worktree": worktree, "window": window},
+        {
+            "state": "booting",
+            "branch": branch,
+            "base": base,
+            "worktree": worktree,
+            "window": window,
+            "session": session or "",
+        },
     )
     _emit_event(client, run, issue, "spawn", {"state": "booting", "branch": branch})
 
@@ -498,6 +549,138 @@ def cmd_stop_hook(args) -> int:
     return 0
 
 
+def cmd_watch(args) -> int:
+    """XREAD BLOCK the events stream. Returns on the first event(s) or timeout.
+
+    Resumes from a per-run cursor (persisted locally) so events between two
+    `watch` calls aren't missed; --from overrides ('0' replays the whole stream).
+    """
+    client = _connect()
+    run = _resolve_run(args)
+    stream = k_events(run)
+
+    if args.from_id is not None:
+        start = "0-0" if args.from_id == "0" else args.from_id
+    else:
+        start = _get_cursor(run) or "$"
+
+    block_ms = 0 if args.timeout is None else int(args.timeout * 1000)
+    try:
+        result = client.xread({stream: start}, block=block_ms, count=args.count)
+    except redis.RedisError as exc:
+        print(f"REDIS_ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    events = _flatten(result) if result else []
+    if events:
+        _set_cursor(run, events[-1]["id"])
+
+    if args.json:
+        print(json.dumps({"run": run, "timed_out": not events, "events": events}))
+        return 0
+
+    if not events:
+        print(f"(timeout, no events) run: {run}")
+        return 0
+    for e in events:
+        commit = (e.get("commit") or "")[:8]
+        print(
+            f"[{e['id']}] issue {e.get('issue', '?'):<6} "
+            f"{e.get('event', '?'):<7} {e.get('state', ''):<14} "
+            f"{commit:<9} {e.get('msg', '')}"
+        )
+    return 0
+
+
+def _interrupt_worker(client: redis.Redis, run: str, issue: str, msg: str) -> bool:
+    """tmux nudge: halt the worker and surface the directive inline (durable copy is in the inbox)."""
+    status = client.hgetall(k_status(run, issue))
+    window = status.get("window")
+    if not window or not _tmux_available():
+        return False
+    session = status.get("session") or ""
+    target = f"{session}:{window}" if session else window
+    _tmux("send-keys", "-t", target, "Escape", check=False)
+    time.sleep(0.3)
+    nudge = f"[fleet] overseer directive (full copy in your inbox — run `sherpa fleet inbox`): {msg}"
+    _tmux("set-buffer", nudge, check=False)
+    _tmux("paste-buffer", "-p", "-t", target, check=False)
+    time.sleep(0.3)
+    _tmux("send-keys", "-t", target, "Enter", check=False)
+    return True
+
+
+def cmd_send(args) -> int:
+    client = _connect()
+    run = _resolve_run(args)
+    issue = str(args.issue)
+    entry = {"msg": args.message, "from": "overseer", "ts": f"{time.time():.3f}"}
+    msg_id = client.xadd(k_inbox(run, issue), entry)
+    nudged = False
+    if args.interrupt:
+        nudged = _interrupt_worker(client, run, issue, args.message)
+    print(json.dumps({"run": run, "issue": issue, "msg_id": msg_id, "interrupted": nudged}))
+    return 0
+
+
+def cmd_ask(args) -> int:
+    """Worker: report needs-decision, then block on the inbox until the overseer answers."""
+    client = _connect()
+    run = _resolve_run(args)
+    issue = _resolve_issue(args)
+    inbox = k_inbox(run, issue)
+
+    # Capture the inbox tail BEFORE announcing, so an answer XADDed the instant we
+    # report can't slip in ahead of our read.
+    start = _last_id(client, inbox)
+
+    _register_worker(client, run, issue)
+    _write_status(client, run, issue, {"state": "needs-decision", "msg": args.question})
+    _emit_event(client, run, issue, "ask", {"state": "needs-decision", "msg": args.question})
+
+    block_ms = 0 if args.timeout is None else int(args.timeout * 1000)
+    result = client.xread({inbox: start}, block=block_ms, count=1)
+    answers = _flatten(result) if result else []
+    if not answers:
+        print(json.dumps({"run": run, "issue": issue, "answered": False}))
+        return 3  # still needs-decision; overseer hasn't answered yet
+
+    answer = answers[0]
+    _write_status(client, run, issue, {"state": "working"})
+    _emit_event(client, run, issue, "resume", {"state": "working"})
+    print(json.dumps({"run": run, "issue": issue, "answered": True, "answer": answer.get("msg", ""), "msg_id": answer["id"]}))
+    return 0
+
+
+def cmd_inbox(args) -> int:
+    """Worker: read pending overseer directives (non-blocking, or --wait for the next)."""
+    client = _connect()
+    run = _resolve_run(args)
+    issue = _resolve_issue(args)
+    inbox = k_inbox(run, issue)
+    cursor_key = f"{inbox}:cursor"
+
+    start = client.get(cursor_key) or "0-0"
+    if args.wait:
+        block_ms = 0 if args.timeout is None else int(args.timeout * 1000)
+        result = client.xread({inbox: start}, block=block_ms, count=args.count)
+        messages = _flatten(result) if result else []
+    else:
+        exclusive = f"({start}" if start != "0-0" else "-"
+        raw = client.xrange(inbox, exclusive, "+", count=args.count)
+        messages = [{"id": mid, **fields} for mid, fields in raw]
+
+    if messages:
+        client.set(cursor_key, messages[-1]["id"])
+
+    if args.json or not messages:
+        print(json.dumps({"run": run, "issue": issue, "messages": messages}))
+        return 0
+    for m in messages:
+        print(f"[{m['id']}] {m.get('from', '?')}: {m.get('msg', '')}")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -542,6 +725,37 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_hook = sub.add_parser("stop-hook", help="Claude Code Stop hook: auto-report inferred state")
     p_hook.set_defaults(func=cmd_stop_hook)
+
+    p_watch = sub.add_parser("watch", help="Block on the events stream until a worker speaks")
+    p_watch.add_argument("--timeout", type=float, help="Seconds to block (default: block forever)")
+    p_watch.add_argument("--run", help="Run id")
+    p_watch.add_argument("--from", dest="from_id", help="Start id ('0' replays whole stream; default: resume cursor)")
+    p_watch.add_argument("--count", type=int, default=100, help="Max events to return per call")
+    p_watch.add_argument("--json", action="store_true", help="JSON output")
+    p_watch.set_defaults(func=cmd_watch)
+
+    p_send = sub.add_parser("send", help="XADD a directive to a worker's inbox (downlink)")
+    p_send.add_argument("issue", help="Target issue")
+    p_send.add_argument("message", help="Directive text")
+    p_send.add_argument("--interrupt", action="store_true", help="Also tmux send-keys to nudge the worker now")
+    p_send.add_argument("--run", help="Run id")
+    p_send.set_defaults(func=cmd_send)
+
+    p_ask = sub.add_parser("ask", help="Worker: report needs-decision + block until answered")
+    p_ask.add_argument("question", help="Question for the overseer")
+    p_ask.add_argument("--timeout", type=float, help="Seconds to block (default: block forever)")
+    p_ask.add_argument("--run", help="Run id (default: FLEET_RUN)")
+    p_ask.add_argument("--issue", help="Issue id (default: FLEET_ISSUE)")
+    p_ask.set_defaults(func=cmd_ask)
+
+    p_inbox = sub.add_parser("inbox", help="Worker: read pending directives")
+    p_inbox.add_argument("--wait", action="store_true", help="Block for the next directive")
+    p_inbox.add_argument("--timeout", type=float, help="With --wait: seconds to block")
+    p_inbox.add_argument("--count", type=int, default=100, help="Max messages to return")
+    p_inbox.add_argument("--run", help="Run id (default: FLEET_RUN)")
+    p_inbox.add_argument("--issue", help="Issue id (default: FLEET_ISSUE)")
+    p_inbox.add_argument("--json", action="store_true", help="JSON output")
+    p_inbox.set_defaults(func=cmd_inbox)
 
     return parser
 
