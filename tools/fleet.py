@@ -421,7 +421,7 @@ def cmd_spawn(args) -> int:
     new_window = ["new-window", "-n", window, "-c", worktree]
     if session:
         new_window += ["-t", session]
-    if args.detached:
+    if not args.focus:
         new_window.insert(1, "-d")
     _tmux(*new_window)
     target = f"{session}:{window}" if session else window
@@ -902,7 +902,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_spawn.add_argument("--session", help="tmux session to create the window in")
     p_spawn.add_argument("--launch", help="Command to launch (default: claude)")
     p_spawn.add_argument("--no-kickoff", action="store_true", help="Skip pasting the kickoff prompt")
-    p_spawn.add_argument("--detached", action="store_true", help="Create the tmux window detached (-d)")
+    p_spawn.add_argument("--focus", action="store_true", help="Switch tmux to the new window (default: create it detached so it never steals focus / races your typing)")
     p_spawn.add_argument("--boot-wait", type=float, default=6.0, help="Seconds to wait for claude to boot before paste")
     p_spawn.add_argument("--dry-run", action="store_true", help="Print the plan without doing anything")
     p_spawn.set_defaults(func=cmd_spawn)
