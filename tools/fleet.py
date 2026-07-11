@@ -22,6 +22,7 @@ usage: |
                                               XADD to a worker inbox (Phase 2)
     land <issue...> [--onto BRANCH] [--push]  Assemble + smoke + single-push a batch (Phase 3)
     kill <issue>|--all [--run ID]             Tear down tmux window(s) + worktree(s) (Phase 3)
+    clear [--all] [--force] [--run ID]        Reset run state (delete keys + forget default) at a session boundary
 
   Worker side (env FLEET_RUN / FLEET_ISSUE / FLEET_REDIS_URL provided by spawn):
     report --state STATE [--commit SHA] [--msg "..."] [--run ID] [--issue ID]
@@ -66,6 +67,9 @@ VALID_STATES = {
     "error",
     "idle",
 }
+
+# A worker in one of these is mid-flight — `clear` refuses to wipe it without --force.
+ACTIVE_STATES = {"booting", "working", "blocked", "needs-decision", "ready"}
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +161,28 @@ def _set_cursor(run: str, cursor_id: str) -> None:
     state = _load_state()
     state.setdefault("cursors", {})[run] = cursor_id
     _save_state(state)
+
+
+def _forget_run(run: str | None, *, all_runs: bool = False) -> list[str]:
+    """Drop stored run default(s) + watch cursor(s) from the local state file.
+
+    Returns the repo roots whose default was cleared. `all_runs` wipes every repo's
+    default and every cursor; otherwise only entries pointing at `run` are removed.
+    """
+    state = _load_state()
+    repos = state.setdefault("repos", {})
+    cursors = state.setdefault("cursors", {})
+    if all_runs:
+        cleared = list(repos)
+        state["repos"] = {}
+        state["cursors"] = {}
+    else:
+        cleared = [repo for repo, r in repos.items() if r == run]
+        for repo in cleared:
+            del repos[repo]
+        cursors.pop(run, None)
+    _save_state(state)
+    return cleared
 
 
 def _resolve_issue(args) -> str:
@@ -889,6 +915,65 @@ def cmd_kill(args) -> int:
     return 0
 
 
+def _run_workers(client: redis.Redis, run: str) -> list[tuple[str, str, dict]]:
+    """[(issue, state, status_hash)] for a run — used to guard/summarize a clear."""
+    out = []
+    for issue in sorted(client.smembers(k_workers(run))):
+        h = client.hgetall(k_status(run, issue))
+        out.append((issue, h.get("state", "unknown"), h))
+    return out
+
+
+def cmd_clear(args) -> int:
+    """Session-boundary reset: delete a run's Redis keys + forget the stored default.
+
+    Not a teardown — worktrees/tmux windows are `kill`'s job. Clears the bookkeeping so
+    a fresh session starts clean instead of replaying last batch's landed workers.
+    """
+    client = _connect()
+    if args.all:
+        runs = sorted({key.split(":", 2)[1] for key in client.scan_iter(match="fleet:*:workers", count=500)})
+    else:
+        runs = [_resolve_run(args)]
+
+    workers = [(run, issue, state, h) for run in runs for issue, state, h in _run_workers(client, run)]
+    active = [(run, issue, state) for run, issue, state, _ in workers if state in ACTIVE_STATES]
+    if active and not args.force:
+        listing = ", ".join(f"#{i} ({s})" for _, i, s in active)
+        print(
+            f"ACTIVE_WORKERS: refusing to clear — in-flight: {listing}. "
+            "Land or kill them first, or pass --force.",
+            file=sys.stderr,
+        )
+        return 1
+
+    stale_worktrees = [
+        h["worktree"]
+        for _, _, _, h in workers
+        if h.get("worktree") and os.path.isdir(h["worktree"])
+    ]
+
+    pattern = "fleet:*" if args.all else f"fleet:{runs[0]}:*"
+    keys = list(client.scan_iter(match=pattern, count=500))
+    deleted = client.delete(*keys) if keys else 0
+    cleared_repos = _forget_run(None if args.all else runs[0], all_runs=args.all)
+
+    print(json.dumps({
+        "cleared": True,
+        "runs": runs,
+        "redis_keys_deleted": deleted,
+        "repo_defaults_cleared": cleared_repos,
+        "forced_over_active": [f"#{i}" for _, i, _ in active] if args.force else [],
+    }))
+    if stale_worktrees:
+        print(
+            "NOTE: worktrees still on disk (clear does not remove them; use `kill --force`): "
+            + ", ".join(stale_worktrees),
+            file=sys.stderr,
+        )
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -982,6 +1067,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_kill.add_argument("--force", action="store_true", help="Kill even if the branch isn't landed/merged")
     p_kill.add_argument("--run", help="Run id")
     p_kill.set_defaults(func=cmd_kill)
+
+    p_clear = sub.add_parser("clear", help="Reset a run's Redis state + forget the stored default (session boundary)")
+    p_clear.add_argument("--all", action="store_true", help="Clear every run's keys + all stored defaults, not just the current one")
+    p_clear.add_argument("--force", action="store_true", help="Clear even if workers are still in-flight (booting/working/blocked/needs-decision/ready)")
+    p_clear.add_argument("--run", help="Run id (default: the stored default for this repo)")
+    p_clear.set_defaults(func=cmd_clear)
 
     return parser
 
