@@ -658,6 +658,16 @@ def cmd_send(args) -> int:
     nudged = False
     if args.interrupt:
         nudged = _interrupt_worker(client, run, issue, args.message)
+        # An --interrupt actively wakes the worker and re-tasks it, so its prior
+        # reported state (ready / needs-decision) is now stale. Flip it to
+        # "working" so `fleet status` reflects reality without the overseer
+        # re-inspecting the worker's window. If the worker never acts, its Stop
+        # hook re-infers the real state (ready when clean+ahead) when it next
+        # goes idle. A plain queued send (no --interrupt) does NOT touch state —
+        # the worker may not have seen the message, and it sets its own state
+        # when it acts on the inbox (see cmd_ask).
+        _write_status(client, run, issue, {"state": "working"})
+        _emit_event(client, run, issue, "nudge", {"state": "working", "msg": args.message})
     print(json.dumps({"run": run, "issue": issue, "msg_id": msg_id, "interrupted": nudged}))
     return 0
 

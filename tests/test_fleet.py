@@ -185,3 +185,30 @@ def test_inbox_cursor_advances(run_ctx, monkeypatch, capsys):
     )
     assert rc == 0
     assert json.loads(capsys.readouterr().out)["messages"] == []
+
+
+def test_interrupt_send_resets_state_to_working(run_ctx, monkeypatch):
+    """`send --interrupt` re-tasks the worker, so its stale reported state
+    (e.g. ready) flips to working — the overseer shouldn't have to re-inspect
+    the window. A plain queued send does NOT touch state."""
+    client, run = run_ctx
+    _env(monkeypatch, run, issue="42")
+    status_key = fleet.k_status(run, "42")
+
+    # Worker had reported ready.
+    fleet._write_status(client, run, "42", {"state": "ready", "commit": "abc123"})
+
+    # Plain send (no interrupt): state must NOT change (worker hasn't seen it).
+    with contextlib.redirect_stdout(io.StringIO()):
+        fleet.cmd_send(
+            argparse.Namespace(issue="42", message="fyi", interrupt=False, run=run)
+        )
+    assert client.hget(status_key, "state") == "ready"
+
+    # Interrupt send: state flips to working (tmux nudge stubbed out).
+    monkeypatch.setattr(fleet, "_interrupt_worker", lambda *a, **k: True)
+    with contextlib.redirect_stdout(io.StringIO()):
+        fleet.cmd_send(
+            argparse.Namespace(issue="42", message="rework the selector", interrupt=True, run=run)
+        )
+    assert client.hget(status_key, "state") == "working"
