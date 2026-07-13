@@ -714,7 +714,8 @@ def cmd_ask(args) -> int:
     _emit_event(client, run, issue, "ask", {"state": "needs-decision", "msg": args.question})
 
     block_ms = 0 if args.timeout is None else int(args.timeout * 1000)
-    result = client.xread({inbox: start}, block=block_ms, count=1)
+    deadline = None if args.timeout is None else time.monotonic() + args.timeout
+    result = _blocking_xread(client, inbox, start, block_ms, 1, deadline)
     answers = _flatten(result) if result else []
     if not answers:
         print(json.dumps({"run": run, "issue": issue, "answered": False}))
@@ -738,7 +739,8 @@ def cmd_inbox(args) -> int:
     start = client.get(cursor_key) or "0-0"
     if args.wait:
         block_ms = 0 if args.timeout is None else int(args.timeout * 1000)
-        result = client.xread({inbox: start}, block=block_ms, count=args.count)
+        deadline = None if args.timeout is None else time.monotonic() + args.timeout
+        result = _blocking_xread(client, inbox, start, block_ms, args.count, deadline)
         messages = _flatten(result) if result else []
     else:
         exclusive = f"({start}" if start != "0-0" else "-"

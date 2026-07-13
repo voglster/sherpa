@@ -166,6 +166,82 @@ def test_ask_send_roundtrip_blocks_until_answered(run_ctx, monkeypatch):
     assert client.hget(status_key, "state") == "working"
 
 
+def _with_socket_timeout(url: str, seconds: float) -> str:
+    """Return `url` carrying a `socket_timeout` query param (mimics a shared/managed redis)."""
+    from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+    parts = urlparse(url)
+    query = dict(parse_qsl(parts.query))
+    query["socket_timeout"] = str(seconds)
+    return urlunparse(parts._replace(query=urlencode(query)))
+
+
+def test_ask_survives_socket_timeout_shorter_than_block_window(run_ctx, monkeypatch):
+    """Regression: a short `?socket_timeout=` must not sink `ask`'s long block.
+
+    The overseer answers only AFTER the socket read timeout would have fired, so a raw
+    `xread(block=...)` longer than socket_timeout raises "Timeout reading from socket".
+    Routing through `_blocking_xread` re-issues the read across that timeout and still
+    delivers the answer.
+    """
+    _client, run = run_ctx
+    short_url = _with_socket_timeout(REDIS_URL, 1)
+    _env(monkeypatch, run, issue="8")
+    monkeypatch.setenv("FLEET_REDIS_URL", short_url)
+
+    box: dict = {}
+
+    def ask():
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            box["rc"] = fleet.cmd_ask(
+                argparse.Namespace(question="which file?", timeout=6, run=None, issue=None)
+            )
+        box["out"] = buf.getvalue()
+
+    thread = threading.Thread(target=ask)
+    thread.start()
+
+    status_key = fleet.k_status(run, "8")
+    for _ in range(50):
+        if _client.hget(status_key, "state") == "needs-decision":
+            break
+        time.sleep(0.1)
+    assert _client.hget(status_key, "state") == "needs-decision"
+
+    # Answer only after the 1s socket_timeout has elapsed at least once, proving the
+    # read is re-issued across the socket timeout rather than dying on it.
+    time.sleep(2)
+    assert thread.is_alive()  # not raised, not returned early
+    with contextlib.redirect_stdout(io.StringIO()):
+        fleet.cmd_send(
+            argparse.Namespace(issue="8", message="edit config.yaml", interrupt=False, run=run)
+        )
+
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert box["rc"] == 0
+    answer = json.loads(box["out"])
+    assert answer["answered"] is True
+    assert answer["answer"] == "edit config.yaml"
+    assert _client.hget(status_key, "state") == "working"
+
+
+def test_inbox_wait_survives_socket_timeout_and_returns_empty(run_ctx, monkeypatch, capsys):
+    """Regression: `inbox --wait` with a block window longer than a short socket_timeout
+    must time out empty instead of raising a socket read timeout."""
+    _client, run = run_ctx
+    short_url = _with_socket_timeout(REDIS_URL, 1)
+    _env(monkeypatch, run, issue="11")
+    monkeypatch.setenv("FLEET_REDIS_URL", short_url)
+
+    rc = fleet.cmd_inbox(
+        argparse.Namespace(wait=True, timeout=2, count=100, run=run, issue=None, json=True)
+    )
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["messages"] == []
+
+
 def test_inbox_cursor_advances(run_ctx, monkeypatch, capsys):
     client, run = run_ctx
     _env(monkeypatch, run, issue="11")
