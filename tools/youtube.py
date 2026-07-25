@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = []
+# dependencies = ["python-toon==0.1.3"]
 # ///
 """
 name: youtube
 description: Fetch YouTube transcripts, metadata, and chapters via yt-dlp. Writes a timestamped markdown transcript to cache and returns its path.
 categories: [youtube, video, transcript, research, read]
+axi: true
 usage: |
-  transcript <URL_OR_VIDEO_ID> [--refresh] [--interval 30] [--no-auto-update]
-  info <URL_OR_VIDEO_ID> [--no-auto-update]
-  version
-  update
+  transcript <URL_OR_VIDEO_ID> [--refresh] [--interval 30] [--no-auto-update] [--fields ...] [--json]
+  info <URL_OR_VIDEO_ID> [--full] [--fields channel,upload_date,url,view_count] [--no-auto-update] [--json]
+  version [--json]
+  update [--json]
 """
 
 import argparse
@@ -23,6 +24,9 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from sherpa.render import bin_line, emit, fail, parse_strict, truncate
 
 CACHE_DIR = Path.home() / ".sherpa" / "cache" / "youtube"
 UPGRADE_MARKER = CACHE_DIR / ".last-upgrade-attempt"
@@ -40,6 +44,8 @@ STALENESS_SIGNATURES = (
     "failed to extract any player response",
     "please report this issue on",
 )
+
+EXTRA_INFO_FIELDS = ("channel", "upload_date", "url", "view_count")
 
 
 def format_timestamp(seconds: float) -> str:
@@ -184,8 +190,7 @@ def url_of(target: str) -> str:
 def require_ytdlp() -> str:
     binary = shutil.which("yt-dlp")
     if not binary:
-        print("yt-dlp not found on PATH. Install with: uv tool install yt-dlp", file=sys.stderr)
-        sys.exit(1)
+        fail("yt-dlp is not installed", help="install with: uv tool install yt-dlp", usage=True)
     return binary
 
 
@@ -250,33 +255,73 @@ def fetch_metadata(target: str, allow_auto_update: bool) -> tuple[dict, bool]:
         ["--skip-download", "--dump-json", "--no-warnings", url_of(target)], allow_auto_update
     )
     if result.returncode != 0 or not result.stdout.strip():
-        print(f"Metadata fetch failed:\n{result.stderr.strip()[-2000:]}", file=sys.stderr)
-        sys.exit(2)
+        reason = next((line for line in reversed(result.stderr.strip().splitlines())), "no output")
+        video = video_id_of(target)
+        fail(
+            f"could not fetch metadata for {video}: {reason}",
+            help=f"youtube version to check for a stale fetcher, then youtube update",
+        )
     return json.loads(result.stdout.splitlines()[0]), upgraded
 
 
-def summarize(meta: dict) -> dict:
-    return {
+def parse_fields(raw: str | None) -> set[str] | None:
+    if not raw:
+        return None
+    return {name.strip() for name in raw.split(",") if name.strip()}
+
+
+def summarize(meta: dict, fields: set[str] | None = None) -> dict:
+    payload = {
         "video_id": meta.get("id"),
         "title": meta.get("title"),
-        "channel": meta.get("channel") or meta.get("uploader"),
         "duration": format_timestamp(meta.get("duration") or 0),
-        "upload_date": meta.get("upload_date"),
-        "url": meta.get("webpage_url"),
-        "view_count": meta.get("view_count"),
         "chapters": [
             {"t": format_timestamp(chapter.get("start_time") or 0), "title": chapter.get("title")}
             for chapter in (meta.get("chapters") or [])
         ],
     }
+    extra = {
+        "channel": meta.get("channel") or meta.get("uploader"),
+        "upload_date": meta.get("upload_date"),
+        "url": meta.get("webpage_url"),
+        "view_count": meta.get("view_count"),
+    }
+    for name in fields or ():
+        if name in extra:
+            payload[name] = extra[name]
+    return payload
+
+
+def build_info_payload(meta: dict, fields: set[str] | None, full: bool) -> dict:
+    payload = summarize(meta, fields)
+    description = meta.get("description") or ""
+    if full:
+        payload["description"] = description
+        return payload
+
+    preview, notice = truncate(description, 1000)
+    payload["description"] = preview
+    if notice:
+        payload["description_notice"] = notice
+        payload["help"] = f"youtube info {meta.get('id')} --full for the complete description"
+    return payload
+
+
+def require_track(meta: dict, video: str) -> tuple[str, bool]:
+    track = pick_track(meta.get("subtitles"), meta.get("automatic_captions"))
+    if not track:
+        fail(
+            f"no English captions available for {video}",
+            help=f"youtube info {video} to check which languages exist",
+        )
+    return track
 
 
 def cmd_info(args: argparse.Namespace) -> None:
     meta, upgraded = fetch_metadata(args.target, not args.no_auto_update)
-    payload = summarize(meta)
-    payload["description"] = (meta.get("description") or "")[:4000]
+    payload = build_info_payload(meta, parse_fields(args.fields), args.full)
     payload["auto_upgraded"] = upgraded
-    print(json.dumps(payload, indent=2))
+    emit(payload, as_json=args.json)
 
 
 def cmd_transcript(args: argparse.Namespace) -> None:
@@ -284,15 +329,19 @@ def cmd_transcript(args: argparse.Namespace) -> None:
     destination = CACHE_DIR / f"{video}.md"
 
     if destination.exists() and not args.refresh:
-        print(json.dumps({"video_id": video, "path": str(destination), "cached": True,
-                          "words": len(destination.read_text().split())}, indent=2))
+        emit(
+            {
+                "video_id": video,
+                "path": str(destination),
+                "cached": True,
+                "words": len(destination.read_text().split()),
+            },
+            as_json=args.json,
+        )
         return
 
     meta, upgraded = fetch_metadata(args.target, not args.no_auto_update)
-    track = pick_track(meta.get("subtitles"), meta.get("automatic_captions"))
-    if not track:
-        print(f"No English captions available for {video}.", file=sys.stderr)
-        sys.exit(2)
+    track = require_track(meta, video)
 
     lang, _ = track
     with tempfile.TemporaryDirectory() as workdir:
@@ -312,19 +361,24 @@ def cmd_transcript(args: argparse.Namespace) -> None:
         upgraded = upgraded or retried
         tracks = sorted(Path(workdir).glob("*.vtt"))
         if not tracks:
-            print(f"Caption download produced no VTT file:\n{result.stderr.strip()[-2000:]}", file=sys.stderr)
-            sys.exit(2)
+            reason = next((line for line in reversed(result.stderr.strip().splitlines())), "no output")
+            fail(
+                f"caption download for {video} produced no subtitle file: {reason}",
+                help=f"youtube transcript {video} --refresh to retry",
+            )
         cues = parse_vtt(tracks[0].read_text(encoding="utf-8", errors="replace"))
 
     if not cues:
-        print(f"Caption track {lang} parsed to zero lines.", file=sys.stderr)
-        sys.exit(2)
+        fail(
+            f"caption track {lang} for {video} parsed to zero lines",
+            help=f"youtube transcript {video} --refresh to retry",
+        )
 
     document = render_document(meta, track, cues, args.interval)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     destination.write_text(document, encoding="utf-8")
 
-    payload = summarize(meta)
+    payload = summarize(meta, parse_fields(args.fields))
     payload.update(
         captions=f"{lang} ({'auto-generated' if track[1] else 'manual'})",
         words=len(document.split()),
@@ -332,26 +386,44 @@ def cmd_transcript(args: argparse.Namespace) -> None:
         cached=False,
         auto_upgraded=upgraded,
     )
-    print(json.dumps(payload, indent=2))
+    emit(payload, as_json=args.json)
 
 
-def cmd_version(_: argparse.Namespace) -> None:
+def cmd_version(args: argparse.Namespace) -> None:
     age = ytdlp_age_days()
-    print(json.dumps({
-        "yt_dlp": ytdlp_version(),
-        "path": str(Path(require_ytdlp()).resolve()),
-        "age_days": round(age, 1) if age is not None else None,
-        "stale_hint": age is not None and age > 30,
-    }, indent=2))
+    emit(
+        {
+            "yt_dlp": ytdlp_version(),
+            "path": str(Path(require_ytdlp()).resolve()),
+            "age_days": round(age, 1) if age is not None else None,
+            "stale_hint": age is not None and age > 30,
+        },
+        as_json=args.json,
+    )
 
 
-def cmd_update(_: argparse.Namespace) -> None:
+def cmd_update(args: argparse.Namespace) -> None:
     result = upgrade_ytdlp()
-    print(json.dumps(result, indent=2))
-    sys.exit(0 if result["ok"] else 2)
+    emit(result, as_json=args.json)
+    sys.exit(0 if result["ok"] else 1)
 
 
-def main() -> None:
+def cmd_home() -> None:
+    cached = sorted(CACHE_DIR.glob("*.md")) if CACHE_DIR.exists() else []
+    lines = [
+        bin_line(sys.argv[0]),
+        "description: Fetch YouTube transcripts, metadata, and chapters via yt-dlp.",
+        f"cached_transcripts: {len(cached)}",
+    ]
+    if cached:
+        lines.append("recent: " + ", ".join(path.stem for path in cached[-3:]))
+    lines.append("hint: youtube info <VIDEO_ID_OR_URL> for metadata and chapters")
+    lines.append("hint: youtube transcript <VIDEO_ID_OR_URL> for the full transcript")
+    print("\n".join(lines))
+    sys.exit(0)
+
+
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Fetch YouTube transcripts, metadata, and chapters.")
     sub = parser.add_subparsers(dest="command")
 
@@ -360,15 +432,24 @@ def main() -> None:
     transcript.add_argument("--refresh", action="store_true", help="Re-fetch even if cached")
     transcript.add_argument("--interval", type=int, default=30, help="Seconds per timestamped paragraph")
     transcript.add_argument("--no-auto-update", action="store_true", help="Never auto-upgrade yt-dlp on failure")
+    transcript.add_argument("--fields", help=f"Extra metadata fields to include: {', '.join(EXTRA_INFO_FIELDS)}")
+    transcript.add_argument("--json", action="store_true", help="Emit the previous JSON shape")
 
     info = sub.add_parser("info", help="Fetch metadata and chapters only")
     info.add_argument("target", help="YouTube URL or 11-character video ID")
     info.add_argument("--no-auto-update", action="store_true", help="Never auto-upgrade yt-dlp on failure")
+    info.add_argument("--full", action="store_true", help="Do not truncate the description")
+    info.add_argument("--fields", help=f"Extra metadata fields to include: {', '.join(EXTRA_INFO_FIELDS)}")
+    info.add_argument("--json", action="store_true", help="Emit the previous JSON shape")
 
-    sub.add_parser("version", help="Report installed yt-dlp version and age")
-    sub.add_parser("update", help="Upgrade yt-dlp to the latest release")
+    version = sub.add_parser("version", help="Report installed yt-dlp version and age")
+    version.add_argument("--json", action="store_true", help="Emit the previous JSON shape")
 
-    args = parser.parse_args()
+    update = sub.add_parser("update", help="Upgrade yt-dlp to the latest release")
+    update.add_argument("--json", action="store_true", help="Emit the previous JSON shape")
+
+    subparsers = {"transcript": transcript, "info": info, "version": version, "update": update}
+    args = parse_strict(parser, subparsers, argv)
 
     match args.command:
         case "transcript":
@@ -380,8 +461,7 @@ def main() -> None:
         case "update":
             cmd_update(args)
         case _:
-            parser.print_help()
-            sys.exit(1)
+            cmd_home()
 
 
 if __name__ == "__main__":

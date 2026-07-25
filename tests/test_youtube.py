@@ -158,3 +158,46 @@ def test_known_breakage_signatures_are_recognized_as_stale(stderr):
 
 def test_missing_captions_is_not_mistaken_for_staleness():
     assert not youtube.looks_stale("ERROR: no subtitles available for this video")
+
+
+def test_no_args_shows_content_not_help(capsys, monkeypatch):
+    monkeypatch.setattr(youtube.sys, "argv", ["youtube"])
+    with pytest.raises(SystemExit) as exit_info:
+        youtube.main()
+    out = capsys.readouterr().out
+    assert "bin: " in out and "description: " in out
+    assert "usage:" not in out
+    assert exit_info.value.code == 0
+
+
+def test_no_english_captions_fails_on_stdout_without_network(capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        youtube.require_track({"subtitles": {}, "automatic_captions": {}}, "abc12345678")
+    captured = capsys.readouterr()
+    assert captured.out.startswith("error: ")
+    assert "abc12345678" in captured.out
+    assert captured.err == ""
+    assert exit_info.value.code == 1
+
+
+def test_long_description_is_truncated_with_notice_and_full_hint():
+    meta = {"id": "abc12345678", "title": "T", "duration": 10, "description": "x" * 5000}
+    payload = youtube.build_info_payload(meta, fields=None, full=False)
+    assert len(payload["description"]) == 1000
+    assert "5000 chars total" in payload["description_notice"]
+    assert "abc12345678 --full" in payload["help"]
+
+
+def test_short_description_carries_no_truncation_notice():
+    meta = {"id": "abc12345678", "title": "T", "duration": 10, "description": "short"}
+    payload = youtube.build_info_payload(meta, fields=None, full=False)
+    assert payload["description"] == "short"
+    assert "description_notice" not in payload
+    assert "help" not in payload
+
+
+def test_unknown_flag_is_rejected_rather_than_ignored(capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        youtube.main(["info", "abc12345678", "--referesh"])
+    assert "--referesh" in capsys.readouterr().out
+    assert exit_info.value.code == 2
