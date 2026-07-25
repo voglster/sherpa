@@ -103,8 +103,10 @@ def test_re_executing_the_module_leaves_the_installed_quoting_patch_alone(capsys
     already_installed = render.toon.primitives.is_safe_unquoted
     _SPEC.loader.exec_module(render)
     assert render.toon.primitives.is_safe_unquoted is already_installed
-    render.emit({"note": "#comment"})
-    assert '"#comment"' in capsys.readouterr().out
+    render.emit({"note": "plain text", "hash": "#comment"})
+    out = capsys.readouterr().out
+    assert "note: plain text" in out
+    assert '"#comment"' in out
 
 
 def test_pristine_encoder_stays_recoverable_from_the_patch():
