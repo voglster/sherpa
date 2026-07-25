@@ -14,6 +14,16 @@ little left to shed.
 Executing any row below (conversion or replacement) is out of scope for
 this document; this is the decision record only.
 
+**Row count vs. tool count**: `sherpa list` shows 21 top-level tools. The
+table below has more than 21 rows because tools that mix list-shaped and
+detail-shaped subcommands are split into one row per shape-group (e.g.
+`jira_issues` becomes a "done" row for `search` plus two axi-ify rows for
+its other subcommands), so the priority column stays honest about which
+subcommands actually benefit. The two "replace candidate rejected" rows
+are commentary on `client_db` and `slack_messenger`, not additional
+tools. To reconcile row count against the bucket summary below: count
+distinct tool names, not rows.
+
 ## Legend
 
 - **Shape**: `list` (many uniform rows — the shape TOON's key-folding
@@ -38,6 +48,7 @@ this document; this is the decision record only.
 | `jira_admin epic/subtask/complete-subtask/assign-subtask/link/weblink` | detail (single mutation confirmation) | axi-ify | — | low | Each returns one confirmation object for one issue action. Detail-shaped; convert for contract consistency (`--json`, exit codes, `fail()`) more than for token savings. |
 | `client_db find/aggregate` | list (query result rows) | axi-ify | — | high | Primary use is returning many uniform documents from a MongoDB query — the clearest list shape in the catalog outside jira. See "replace candidates rejected" below for why this is axi-ify, not replace. |
 | `client_db count` | detail (single number) | axi-ify | — | low | Single scalar result; convert for contract consistency only. |
+| `client_db config` | detail (one instance's connection info + database list) | axi-ify | — | low | Returns one instance's config as a single object; detail-shaped even though it lists databases, since those are nested inside one instance's record, not a row-per-instance table. |
 | `client_db search/collections` | list (client instances / collection names) | axi-ify | — | medium | Search-by-name and collection listing are both small uniform lists. |
 | `knowledge list/search` | list | axi-ify | — | high | Facts store; `list`/`search` return many uniform key/value/tags rows — direct list shape, same family as jira search. |
 | `knowledge get/add/remove` | detail | axi-ify | — | low | Single-entry operations; convert for consistency. |
@@ -46,8 +57,9 @@ this document; this is the decision record only.
 | `sentry_issues fetch/resolve` | detail | axi-ify | — | low | Both return one issue's detail. No list subcommand exists. Low priority but cheap and harmless to convert (TOON degrades gracefully on scalars, per the measurement doc). |
 | `slack_messenger channels/users` | list | axi-ify | — | high | `channels [--filter]` and `users [--filter]` return many uniform rows (name, id, etc.) — the local caching/fuzzy-match logic lives in the lookup, not the output shape, so conversion doesn't touch it. |
 | `slack_messenger send/dm` | detail (single message-sent confirmation) | axi-ify | — | low | One confirmation per call; convert for contract consistency. See "replace candidates rejected" — this subcommand pair is exactly where the custom mention/link/cache logic lives, which is why `slack_messenger` as a whole is axi-ify, not replace. |
-| `slack_pomodoro start/stop` | detail (single status object) | axi-ify | — | low | Timer start/stop returns one status snapshot; detail-shaped, low payoff but cheap. |
+| `slack_pomodoro start/status/cancel` | detail | axi-ify | — | low | Real subcommands are `start`, `status`, and `cancel` (there is no `stop`). `start` and `cancel` each return one confirmation of the state change they just made; `status` is its own query returning the current timer's single snapshot rather than something `start`/`cancel` hand back. All three are single-object, detail-shaped. The internal `_daemon` subcommand is excluded from this table — it is the background process `start` forks into, not a user-invocable command, so it has no independent output contract to triage. |
 | `ask_ai models` | list | axi-ify | — | medium | Returns a list of available models; moderate row count expected. |
+| `ask_ai default` | detail (get or set the default model) | axi-ify | — | low | Returns/sets one model-name value; detail-shaped, no row-per-item output. |
 | `ask_ai ask` | detail (single completion) | axi-ify | — | low | One prompt, one response; detail-shaped. |
 | `unsplash_search search` | list | axi-ify | — | medium | Returns N photo results, uniform fields (id, url, description, etc.) — list shape, moderate row counts (`--count`, default likely small). |
 | `unsplash_search download` | detail | axi-ify | — | low | Single-file download confirmation. |
@@ -102,15 +114,17 @@ this document; this is the decision record only.
 19. `notes_search read/context/create/append/edit/rename/delete`
 20. `sentry_issues fetch/resolve`
 21. `slack_messenger send/dm`
-22. `slack_pomodoro start/stop`
+22. `slack_pomodoro start/status/cancel`
 23. `ask_ai ask`
-24. `unsplash_search download`
-25. `vault_manager list/get/set/delete`
-26. `image_edit` (all subcommands)
-27. `image_gen generate`
-28. `notify`
-29. `lumbergh` (single-item subcommands)
-30. `fleet` (all subcommands except `status`)
+24. `ask_ai default`
+25. `client_db config`
+26. `unsplash_search download`
+27. `vault_manager list/get/set/delete`
+28. `image_edit` (all subcommands)
+29. `image_gen generate`
+30. `notify`
+31. `lumbergh` (single-item subcommands)
+32. `fleet` (all subcommands except `status`)
 
 ## Notes on tools with both list and detail subcommands
 
