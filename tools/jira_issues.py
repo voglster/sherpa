@@ -52,10 +52,18 @@ def _load_vault() -> dict:
 
 
 def _load_secret(key: str) -> str:
+    """Vault lookup for the unconverted subcommands.
+
+    Differs from `_load_secret_axi` only in reporting channel: the
+    `MISSING_SECRET: KEY` stderr line is what sherpa's runner scrapes to tell
+    the user which key to set, and moving it to stdout would change these
+    subcommands' output. The exit code is the AXI one either way, so a missing
+    secret is 2 from every subcommand of this tool.
+    """
     value = _load_vault().get(key)
     if not value:
         print(f"MISSING_SECRET: {key}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(2)
     return value
 
 
@@ -79,9 +87,8 @@ def _client() -> httpx.Client:
 def _load_secret_axi(key: str) -> str:
     """Vault lookup for the AXI-converted `search` path.
 
-    Unconverted subcommands keep using `_load_secret`/`_client`, which exit
-    directly rather than routing through `fail()`; this variant exists so
-    converting `search`'s error handling doesn't change their behavior.
+    Reports on stdout through `fail()` as the AXI contract requires, which is
+    the whole reason it is separate from `_load_secret` — see that docstring.
     """
     value = _load_vault().get(key)
     if not value:
