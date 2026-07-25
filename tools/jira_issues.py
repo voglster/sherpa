@@ -770,14 +770,19 @@ def translate_jira_error(status_code: int, body: str, *, fallback: str) -> str:
     return fallback
 
 
-def _search_execute(client: httpx.Client, jql: str, max_results: int) -> tuple[list[dict], int]:
-    """Fetch a page of issues plus the query's true total.
+def _search_execute(client: httpx.Client, jql: str, max_results: int) -> tuple[list[dict], int, bool]:
+    """Fetch a page of issues, the query's total, and whether that total is exact.
 
     `/rest/api/3/search/jql` (the current, non-deprecated search endpoint)
     does not return a `total` — only `issues`, `nextPageToken`, and `isLast`.
-    The true total comes from the separate `/rest/api/3/search/approximate-count`
-    endpoint, Jira's own replacement for the `total` the old `/rest/api/3/search`
-    endpoint used to return (that endpoint now responds 410 Gone).
+    When `isLast` is true the page itself contains every matching issue, so
+    `len(issues)` IS the exact total and no further call is needed. Only when
+    `isLast` is false is a second call to `/rest/api/3/search/approximate-count`
+    required — Jira's own (named, by them, "approximate") replacement for the
+    `total` the old `/rest/api/3/search` endpoint used to return (that endpoint
+    now responds 410 Gone). A failure of that supplementary call — network
+    error, non-200 status, or a non-JSON body — must never break the search
+    itself, so it degrades to the page size rather than propagating.
     """
     try:
         resp = client.post("/rest/api/3/search/jql", json={
@@ -800,15 +805,19 @@ def _search_execute(client: httpx.Client, jql: str, max_results: int) -> tuple[l
         )
         fail(f"search failed: {reason}", help=help_text, usage=usage)
 
-    issues = resp.json().get("issues", [])
+    data = resp.json()
+    issues = data.get("issues", [])
+
+    if data.get("isLast", False):
+        return issues, len(issues), True
 
     try:
         count_resp = client.post("/rest/api/3/search/approximate-count", json={"jql": jql})
         total = count_resp.json().get("count", len(issues)) if count_resp.status_code == 200 else len(issues)
-    except httpx.HTTPError:
+    except (httpx.HTTPError, ValueError):
         total = len(issues)
 
-    return issues, total
+    return issues, total, False
 
 
 def search_rows(issues: list[dict], fields: set[str] | None = None) -> list[dict]:
@@ -835,7 +844,19 @@ def search_rows(issues: list[dict], fields: set[str] | None = None) -> list[dict
     return rows
 
 
-def search_payload(issues: list[dict], total: int, fields: set[str] | None = None) -> dict:
+def search_payload(
+    issues: list[dict],
+    total: int,
+    fields: set[str] | None = None,
+    *,
+    total_is_exact: bool = True,
+) -> dict:
+    """Shape issues + total into the AXI list payload.
+
+    `total_is_exact` is passed in rather than inferred here, so this stays a
+    pure function of its arguments — the caller (which knows whether the total
+    came from a full page or the approximate-count endpoint) decides.
+    """
     rows = search_rows(issues, fields)
     if not rows:
         return {
@@ -843,7 +864,7 @@ def search_payload(issues: list[dict], total: int, fields: set[str] | None = Non
             "issues": "0 issues matched this query",
             "help": ["Broaden the JQL, or remove --project/--status filters"],
         }
-    return {
+    payload = {
         "count": f"{len(rows)} of {total} total",
         "issues": rows,
         "help": [
@@ -851,6 +872,9 @@ def search_payload(issues: list[dict], total: int, fields: set[str] | None = Non
             f"Use --fields to add columns: {', '.join(EXTRA_SEARCH_FIELDS)}",
         ],
     }
+    if not total_is_exact:
+        payload["total_is_approximate"] = True
+    return payload
 
 
 def parse_fields(raw: str | None) -> set[str] | None:
@@ -864,13 +888,16 @@ def cmd_search(args: argparse.Namespace) -> None:
     print(f"JQL: {jql}", file=sys.stderr)
 
     with _client_axi() as client:
-        issues, total = _search_execute(client, jql, args.max_results)
+        issues, total, total_is_exact = _search_execute(client, jql, args.max_results)
 
     if args.json:
-        emit({"total": total, "issues": search_rows(issues, set(EXTRA_SEARCH_FIELDS))}, as_json=True)
+        json_payload = {"total": total, "issues": search_rows(issues, set(EXTRA_SEARCH_FIELDS))}
+        if not total_is_exact:
+            json_payload["total_is_approximate"] = True
+        emit(json_payload, as_json=True)
         return
 
-    payload = search_payload(issues, total, parse_fields(args.fields))
+    payload = search_payload(issues, total, parse_fields(args.fields), total_is_exact=total_is_exact)
     emit(payload, as_json=False)
 
 

@@ -47,3 +47,73 @@ def test_empty_result_states_the_zero_explicitly():
 def test_hints_use_placeholders_rather_than_guessed_values():
     hints = jira_issues.search_payload([ISSUE], total=1)["help"]
     assert any("<" in hint for hint in hints)
+
+
+def test_exact_total_omits_the_approximate_marker():
+    payload = jira_issues.search_payload([ISSUE], total=1, total_is_exact=True)
+    assert "total_is_approximate" not in payload
+
+
+def test_inexact_total_is_flagged_approximate():
+    payload = jira_issues.search_payload([ISSUE], total=847, total_is_exact=False)
+    assert payload["total_is_approximate"] is True
+
+
+class _FakeResponse:
+    def __init__(self, status_code, body=None, text=""):
+        self.status_code = status_code
+        self._body = body
+        self.text = text
+
+    def json(self):
+        if self._body is None:
+            raise ValueError("response body is not valid JSON")
+        return self._body
+
+
+class _FakeClient:
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = 0
+
+    def post(self, url, json=None):
+        response = self._responses[self.calls]
+        self.calls += 1
+        return response
+
+
+def test_isLast_true_reports_exact_total_without_a_second_call():
+    client = _FakeClient([_FakeResponse(200, {"issues": [ISSUE], "isLast": True})])
+    issues, total, total_is_exact = jira_issues._search_execute(client, "project = KB", 20)
+    assert issues == [ISSUE]
+    assert total == 1
+    assert total_is_exact is True
+    assert client.calls == 1
+
+
+def test_garbage_count_response_does_not_break_the_search():
+    client = _FakeClient([
+        _FakeResponse(200, {"issues": [ISSUE], "isLast": False}),
+        _FakeResponse(200, body=None, text="<html>not json</html>"),
+    ])
+    issues, total, total_is_exact = jira_issues._search_execute(client, "project = KB", 20)
+    assert issues == [ISSUE]
+    assert total == 1
+    assert total_is_exact is False
+
+
+def test_count_call_network_failure_does_not_break_the_search():
+    import httpx
+
+    class _RaisingClient(_FakeClient):
+        def post(self, url, json=None):
+            if self.calls == 0:
+                return super().post(url, json)
+            self.calls += 1
+            raise httpx.ConnectError("connection refused")
+
+    client = _RaisingClient([_FakeResponse(200, {"issues": [ISSUE], "isLast": False})])
+    issues, total, total_is_exact = jira_issues._search_execute(client, "project = KB", 20)
+    assert issues == [ISSUE]
+    assert total == 1
+    assert total_is_exact is False
