@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["httpx", "markdown-it-py"]
+# dependencies = ["httpx", "markdown-it-py", "python-toon==0.1.3"]
 # ///
 """
 name: jira_issues
 description: Create, update, search, and transition Jira issues with sprint support
 categories: [jira, tickets, project-management, sprint]
+axi: true
 secrets:
   - JIRA_URL
   - JIRA_USERNAME
@@ -20,8 +21,13 @@ usage: |
   transition <ISSUE_KEY> --status '<status>'
   comment <ISSUE_KEY> [--body '...'|--body-file PATH|--body-stdin] [--dry-run]
   search [--jql '<JQL>'] [--project KEY] [--status '<status>'] [--mine] [--current-sprint]
+         [--fields assignee,priority,type,updated] [--json]
   sprints [--board ID]
   Body input: --description / --body accept '@PATH' shorthand to read from a file.
+
+  Note: only `search` has been converted to the AXI contract (TOON output,
+  strict flags, emit/fail). The other subcommands above are unconverted
+  follow-on work and still use the pre-AXI JSON/argparse conventions.
 """
 
 import argparse
@@ -33,8 +39,12 @@ from pathlib import Path
 import httpx
 from markdown_it import MarkdownIt
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from sherpa.render import bin_line, emit, fail, parse_strict, truncate
+
 VAULT_PATH = Path.home() / ".sherpa" / "vault.json"
 USER_CACHE_PATH = Path.home() / ".sherpa" / "jira_users.json"
+EXTRA_SEARCH_FIELDS = ("type", "assignee", "priority", "updated")
 
 
 def _load_vault() -> dict:
@@ -58,6 +68,31 @@ def _client() -> httpx.Client:
     base_url = _load_secret("JIRA_URL").rstrip("/")
     username = _load_secret("JIRA_USERNAME")
     token = _load_secret("JIRA_API_TOKEN")
+    return httpx.Client(
+        base_url=base_url,
+        auth=(username, token),
+        headers={"Accept": "application/json", "Content-Type": "application/json"},
+        timeout=30,
+    )
+
+
+def _load_secret_axi(key: str) -> str:
+    """Vault lookup for the AXI-converted `search` path.
+
+    Unconverted subcommands keep using `_load_secret`/`_client`, which exit
+    directly rather than routing through `fail()`; this variant exists so
+    converting `search`'s error handling doesn't change their behavior.
+    """
+    value = _load_vault().get(key)
+    if not value:
+        fail(f"missing secret {key}", help=f"sherpa vault_manager set {key} <value>", usage=True)
+    return value
+
+
+def _client_axi() -> httpx.Client:
+    base_url = _load_secret_axi("JIRA_URL").rstrip("/")
+    username = _load_secret_axi("JIRA_USERNAME")
+    token = _load_secret_axi("JIRA_API_TOKEN")
     return httpx.Client(
         base_url=base_url,
         auth=(username, token),
@@ -684,54 +719,159 @@ def cmd_transition(args: argparse.Namespace) -> None:
     print(json.dumps({"key": args.issue_key, "status": match["name"]}))
 
 
-def cmd_search(args: argparse.Namespace) -> None:
+def _build_search_jql(args: argparse.Namespace) -> str:
     if args.jql:
-        jql = args.jql
-    else:
-        parts = []
-        project = args.project or _load_default("JIRA_DEFAULT_PROJECT")
-        if project:
-            parts.append(f"project = {project}")
-        if args.mine:
-            parts.append("assignee = currentUser()")
-        if args.current_sprint:
-            prefix = _load_default("JIRA_DEFAULT_SPRINT_PREFIX")
-            if prefix:
-                parts.append(f'sprint = "{prefix}" AND sprint in openSprints()')
-            else:
-                parts.append("sprint in openSprints()")
-        if args.status:
-            parts.append(f'status = "{args.status}"')
-        if not parts:
-            print("Provide --jql or at least --project (or set JIRA_DEFAULT_PROJECT)", file=sys.stderr)
-            sys.exit(1)
-        jql = " AND ".join(parts) + " ORDER BY updated DESC"
+        return args.jql
+    parts = []
+    project = args.project or _load_default("JIRA_DEFAULT_PROJECT")
+    if project:
+        parts.append(f"project = {project}")
+    if args.mine:
+        parts.append("assignee = currentUser()")
+    if args.current_sprint:
+        prefix = _load_default("JIRA_DEFAULT_SPRINT_PREFIX")
+        if prefix:
+            parts.append(f'sprint = "{prefix}" AND sprint in openSprints()')
+        else:
+            parts.append("sprint in openSprints()")
+    if args.status:
+        parts.append(f'status = "{args.status}"')
+    if not parts:
+        fail(
+            "no search scope given",
+            help="provide --jql '<JQL>', or --project <PROJECT_KEY> (or set JIRA_DEFAULT_PROJECT in the vault)",
+            usage=True,
+        )
+    return " AND ".join(parts) + " ORDER BY updated DESC"
 
-    print(f"JQL: {jql}", file=sys.stderr)
-    with _client() as client:
+
+JIRA_ERROR_SIGNATURES = (
+    (401, None, "Jira rejected the credentials"),
+    (403, None, "Jira denied access to this resource"),
+    (400, "jql", "Jira rejected the query: check the JQL syntax"),
+)
+
+
+def translate_jira_error(status_code: int, body: str, *, fallback: str) -> str:
+    """Map a Jira API failure to an owned, actionable phrase.
+
+    Never echoes the raw Jira error body (which can contain field-level
+    validation dumps) to the caller — an unrecognized signature falls back
+    to a generic, tool-agnostic phrase instead.
+    """
+    lowered = (body or "").lower()
+    for code, needle, phrase in JIRA_ERROR_SIGNATURES:
+        if status_code == code and (needle is None or needle in lowered):
+            return phrase
+    if status_code == 400:
+        return "Jira rejected the request"
+    if status_code >= 500:
+        return "Jira is currently unavailable"
+    return fallback
+
+
+def _search_execute(client: httpx.Client, jql: str, max_results: int) -> tuple[list[dict], int]:
+    """Fetch a page of issues plus the query's true total.
+
+    `/rest/api/3/search/jql` (the current, non-deprecated search endpoint)
+    does not return a `total` — only `issues`, `nextPageToken`, and `isLast`.
+    The true total comes from the separate `/rest/api/3/search/approximate-count`
+    endpoint, Jira's own replacement for the `total` the old `/rest/api/3/search`
+    endpoint used to return (that endpoint now responds 410 Gone).
+    """
+    try:
         resp = client.post("/rest/api/3/search/jql", json={
             "jql": jql,
-            "maxResults": args.max_results,
+            "maxResults": max_results,
             "fields": ["summary", "status", "assignee", "issuetype", "priority", "updated"],
         })
-        if resp.status_code != 200:
-            print(f"Search failed: {resp.status_code} {resp.text}", file=sys.stderr)
-            sys.exit(2)
-        data = resp.json()
+    except httpx.HTTPError as exc:
+        print(str(exc), file=sys.stderr)
+        fail("could not reach Jira: network error", help="check network connectivity and JIRA_URL in the vault")
 
-    issues = []
-    for item in data.get("issues", []):
-        f = item["fields"]
-        issues.append({
-            "key": item["key"],
+    if resp.status_code != 200:
+        print(resp.text, file=sys.stderr)
+        reason = translate_jira_error(resp.status_code, resp.text, fallback="search request failed")
+        usage = resp.status_code in (400, 401, 403)
+        help_text = (
+            "jira_issues search --jql '<VALID_JQL>' with corrected syntax"
+            if resp.status_code == 400
+            else "check JIRA_URL, JIRA_USERNAME, and JIRA_API_TOKEN in the vault"
+        )
+        fail(f"search failed: {reason}", help=help_text, usage=usage)
+
+    issues = resp.json().get("issues", [])
+
+    try:
+        count_resp = client.post("/rest/api/3/search/approximate-count", json={"jql": jql})
+        total = count_resp.json().get("count", len(issues)) if count_resp.status_code == 200 else len(issues)
+    except httpx.HTTPError:
+        total = len(issues)
+
+    return issues, total
+
+
+def search_rows(issues: list[dict], fields: set[str] | None = None) -> list[dict]:
+    """Shape raw Jira issues into the AXI list schema: {key, summary, status} by
+    default, plus any of `fields` (a subset of EXTRA_SEARCH_FIELDS)."""
+    wanted = fields or set()
+    rows = []
+    for issue in issues:
+        f = issue.get("fields", {})
+        row = {
+            "key": issue.get("key"),
             "summary": f.get("summary"),
-            "status": f.get("status", {}).get("name"),
-            "type": f.get("issuetype", {}).get("name"),
-            "assignee": (f.get("assignee") or {}).get("displayName"),
-            "priority": (f.get("priority") or {}).get("name"),
-            "updated": f.get("updated"),
-        })
-    print(json.dumps({"total": data.get("total", 0), "issues": issues}, indent=2))
+            "status": (f.get("status") or {}).get("name"),
+        }
+        if "type" in wanted:
+            row["type"] = (f.get("issuetype") or {}).get("name")
+        if "assignee" in wanted:
+            row["assignee"] = (f.get("assignee") or {}).get("displayName")
+        if "priority" in wanted:
+            row["priority"] = (f.get("priority") or {}).get("name")
+        if "updated" in wanted:
+            row["updated"] = f.get("updated")
+        rows.append(row)
+    return rows
+
+
+def search_payload(issues: list[dict], total: int, fields: set[str] | None = None) -> dict:
+    rows = search_rows(issues, fields)
+    if not rows:
+        return {
+            "count": f"0 of {total} total",
+            "issues": "0 issues matched this query",
+            "help": ["Broaden the JQL, or remove --project/--status filters"],
+        }
+    return {
+        "count": f"{len(rows)} of {total} total",
+        "issues": rows,
+        "help": [
+            "Run 'sherpa jira_issues get <ISSUE_KEY>' for full detail",
+            f"Use --fields to add columns: {', '.join(EXTRA_SEARCH_FIELDS)}",
+        ],
+    }
+
+
+def parse_fields(raw: str | None) -> set[str] | None:
+    if not raw:
+        return None
+    return {name.strip() for name in raw.split(",") if name.strip()}
+
+
+def cmd_search(args: argparse.Namespace) -> None:
+    jql = _build_search_jql(args)
+    print(f"JQL: {jql}", file=sys.stderr)
+
+    with _client_axi() as client:
+        issues, total = _search_execute(client, jql, args.max_results)
+
+    if args.json:
+        emit({"total": total, "issues": search_rows(issues, set(EXTRA_SEARCH_FIELDS))}, as_json=True)
+        return
+
+    payload = search_payload(issues, total, parse_fields(args.fields))
+    emit(payload, as_json=False)
 
 
 def cmd_sprints(args: argparse.Namespace) -> None:
@@ -791,16 +931,29 @@ def cmd_comment(args: argparse.Namespace) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
-def main():
+def cmd_home() -> None:
+    lines = [
+        bin_line(sys.argv[0]),
+        "description: Create, update, search, and transition Jira issues with sprint support.",
+        "hint: jira_issues search --mine for your open issues",
+        "hint: jira_issues get <ISSUE_KEY> for full detail",
+    ]
+    print("\n".join(lines))
+    sys.exit(0)
+
+
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Create, update, search, and transition Jira issues.",
         epilog="Defaults loaded from vault: JIRA_DEFAULT_PROJECT, JIRA_DEFAULT_BOARD, "
                "JIRA_DEFAULT_SPRINT_PREFIX, JIRA_DEFAULT_ASSIGNEE",
     )
     sub = parser.add_subparsers(dest="command")
+    subparsers: dict[str, argparse.ArgumentParser] = {}
 
     # create
     p = sub.add_parser("create", help="Create an issue (optionally in your active sprint)")
+    subparsers["create"] = p
     p.add_argument("--project", default=None, help="Project key (default: vault JIRA_DEFAULT_PROJECT)")
     p.add_argument("--summary", required=True, help="Issue summary/title")
     p.add_argument("--description", default=None, help="Markdown description (or '@PATH' to read from file)")
@@ -814,10 +967,12 @@ def main():
 
     # get
     p = sub.add_parser("get", help="Fetch issue details by key")
+    subparsers["get"] = p
     p.add_argument("issue_key", help="Issue key (e.g. KB-123)")
 
     # update
     p = sub.add_parser("update", help="Update fields on an existing issue")
+    subparsers["update"] = p
     p.add_argument("issue_key", help="Issue key (e.g. KB-123)")
     p.add_argument("--summary", default=None, help="New summary")
     p.add_argument("--description", default=None, help="New markdown description (or '@PATH' to read from file)")
@@ -831,20 +986,25 @@ def main():
 
     # transition
     p = sub.add_parser("transition", help="Move issue to a new status")
+    subparsers["transition"] = p
     p.add_argument("issue_key", help="Issue key (e.g. KB-123)")
     p.add_argument("--status", required=True, help="Target status name (e.g. Done)")
 
     # search
     p = sub.add_parser("search", help="Search issues with JQL or convenience filters")
+    subparsers["search"] = p
     p.add_argument("--jql", default=None, help="Raw JQL query (overrides other filters)")
     p.add_argument("--project", default=None, help="Filter by project (default: vault)")
     p.add_argument("--status", default=None, help="Filter by status")
     p.add_argument("--mine", action="store_true", help="Only issues assigned to me")
     p.add_argument("--current-sprint", action="store_true", help="Only issues in my active sprint")
     p.add_argument("--max-results", type=int, default=20, help="Max results (default: 20)")
+    p.add_argument("--fields", default=None, help=f"Extra columns to include: {', '.join(EXTRA_SEARCH_FIELDS)}")
+    p.add_argument("--json", action="store_true", help="Emit the previous JSON shape")
 
     # comment
     p = sub.add_parser("comment", help="Add a comment to an issue")
+    subparsers["comment"] = p
     p.add_argument("issue_key", help="Issue key (e.g. KB-123)")
     p.add_argument("--body", default=None, help="Comment body markdown (or '@PATH' to read from file)")
     p.add_argument("--body-file", default=None, help="Read comment body from file")
@@ -853,12 +1013,14 @@ def main():
 
     # sprints
     p = sub.add_parser("sprints", help="List active/future sprints for your board")
+    subparsers["sprints"] = p
     p.add_argument("--board", type=int, default=None, help="Board ID (default: vault JIRA_DEFAULT_BOARD)")
 
     # Check for admin commands before argparse rejects them
     admin_commands = {"epic", "subtask", "complete-subtask", "assign-subtask"}
-    if len(sys.argv) > 1 and sys.argv[1] in admin_commands:
-        cmd = sys.argv[1]
+    argv_list = argv if argv is not None else sys.argv[1:]
+    if argv_list and argv_list[0] in admin_commands:
+        cmd = argv_list[0]
         print(
             f"Hint: '{cmd}' is available in jira_admin. "
             f"Run: uv run tools/jira_admin.py {cmd} --help",
@@ -866,7 +1028,7 @@ def main():
         )
         sys.exit(1)
 
-    args = parser.parse_args()
+    args = parse_strict(parser, subparsers, argv)
 
     match args.command:
         case "create":
@@ -884,8 +1046,7 @@ def main():
         case "comment":
             cmd_comment(args)
         case _:
-            parser.print_help()
-            sys.exit(1)
+            cmd_home()
 
 
 if __name__ == "__main__":
