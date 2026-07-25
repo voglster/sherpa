@@ -250,13 +250,40 @@ def run_ytdlp(command_args: list[str], allow_auto_update: bool) -> tuple[subproc
     return subprocess.run([require_ytdlp(), *command_args], capture_output=True, text=True), True
 
 
+DEPENDENCY_ERROR_SIGNATURES = (
+    ("private video", "private video"),
+    ("sign in to confirm your age", "age-restricted, requires sign-in"),
+    ("sign in to confirm you're not a bot", "blocked by a bot-check, requires sign-in"),
+    ("members-only content", "members-only video"),
+    ("video is no longer available", "video unavailable"),
+    ("video unavailable", "video unavailable"),
+    ("this live stream recording is not available", "live stream recording unavailable"),
+    ("copyright", "removed for a copyright claim"),
+)
+
+
+def translate_ytdlp_error(stderr: str, *, fallback: str) -> str:
+    """Map a known dependency failure signature to an owned phrase.
+
+    Never echoes the dependency's own formatted text (error-code prefixes,
+    extractor names) to the caller — an unrecognized signature falls back to
+    a generic, tool-agnostic phrase instead.
+    """
+    lowered = (stderr or "").lower()
+    for signature, phrase in DEPENDENCY_ERROR_SIGNATURES:
+        if signature in lowered:
+            return phrase
+    return fallback
+
+
 def fetch_metadata(target: str, allow_auto_update: bool) -> tuple[dict, bool]:
     result, upgraded = run_ytdlp(
         ["--skip-download", "--dump-json", "--no-warnings", url_of(target)], allow_auto_update
     )
     if result.returncode != 0 or not result.stdout.strip():
-        reason = next((line for line in reversed(result.stderr.strip().splitlines())), "no output")
+        print(result.stderr.strip()[-2000:], file=sys.stderr)
         video = video_id_of(target)
+        reason = translate_ytdlp_error(result.stderr, fallback="metadata fetch failed")
         fail(
             f"could not fetch metadata for {video}: {reason}",
             help=f"youtube version to check for a stale fetcher, then youtube update",
@@ -361,7 +388,8 @@ def cmd_transcript(args: argparse.Namespace) -> None:
         upgraded = upgraded or retried
         tracks = sorted(Path(workdir).glob("*.vtt"))
         if not tracks:
-            reason = next((line for line in reversed(result.stderr.strip().splitlines())), "no output")
+            print(result.stderr.strip()[-2000:], file=sys.stderr)
+            reason = translate_ytdlp_error(result.stderr, fallback="caption download failed")
             fail(
                 f"caption download for {video} produced no subtitle file: {reason}",
                 help=f"youtube transcript {video} --refresh to retry",

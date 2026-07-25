@@ -201,3 +201,17 @@ def test_unknown_flag_is_rejected_rather_than_ignored(capsys):
         youtube.main(["info", "abc12345678", "--referesh"])
     assert "--referesh" in capsys.readouterr().out
     assert exit_info.value.code == 2
+
+
+def test_known_dependency_error_maps_to_an_owned_phrase():
+    stderr = "ERROR: [youtube] zzzzzzzzzzz: Video unavailable"
+    assert youtube.translate_ytdlp_error(stderr, fallback="metadata fetch failed") == "video unavailable"
+
+
+def test_unrecognized_dependency_error_falls_back_without_echoing_it():
+    stderr = "ERROR: [youtube] abc12345678: some new internal extractor code XYZ123"
+    reason = youtube.translate_ytdlp_error(stderr, fallback="metadata fetch failed")
+    assert reason == "metadata fetch failed"
+    assert "XYZ123" not in reason
+    assert "yt-dlp" not in reason.lower()
+    assert "youtube]" not in reason
