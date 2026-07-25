@@ -799,7 +799,7 @@ def _search_execute(client: httpx.Client, jql: str, max_results: int) -> tuple[l
         reason = translate_jira_error(resp.status_code, resp.text, fallback="search request failed")
         usage = resp.status_code in (400, 401, 403)
         help_text = (
-            "jira_issues search --jql '<VALID_JQL>' with corrected syntax"
+            "sherpa jira_issues search --jql '<VALID_JQL>' with corrected syntax"
             if resp.status_code == 400
             else "check JIRA_URL, JIRA_USERNAME, and JIRA_API_TOKEN in the vault"
         )
@@ -868,7 +868,7 @@ def search_payload(
         "count": f"{len(rows)} of {total} total",
         "issues": rows,
         "help": [
-            "Run 'sherpa jira_issues get <ISSUE_KEY>' for full detail",
+            "sherpa jira_issues get <ISSUE_KEY> for full detail",
             f"Use --fields to add columns: {', '.join(EXTRA_SEARCH_FIELDS)}",
         ],
     }
@@ -962,8 +962,8 @@ def cmd_home() -> None:
     lines = [
         bin_line(sys.argv[0]),
         "description: Create, update, search, and transition Jira issues with sprint support.",
-        "hint: jira_issues search --mine for your open issues",
-        "hint: jira_issues get <ISSUE_KEY> for full detail",
+        "hint: sherpa jira_issues search --mine for your open issues",
+        "hint: sherpa jira_issues get <ISSUE_KEY> for full detail",
     ]
     print("\n".join(lines))
     sys.exit(0)
