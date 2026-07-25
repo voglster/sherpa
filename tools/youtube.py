@@ -437,7 +437,7 @@ def cmd_update(args: argparse.Namespace) -> None:
 
 
 def cmd_home() -> None:
-    cached = sorted(CACHE_DIR.glob("*.md")) if CACHE_DIR.exists() else []
+    cached = sorted(CACHE_DIR.glob("*.md"), key=lambda path: path.stat().st_mtime) if CACHE_DIR.exists() else []
     lines = [
         bin_line(sys.argv[0]),
         "description: Fetch YouTube transcripts, metadata, and chapters via yt-dlp.",
