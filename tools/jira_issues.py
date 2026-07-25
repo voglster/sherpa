@@ -119,7 +119,7 @@ def _resolve_project(args_project: str | None) -> str:
     if default:
         return default
     print("No --project specified and JIRA_DEFAULT_PROJECT not set in vault", file=sys.stderr)
-    sys.exit(1)
+    sys.exit(2)
 
 
 def _resolve_board(args_board: int | None) -> int:
@@ -129,7 +129,7 @@ def _resolve_board(args_board: int | None) -> int:
     if default:
         return int(default)
     print("No --board specified and JIRA_DEFAULT_BOARD not set in vault", file=sys.stderr)
-    sys.exit(1)
+    sys.exit(2)
 
 
 def _resolve_assignee(args_assignee: str | None) -> str | None:
@@ -174,14 +174,14 @@ def _resolve_body(
             f"Provide only one of --{label}, --{label}-file, --{label}-stdin",
             file=sys.stderr,
         )
-        sys.exit(1)
+        sys.exit(2)
 
     if file_path:
         try:
             body = Path(file_path).read_text()
         except OSError as e:
             print(f"Failed to read {file_path}: {e}", file=sys.stderr)
-            sys.exit(1)
+            sys.exit(2)
     elif use_stdin:
         body = sys.stdin.read()
     else:
@@ -189,14 +189,14 @@ def _resolve_body(
 
     if not body.strip():
         print(f"--{label} body is empty or whitespace", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(2)
     if _SHELL_SUBST_RE.search(body.strip().splitlines()[0] if body.strip() else ""):
         print(
             f"--{label} body looks like an unexpanded shell substitution "
             f"(starts with $(...)). Did you mean --{label}-file PATH?",
             file=sys.stderr,
         )
-        sys.exit(1)
+        sys.exit(2)
     return body
 
 
