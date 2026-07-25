@@ -56,7 +56,7 @@ from sherpa.render import bin_line, emit, fail, parse_strict, truncate
 It exposes:
 
 - `emit(payload: dict, *, as_json: bool = False) -> None` — encodes `payload` as TOON to stdout, or as indented JSON when `as_json=True` (wire this to the tool's `--json` flag). **Always go through `emit()`, never call `toon.encode` directly** — `render.py` patches a python-toon 0.1.3 spec bug (it under-quotes `#`-leading strings and raw control characters per TOON SPEC §15 and §7.1) by overriding `toon.primitives.is_safe_unquoted` at import time. Calling `toon.encode` yourself silently loses that fix.
-- `fail(message: str, *, help: str | None = None, usage: bool = False) -> NoReturn` — prints `error: <message>` (and `help: <help>` if given) to stdout and exits: `2` if `usage=True`, otherwise `1`.
+- `fail(message: str, *, help: str | None = None, usage: bool = False) -> NoReturn` — prints `error: <message>` (and `help: <help>` if given) to stdout and exits: `2` if `usage=True`, otherwise `1`. Pass `usage=True` whenever the caller must change something before retrying is worth attempting — a flag *or* the environment (see "Exit codes" below).
 - `truncate(text: str, limit: int = 1000) -> tuple[str, str | None]` — returns `(preview, notice)`; `notice` is `None` if `text` was short enough to pass through untouched, otherwise a string reporting the total size.
 - `bin_line(executable: str | Path) -> str` — formats a `bin: ~/path/to/tool` line (relative to `$HOME` when possible) for no-args output.
 - `parse_strict(parser, subparsers: dict[str, ArgumentParser] | None = None, argv=None) -> Namespace` — parses `argv` with `allow_abbrev=False` set on every parser involved, and exits (via `fail`, code 2) naming the first unrecognized flag and listing the valid set for the chosen subcommand. **Sherpa tools do not accept abbreviated flags**: `--stat` is rejected rather than silently resolved to `--state`. This is deliberate and matches AXI §6's canonical example.
@@ -68,8 +68,13 @@ It exposes:
 - **PEP 723:** Every tool must have an inline script metadata block (`# /// script` ... `# ///`), pinning `python-toon==0.1.3`.
 - **Args:** Use `argparse`, parsed via `parse_strict()` — never call `parser.parse_args()` directly. `--help` is automatic.
 - **stdout is TOON**, produced only through `emit()`. Every tool accepts `--json` for the previous shape.
-- **Exit codes**: `0` success including idempotent no-ops, `1` error, `2` usage error. **This inverts sherpa's old exit-code meanings** (previously `1` was usage error and `2` was runtime error) — do not carry the old mapping into a converted tool.
-- **Errors go to stdout** via `fail()`, with an actionable `help:` line naming a sherpa command. Translate dependency errors; never leak tracebacks or the wrapped tool's name.
+- **Exit codes:**
+  - `0` — success, including idempotent no-ops.
+  - `1` — the operation failed and retrying the same invocation is the reasonable next step, or nothing the caller controls would change the outcome: network errors, Jira 5xx, a video with no captions, a wrapped tool that crashed.
+  - `2` — **the caller must change something before retrying: flags *or* environment.** Unknown or missing flags, malformed values, a missing vault secret, a missing dependency binary, and rejected/unauthorized credentials (Jira 400/401/403) are all `2`. The test is "would re-running this identically ever work?" — if not, it is `2`. This is deliberately wider than "usage error": an agent reads `2` as *fix the invocation or the setup*, and `1` as *the world was uncooperative*.
+  - **This inverts sherpa's old exit-code meanings** (previously `1` was usage error and `2` was runtime error) — do not carry the old mapping into a converted tool.
+  - Within one tool, the same condition must always yield the same code, including from subcommands that are not yet converted.
+- **Errors go to stdout** via `fail()`, with an actionable `help:` line naming the full invocation the caller should run, `sherpa` prefix included (`sherpa youtube version`, not `youtube version`) — that is the string an agent has to execute. Translate dependency errors; never leak tracebacks or the wrapped tool's name.
 - **stderr is diagnostics only.** Never mix progress into stdout — an agent reads "Fetching..." as data.
 - **Minimal default schemas**: 3-4 fields in lists. Long-form content lives in detail views. Offer `--fields` for more.
 - **Truncate, never omit**: use `truncate()`, include the total size, and suggest `--full` only when truncation happened.
@@ -79,6 +84,8 @@ It exposes:
 - **No interactive prompts.** Every operation completable by flags alone; suppress prompts from wrapped tools.
 - **No-args prints live content** plus `bin:` and `description:` lines — not a usage manual.
 - **Contextual hints** on list and mutation output, omitted on detail views; dynamic values as `<id>` placeholders, never guessed.
+- **`help` is always a list of strings**, even when there is exactly one hint — `"help": ["sherpa jira_issues get <ISSUE_KEY>"]`, never a bare string. TOON encodes a string and a one-element list differently, so a tool that varies the shape forces the agent to type-check the key before reading it. Each hint names a full invocation with the `sherpa` prefix, same rule as `fail()`'s `help:` line.
+- **No-args home view is plain lines, not a TOON document** — `bin:`/`description:`/`hint:` prefixed lines printed directly, deliberately outside `emit()`. It is orientation for an agent that invoked the tool blind, not a payload to parse.
 - **Secrets:** Read `~/.sherpa/vault.json` directly:
   ```python
   vault_path = Path.home() / ".sherpa" / "vault.json"
@@ -107,8 +114,9 @@ A reviewer can run this against any tool to confirm it meets the contract:
 
 - [ ] Output goes through `emit()` (TOON), never raw `print(json.dumps(...))` or `toon.encode` directly
 - [ ] `--json` flag present, emitting the pre-conversion JSON shape
-- [ ] Exit codes correct: `0` success/no-op, `1` error, `2` usage error
-- [ ] Errors printed to stdout via `fail()`, with a `help:` line
+- [ ] Exit codes correct: `0` success/no-op, `1` uncooperative world, `2` caller must change flags or environment — and consistent across every subcommand of the tool
+- [ ] Errors printed to stdout via `fail()`, with a `help:` line naming a full `sherpa ...` invocation
+- [ ] Any `help` key in emitted output is a list of strings, never a bare string
 - [ ] List/default schemas are ≤4 fields, with `--fields` for more
 - [ ] True totals reported (`count: N of M total`), not just the page size
 - [ ] Empty states are explicit and state the zero with context
