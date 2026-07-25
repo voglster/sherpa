@@ -68,7 +68,7 @@ same fields, so a direct comparison does not isolate TOON's encoding:
 
 So the direct TOON-vs-`--json` comparison bundles three effects: TOON's
 key-folding, dropping 4 of 7 fields, and pretty-vs-compact JSON. To
-isolate the encoding-only effect, the TOON side was re-captured with
+isolate TOON's schema-matched effect, the TOON side was re-captured with
 `--fields type,assignee,priority,updated` so both sides carry all 7
 fields, and a compact (non-indented) re-serialization of the same
 `--json` output was generated to isolate the pretty-print component:
@@ -95,11 +95,11 @@ apples-to-apples and needed no correction.
 |---|---|---|---|---|
 | youtube-detail | 1 obj / 18 rows | 834 | 601 | 27.9% |
 | jira-typical — total conversion effect (3-field TOON vs 7-field pretty JSON) | 20 | 1795 | 516 | 71.3% |
-| jira-typical — encoding-only (7-field TOON vs 7-field pretty JSON) | 20 | 1795 | 1054 | 41.3% |
-| jira-typical — pure encoding (7-field TOON vs 7-field compact JSON) | 20 | 1568 | 1054 | 32.8% |
+| jira-typical — schema-matched (7-field TOON vs 7-field pretty JSON) | 20 | 1795 | 1054 | 41.3% |
+| jira-typical — schema+format-matched (7-field TOON vs 7-field compact JSON) | 20 | 1568 | 1054 | 32.8% |
 | jira-large — total conversion effect (3-field TOON vs 7-field pretty JSON) | 100 | 8198 | 1757 | 78.6% |
-| jira-large — encoding-only (7-field TOON vs 7-field pretty JSON) | 100 | 8198 | 4304 | 47.5% |
-| jira-large — pure encoding (7-field TOON vs 7-field compact JSON) | 100 | 7091 | 4304 | 39.3% |
+| jira-large — schema-matched (7-field TOON vs 7-field pretty JSON) | 100 | 8198 | 4304 | 47.5% |
+| jira-large — schema+format-matched (7-field TOON vs 7-field compact JSON) | 100 | 7091 | 4304 | 39.3% |
 
 ### huggingface_tokenizer (`claude-sonnet-4-5`)
 
@@ -107,11 +107,11 @@ apples-to-apples and needed no correction.
 |---|---|---|---|---|
 | youtube-detail | 1 obj / 18 rows | 897 | 649 | 27.6% |
 | jira-typical — total conversion effect | 20 | 1791 | 513 | 71.4% |
-| jira-typical — encoding-only | 20 | 1791 | 1059 | 40.9% |
-| jira-typical — pure encoding | 20 | 1562 | 1059 | 32.2% |
+| jira-typical — schema-matched | 20 | 1791 | 1059 | 40.9% |
+| jira-typical — schema+format-matched | 20 | 1562 | 1059 | 32.2% |
 | jira-large — total conversion effect | 100 | 8184 | 1706 | 79.2% |
-| jira-large — encoding-only | 100 | 8184 | 4370 | 46.6% |
-| jira-large — pure encoding | 100 | 7075 | 4370 | 38.2% |
+| jira-large — schema-matched | 100 | 8184 | 4370 | 46.6% |
+| jira-large — schema+format-matched | 100 | 7075 | 4370 | 38.2% |
 
 The two tokenizers agree within ~1 point on every row of every table
 above. That's strong evidence each effect is structural (not tokenizer
@@ -129,41 +129,52 @@ noise) — including the decomposition itself.
   it is **not** TOON's isolated contribution. It bundles three things:
   TOON's key-folding, `--json` forcing 4 extra fields the TOON path
   doesn't emit by default, and `--json`'s pretty-printing.
-- **jira "encoding-only" (41–48%, schema-matched, still pretty-vs-compact
-  JSON on the baseline)** is the more honest like-for-like number: same
-  7 fields on both sides, TOON compact vs JSON pretty. This lands close
-  to the 40% AXI headline, not far above it, and it grows modestly with
-  row count (41%→47-48% from 20 to 100 rows) rather than dramatically.
-- **jira "pure encoding" (32–39%, schema-matched AND compact-vs-compact)**
-  isolates TOON's format alone, with the pretty-print advantage removed
-  from both totals. This is the figure that predicts what TOON's table
-  encoding contributes on its own, independent of any field-count
-  decisions a tool's `--json` path happens to make. It's below the 40%
-  headline and roughly comparable to the youtube-detail figure once
-  schema effects are stripped out.
+- **jira "schema-matched" (41–48%: same 7 fields both sides, TOON
+  compact vs JSON pretty)** is the more honest like-for-like number for
+  the comparison sherpa users actually face today, since sherpa's
+  pre-AXI JSON contract was always pretty-printed. This lands close to
+  the 40% AXI headline, not far above it, and it grows modestly with row
+  count (41%→47-48% from 20 to 100 rows) rather than dramatically.
+- **jira "schema+format-matched" (32–39%: same 7 fields, TOON compact vs
+  JSON also compact)** isolates TOON's table format alone, with the
+  pretty-print advantage removed from both sides. This is the figure
+  that predicts what TOON's encoding contributes on its own, independent
+  of any field-count decision a tool's `--json` path happens to make, or
+  of whether that tool's JSON was ever pretty-printed to begin with. It's
+  below the 40% headline and roughly comparable to the youtube-detail
+  figure once schema effects are stripped out.
 
-The takeaway: **most of the eye-catching 71–79% "savings" in the first
-pass of this measurement came from `jira_issues search --json` emitting
-more fields than its own TOON default, and from pretty-printing — not
-from TOON's encoding.** TOON's own contribution, isolated, is a real but
-much more modest 32–48%, in the same neighborhood as AXI's published 40%
-figure rather than dramatically above it. The schema-minimization gain
-is real too, but it belongs to the tool's own field-selection design
-(TOON's default omitting `type`/`assignee`/`priority`/`updated` unless
-asked for), not to the TOON format.
+The takeaway: **most of the eye-catching 71–79% "total conversion
+effect" in the first pass of this measurement came from
+`jira_issues search --json` emitting more fields than its own TOON
+default, and from pretty-printing — not from TOON's encoding.** TOON's
+own contribution, isolated, is real but more modest: **41–48%
+(schema-matched, against sherpa's actual pretty-printed JSON baseline)**,
+or **32–39% (schema+format-matched, the conservative floor with no
+pretty-print advantage to strip)**. Both sit in the same neighborhood as
+AXI's published 40% figure rather than dramatically above it. The
+schema-minimization gain is real too, but it belongs to the tool's own
+field-selection design (TOON's default omitting
+`type`/`assignee`/`priority`/`updated` unless asked for), not to the
+TOON format.
 
 ## Recommendation
 
 **Proceed with converting the remaining ~18 tools, but calibrate
-expectations to the encoding-only figure (~32–48%), not the unadjusted
-total-conversion figure (71–79%).** The encoding-only savings are real,
-tokenizer-independent, still meaningful, and scale (modestly) with row
-count:
+expectations to the schema-matched figure (~41–48%), not the unadjusted
+total-conversion figure (71–79%).** Schema-matched is the right headline
+here because it compares TOON against sherpa's actual JSON baseline —
+pretty-printed, which is what the pre-AXI contract always emitted — so
+it's the savings a tool genuinely realizes on conversion, not a
+best-case or worst-case bound. (The conservative floor, if a tool's JSON
+was already compact, is schema+format-matched: ~32–39%.) These savings
+are real, tokenizer-independent, still meaningful, and scale (modestly)
+with row count:
 
 - **High priority**: tools whose primary output is a list/table
   (search, list, query-style commands) — these are the shape that
-  benefits from TOON's key-folding at all, with the isolated encoding
-  effect measured here at roughly 32–48% depending on row count.
+  benefits from TOON's key-folding at all, with the schema-matched
+  effect measured here at roughly 41–48% depending on row count.
 - **Lower priority / optional**: tools whose primary output is a single
   object or a short scalar/summary — expect savings well under 40% (the
   youtube-detail case here landed at ~28%, and a payload with no nested
@@ -179,8 +190,8 @@ count:
 
 What would change this recommendation: if a converted tool's realistic
 default field set is already lean (3–4 fields, no `--json`-only
-expansion), expect its encoding-only savings to sit closer to the
-youtube-detail ~28% figure than to the 40–48% jira figures — the field
+expansion), expect its schema-matched savings to sit closer to the
+youtube-detail ~28% figure than to the 41–48% jira figures — the field
 count matters as much as the row count. Task 7's catalog triage should
 classify each remaining tool's (a) typical output shape (list vs.
 detail) and (b) whether `--json` already matches TOON's default field
