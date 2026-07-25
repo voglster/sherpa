@@ -286,7 +286,7 @@ def fetch_metadata(target: str, allow_auto_update: bool) -> tuple[dict, bool]:
         reason = translate_ytdlp_error(result.stderr, fallback="metadata fetch failed")
         fail(
             f"could not fetch metadata for {video}: {reason}",
-            help=f"youtube version to check for a stale fetcher, then youtube update",
+            help="sherpa youtube version to check for a stale fetcher, then sherpa youtube update",
         )
     return json.loads(result.stdout.splitlines()[0]), upgraded
 
@@ -330,7 +330,7 @@ def build_info_payload(meta: dict, fields: set[str] | None, full: bool) -> dict:
     payload["description"] = preview
     if notice:
         payload["description_notice"] = notice
-        payload["help"] = f"youtube info {meta.get('id')} --full for the complete description"
+        payload["help"] = [f"sherpa youtube info {meta.get('id')} --full for the complete description"]
     return payload
 
 
@@ -339,7 +339,7 @@ def require_track(meta: dict, video: str) -> tuple[str, bool]:
     if not track:
         fail(
             f"no English captions available for {video}",
-            help=f"youtube info {video} to check which languages exist",
+            help=f"sherpa youtube info {video} to check which languages exist",
         )
     return track
 
@@ -392,14 +392,14 @@ def cmd_transcript(args: argparse.Namespace) -> None:
             reason = translate_ytdlp_error(result.stderr, fallback="caption download failed")
             fail(
                 f"caption download for {video} produced no subtitle file: {reason}",
-                help=f"youtube transcript {video} --refresh to retry",
+                help=f"sherpa youtube transcript {video} --refresh to retry",
             )
         cues = parse_vtt(tracks[0].read_text(encoding="utf-8", errors="replace"))
 
     if not cues:
         fail(
             f"caption track {lang} for {video} parsed to zero lines",
-            help=f"youtube transcript {video} --refresh to retry",
+            help=f"sherpa youtube transcript {video} --refresh to retry",
         )
 
     document = render_document(meta, track, cues, args.interval)
@@ -445,8 +445,8 @@ def cmd_home() -> None:
     ]
     if cached:
         lines.append("recent: " + ", ".join(path.stem for path in cached[-3:]))
-    lines.append("hint: youtube info <VIDEO_ID_OR_URL> for metadata and chapters")
-    lines.append("hint: youtube transcript <VIDEO_ID_OR_URL> for the full transcript")
+    lines.append("hint: sherpa youtube info <VIDEO_ID_OR_URL> for metadata and chapters")
+    lines.append("hint: sherpa youtube transcript <VIDEO_ID_OR_URL> for the full transcript")
     print("\n".join(lines))
     sys.exit(0)
 

@@ -185,7 +185,7 @@ def test_long_description_is_truncated_with_notice_and_full_hint():
     payload = youtube.build_info_payload(meta, fields=None, full=False)
     assert len(payload["description"]) == 1000
     assert "5000 chars total" in payload["description_notice"]
-    assert "abc12345678 --full" in payload["help"]
+    assert payload["help"] == ["sherpa youtube info abc12345678 --full for the complete description"]
 
 
 def test_short_description_carries_no_truncation_notice():
