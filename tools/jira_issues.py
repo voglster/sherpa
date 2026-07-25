@@ -54,11 +54,11 @@ def _load_vault() -> dict:
 def _load_secret(key: str) -> str:
     """Vault lookup for the unconverted subcommands.
 
-    Differs from `_load_secret_axi` only in reporting channel: the
-    `MISSING_SECRET: KEY` stderr line is what sherpa's runner scrapes to tell
-    the user which key to set, and moving it to stdout would change these
-    subcommands' output. The exit code is the AXI one either way, so a missing
-    secret is 2 from every subcommand of this tool.
+    Differs from `_load_secret_axi` only in reporting channel: this one emits
+    the `MISSING_SECRET: KEY` stderr diagnostic alone, where the AXI variant
+    adds a structured error on stdout that these subcommands must not grow.
+    The exit code is the AXI one either way, so a missing secret is 2 from
+    every subcommand of this tool.
     """
     value = _load_vault().get(key)
     if not value:
@@ -87,11 +87,15 @@ def _client() -> httpx.Client:
 def _load_secret_axi(key: str) -> str:
     """Vault lookup for the AXI-converted `search` path.
 
-    Reports on stdout through `fail()` as the AXI contract requires, which is
-    the whole reason it is separate from `_load_secret` — see that docstring.
+    Reports on both channels, which is why it is separate from `_load_secret`:
+    the structured error goes to stdout through `fail()` as the AXI contract
+    requires, and the `MISSING_SECRET: KEY` diagnostic still goes to stderr
+    because that marker is the documented signal a calling agent recovers from
+    (prompt for the value, `sherpa vault_manager set`, retry).
     """
     value = _load_vault().get(key)
     if not value:
+        print(f"MISSING_SECRET: {key}", file=sys.stderr)
         fail(f"missing secret {key}", help=f"sherpa vault_manager set {key} <value>", usage=True)
     return value
 

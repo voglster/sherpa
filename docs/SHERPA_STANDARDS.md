@@ -74,6 +74,7 @@ It exposes:
   - `2` — **the caller must change something before retrying: flags *or* environment.** Unknown or missing flags, malformed values, a missing vault secret, a missing dependency binary, and rejected/unauthorized credentials (Jira 400/401/403) are all `2`. The test is "would re-running this identically ever work?" — if not, it is `2`. This is deliberately wider than "usage error": an agent reads `2` as *fix the invocation or the setup*, and `1` as *the world was uncooperative*.
   - **This inverts sherpa's old exit-code meanings** (previously `1` was usage error and `2` was runtime error) — do not carry the old mapping into a converted tool.
   - Within one tool, the same condition must always yield the same code, including from subcommands that are not yet converted.
+- **A missing secret MUST report on both channels** and exit `2`: `MISSING_SECRET: <KEY>` on stderr **and** the structured `error:`/`help:` pair on stdout via `fail()`. This does not contradict "stdout is TOON, stderr is diagnostics" — stdout carries the structured error the agent parses, stderr carries the diagnostic marker. That marker is load-bearing: it is the documented signal a calling agent recovers from (prompt the user for the value, `sherpa vault_manager set <KEY> <VALUE>`, retry), so a conversion that emits only the stdout error breaks that workflow silently. See the `Secrets:` snippet below for the exact shape.
 - **Errors go to stdout** via `fail()`, with an actionable `help:` line naming the full invocation the caller should run, `sherpa` prefix included (`sherpa youtube version`, not `youtube version`) — that is the string an agent has to execute. Translate dependency errors; never leak tracebacks or the wrapped tool's name.
 - **stderr is diagnostics only.** Never mix progress into stdout — an agent reads "Fetching..." as data.
 - **Minimal default schemas**: 3-4 fields in lists. Long-form content lives in detail views. Offer `--fields` for more.
@@ -92,6 +93,7 @@ It exposes:
   vault = json.loads(vault_path.read_text()) if vault_path.exists() else {}
   token = vault.get("MY_SECRET")
   if not token:
+      print("MISSING_SECRET: MY_SECRET", file=sys.stderr)
       fail("missing secret MY_SECRET", help="sherpa vault_manager set MY_SECRET <value>", usage=True)
   ```
 
@@ -117,6 +119,7 @@ A reviewer can run this against any tool to confirm it meets the contract:
 - [ ] Exit codes correct: `0` success/no-op, `1` uncooperative world, `2` caller must change flags or environment — and consistent across every subcommand of the tool
 - [ ] Errors printed to stdout via `fail()`, with a `help:` line naming a full `sherpa ...` invocation
 - [ ] Any `help` key in emitted output is a list of strings, never a bare string
+- [ ] A missing secret emits `MISSING_SECRET: <KEY>` on stderr as well as the stdout error, and exits 2
 - [ ] List/default schemas are ≤4 fields, with `--fields` for more
 - [ ] True totals reported (`count: N of M total`), not just the page size
 - [ ] Empty states are explicit and state the zero with context

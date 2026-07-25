@@ -8,6 +8,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 _SPEC = importlib.util.spec_from_file_location(
     "jira_issues", Path(__file__).resolve().parent.parent / "tools" / "jira_issues.py"
 )
@@ -117,3 +119,24 @@ def test_count_call_network_failure_does_not_break_the_search():
     assert issues == [ISSUE]
     assert total == 1
     assert total_is_exact is False
+
+
+def test_missing_secret_reports_on_both_channels_and_exits_two(capsys, monkeypatch):
+    monkeypatch.setattr(jira_issues, "_load_vault", dict)
+    with pytest.raises(SystemExit) as exit_info:
+        jira_issues._load_secret_axi("JIRA_API_TOKEN")
+    captured = capsys.readouterr()
+    assert captured.err == "MISSING_SECRET: JIRA_API_TOKEN\n"
+    assert captured.out == (
+        "error: missing secret JIRA_API_TOKEN\n"
+        "help: sherpa vault_manager set JIRA_API_TOKEN <value>\n"
+    )
+    assert exit_info.value.code == 2
+
+
+def test_unconverted_subcommands_share_the_missing_secret_exit_code(capsys, monkeypatch):
+    monkeypatch.setattr(jira_issues, "_load_vault", dict)
+    with pytest.raises(SystemExit) as exit_info:
+        jira_issues._load_secret("JIRA_API_TOKEN")
+    assert capsys.readouterr().err == "MISSING_SECRET: JIRA_API_TOKEN\n"
+    assert exit_info.value.code == 2
