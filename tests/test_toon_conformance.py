@@ -7,6 +7,10 @@ suite (github.com/toon-format/spec, tests/fixtures/encode, commit 6b8e74c).
 KNOWN_NONCONFORMANT documents every fixture case python-toon 0.1.3 fails,
 each tagged with the spec behavior it violates. This is a decision record,
 not a workaround: see docs/axi-toon-decision.md for the adoption verdict.
+
+Those cases are marked `xfail(strict=True)`, so an upstream release that fixes
+one fails this suite instead of passing silently — that loud failure is the
+only signal the branch has that an entry can be retired.
 """
 
 from __future__ import annotations
@@ -90,6 +94,37 @@ KNOWN_NONCONFORMANT = {
 }
 
 
+@pytest.fixture(autouse=True)
+def measure_pristine_python_toon():
+    """Undo sherpa's encoder patch for the duration of this module.
+
+    `sherpa/render.py` overrides `toon.primitives.is_safe_unquoted` at import
+    time, and pytest imports every test module (including the ones that load
+    render.py) before running any test — so without this, the suite would
+    measure sherpa's patched encoder while claiming to measure python-toon
+    0.1.3, and could not tell an upstream fix from the local patch.
+    """
+    installed = toon.primitives.is_safe_unquoted
+    toon.primitives.is_safe_unquoted = getattr(installed, "__wrapped__", installed)
+    yield
+    toon.primitives.is_safe_unquoted = installed
+
+
+def _fixture_params() -> list:
+    params = []
+    for fixture_file, case in _load_fixture_cases():
+        reason = KNOWN_NONCONFORMANT.get((fixture_file, case["name"]))
+        params.append(
+            pytest.param(
+                fixture_file,
+                case,
+                marks=[pytest.mark.xfail(strict=True, reason=reason)] if reason else [],
+                id=f"{fixture_file}::{case['name']}",
+            )
+        )
+    return params
+
+
 def _fixture_options(case: dict) -> dict | None:
     options = case.get("options") or {}
     mapped = {}
@@ -100,15 +135,8 @@ def _fixture_options(case: dict) -> dict | None:
     return mapped or None
 
 
-@pytest.mark.parametrize(
-    "fixture_file,case",
-    _load_fixture_cases(),
-    ids=[f"{f}::{c['name']}" for f, c in _load_fixture_cases()],
-)
+@pytest.mark.parametrize("fixture_file,case", _fixture_params())
 def test_encoder_matches_official_reference_fixture(fixture_file, case):
-    reason = KNOWN_NONCONFORMANT.get((fixture_file, case["name"]))
-    if reason:
-        pytest.xfail(reason)
     actual = toon.encode(case["input"], _fixture_options(case))
     assert _strip_accepted_delimiter_marker(actual) == _strip_accepted_delimiter_marker(case["expected"])
 
