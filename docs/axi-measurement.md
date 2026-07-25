@@ -6,10 +6,20 @@ converted tools (`youtube info`, `jira_issues search`), driving the real
 CLI and capturing real stdout for both output modes — not a re-encode of
 an in-memory payload.
 
+**Update after review**: the first pass of this measurement compared
+`jira_issues search`'s TOON and `--json` stdout directly and attributed
+the whole delta to TOON's encoding. That comparison was not
+schema-matched — see "The jira confound" below — so it measured the
+*total AXI-conversion effect* (encoding + schema minimization +
+pretty-vs-compact JSON), not TOON's isolated contribution. Both figures
+are now reported, decomposed. The youtube comparison was already
+apples-to-apples (see below) and is unaffected.
+
 ## Method
 
 - Captured real stdout: `sherpa <tool> ... > file.json` and
-  `sherpa <tool> ...` (TOON, the default) for the same underlying data.
+  `sherpa <tool> ...` (TOON, the default), driving the real CLI rather
+  than re-encoding an in-memory payload.
 - Counted tokens via the LiteLLM proxy's `POST /utils/token_counter`
   (`~/.sherpa/vault.json`: `LITELLM_API_URL` / `LITELLM_API_KEY`), not the
   Anthropic SDK — there is no `ANTHROPIC_API_KEY` available in this
@@ -20,7 +30,8 @@ an in-memory payload.
 - **Neither is Anthropic's actual billing tokenizer.** Treat all counts
   below as approximate, structurally-representative numbers, not
   Anthropic-exact token counts. See "Reproducing with a real key" below.
-- Script: `scripts/measure_toon.py`, run as:
+- Script: `scripts/measure_toon.py`, run as (see "The jira confound" for
+  the additional pairs needed to decompose the jira effect):
 
   ```
   uv run --script scripts/measure_toon.py \
@@ -40,6 +51,42 @@ an in-memory payload.
 Note: the brief's suggested `--limit 100` flag does not exist on
 `jira_issues search`; the correct flag is `--max-results 100`, used above.
 
+### The jira confound
+
+`sherpa jira_issues search`'s TOON and `--json` paths do not carry the
+same fields, so a direct comparison does not isolate TOON's encoding:
+
+- TOON with no `--fields` passed emits **3 fields/row**:
+  `key, summary, status` (`search_payload` → `parse_fields(args.fields)`,
+  `tools/jira_issues.py`).
+- `--json` unconditionally forces **all 7 fields**:
+  `key, summary, status, type, assignee, priority, updated`
+  (`search_rows(issues, set(EXTRA_SEARCH_FIELDS))`, ignoring
+  `--fields`, `tools/jira_issues.py:893-894`).
+- `--json` is also pretty-printed at `indent=2`
+  (`sherpa/render.py:41-42`) while TOON output is compact.
+
+So the direct TOON-vs-`--json` comparison bundles three effects: TOON's
+key-folding, dropping 4 of 7 fields, and pretty-vs-compact JSON. To
+isolate the encoding-only effect, the TOON side was re-captured with
+`--fields type,assignee,priority,updated` so both sides carry all 7
+fields, and a compact (non-indented) re-serialization of the same
+`--json` output was generated to isolate the pretty-print component:
+
+```
+sherpa jira_issues search --mine --fields type,assignee,priority,updated \
+                                            > /tmp/axi-payloads/jira-typical-matched.toon
+sherpa jira_issues search --jql 'project = KB ORDER BY created DESC' --max-results 100 \
+       --fields type,assignee,priority,updated > /tmp/axi-payloads/jira-large-matched.toon
+python3 -c "import json; d=json.load(open('jira-typical.json')); open('jira-typical-compact.json','w').write(json.dumps(d))"
+python3 -c "import json; d=json.load(open('jira-large.json')); open('jira-large-compact.json','w').write(json.dumps(d))"
+```
+
+`youtube info` does not have this problem: both its TOON and `--json`
+paths route through the same `build_info_payload(meta, parse_fields(args.fields), args.full)`
+(`tools/youtube.py:347-351`), so the youtube-detail comparison is already
+apples-to-apples and needed no correction.
+
 ## Results
 
 ### openai_tokenizer (`ollama/glm-4.7-flash`)
@@ -47,20 +94,28 @@ Note: the brief's suggested `--limit 100` flag does not exist on
 | Payload | Rows | JSON tokens | TOON tokens | Saved |
 |---|---|---|---|---|
 | youtube-detail | 1 obj / 18 rows | 834 | 601 | 27.9% |
-| jira-typical | 20 | 1795 | 516 | 71.3% |
-| jira-large | 100 | 8198 | 1757 | 78.6% |
+| jira-typical — total conversion effect (3-field TOON vs 7-field pretty JSON) | 20 | 1795 | 516 | 71.3% |
+| jira-typical — encoding-only (7-field TOON vs 7-field pretty JSON) | 20 | 1795 | 1054 | 41.3% |
+| jira-typical — pure encoding (7-field TOON vs 7-field compact JSON) | 20 | 1568 | 1054 | 32.8% |
+| jira-large — total conversion effect (3-field TOON vs 7-field pretty JSON) | 100 | 8198 | 1757 | 78.6% |
+| jira-large — encoding-only (7-field TOON vs 7-field pretty JSON) | 100 | 8198 | 4304 | 47.5% |
+| jira-large — pure encoding (7-field TOON vs 7-field compact JSON) | 100 | 7091 | 4304 | 39.3% |
 
 ### huggingface_tokenizer (`claude-sonnet-4-5`)
 
 | Payload | Rows | JSON tokens | TOON tokens | Saved |
 |---|---|---|---|---|
 | youtube-detail | 1 obj / 18 rows | 897 | 649 | 27.6% |
-| jira-typical | 20 | 1791 | 513 | 71.4% |
-| jira-large | 100 | 8184 | 1706 | 79.2% |
+| jira-typical — total conversion effect | 20 | 1791 | 513 | 71.4% |
+| jira-typical — encoding-only | 20 | 1791 | 1059 | 40.9% |
+| jira-typical — pure encoding | 20 | 1562 | 1059 | 32.2% |
+| jira-large — total conversion effect | 100 | 8184 | 1706 | 79.2% |
+| jira-large — encoding-only | 100 | 8184 | 4370 | 46.6% |
+| jira-large — pure encoding | 100 | 7075 | 4370 | 38.2% |
 
-The two tokenizers agree within ~1 point on every payload. That's strong
-evidence the saving is structural (TOON not repeating field names per
-row) rather than an artifact of either tokenizer's encoding.
+The two tokenizers agree within ~1 point on every row of every table
+above. That's strong evidence each effect is structural (not tokenizer
+noise) — including the decomposition itself.
 
 ## Interpretation
 
@@ -69,46 +124,76 @@ row) rather than an artifact of either tokenizer's encoding.
   for TOON to fold away. The 28% here comes mostly from the nested
   18-row chapters array, not the top-level object. This is not TOON
   underperforming; it's the wrong shape to benefit from TOON.
-- **jira-typical (20-row list)**: ~71% saved, well above the 40% headline.
-- **jira-large (100-row list)**: ~79% saved, the strongest result, and it
-  grows with row count as expected (more rows = more repeated keys
-  folded away per row).
+- **jira "total conversion effect" (71–79%)** is what a user actually
+  sees today comparing sherpa's TOON output to its `--json` output — but
+  it is **not** TOON's isolated contribution. It bundles three things:
+  TOON's key-folding, `--json` forcing 4 extra fields the TOON path
+  doesn't emit by default, and `--json`'s pretty-printing.
+- **jira "encoding-only" (41–48%, schema-matched, still pretty-vs-compact
+  JSON on the baseline)** is the more honest like-for-like number: same
+  7 fields on both sides, TOON compact vs JSON pretty. This lands close
+  to the 40% AXI headline, not far above it, and it grows modestly with
+  row count (41%→47-48% from 20 to 100 rows) rather than dramatically.
+- **jira "pure encoding" (32–39%, schema-matched AND compact-vs-compact)**
+  isolates TOON's format alone, with the pretty-print advantage removed
+  from both totals. This is the figure that predicts what TOON's table
+  encoding contributes on its own, independent of any field-count
+  decisions a tool's `--json` path happens to make. It's below the 40%
+  headline and roughly comparable to the youtube-detail figure once
+  schema effects are stripped out.
 
-List-shaped payloads beat AXI's own 40% figure by a wide margin on real
-sherpa data; only the single-object detail view falls short, and it falls
-short for the structural reason the brief predicted, not because the
-number is soft.
+The takeaway: **most of the eye-catching 71–79% "savings" in the first
+pass of this measurement came from `jira_issues search --json` emitting
+more fields than its own TOON default, and from pretty-printing — not
+from TOON's encoding.** TOON's own contribution, isolated, is a real but
+much more modest 32–48%, in the same neighborhood as AXI's published 40%
+figure rather than dramatically above it. The schema-minimization gain
+is real too, but it belongs to the tool's own field-selection design
+(TOON's default omitting `type`/`assignee`/`priority`/`updated` unless
+asked for), not to the TOON format.
 
 ## Recommendation
 
-**Proceed with converting the remaining ~18 tools, prioritized by output
-shape.** The savings are real, tokenizer-independent, and scale with row
+**Proceed with converting the remaining ~18 tools, but calibrate
+expectations to the encoding-only figure (~32–48%), not the unadjusted
+total-conversion figure (71–79%).** The encoding-only savings are real,
+tokenizer-independent, still meaningful, and scale (modestly) with row
 count:
 
 - **High priority**: tools whose primary output is a list/table
-  (search, list, query-style commands) — these are the ones already
-  showing 70–80% savings here and stand to gain the most.
+  (search, list, query-style commands) — these are the shape that
+  benefits from TOON's key-folding at all, with the isolated encoding
+  effect measured here at roughly 32–48% depending on row count.
 - **Lower priority / optional**: tools whose primary output is a single
   object or a short scalar/summary — expect savings well under 40% (the
   youtube-detail case here landed at ~28%, and a payload with no nested
   array at all would land near 0%). Converting these is still cheap and
   harmless (TOON degrades gracefully on scalars) but shouldn't be the
   reason to justify the fan-out.
+- **Separately worth doing regardless of TOON**: if any of the remaining
+  tools' `--json` paths force more fields than a sensible default (as
+  `jira_issues search --json` does), that's an independent field-scoping
+  fix worth making on its own merits — it's real token savings, but it's
+  a schema decision, not a TOON encoding win, and should not be counted
+  toward "TOON saved X%" claims.
 
-What would change this recommendation: if most of the remaining ~18
-tools are single-object/detail-style (like `youtube info` rather than
-`jira_issues search`), the aggregate benefit across the catalog would be
-far more modest than these numbers suggest, and a case-by-case call would
-be better than a blanket conversion. Task 7's catalog triage should
-classify each remaining tool's typical output shape (list vs. detail)
-before committing to convert all of them.
+What would change this recommendation: if a converted tool's realistic
+default field set is already lean (3–4 fields, no `--json`-only
+expansion), expect its encoding-only savings to sit closer to the
+youtube-detail ~28% figure than to the 40–48% jira figures — the field
+count matters as much as the row count. Task 7's catalog triage should
+classify each remaining tool's (a) typical output shape (list vs.
+detail) and (b) whether `--json` already matches TOON's default field
+set, before committing to convert all of them.
 
 ## Reproducing with a real Anthropic key
 
 `scripts/measure_toon.py` calls the LiteLLM proxy's `/utils/token_counter`
 because no `ANTHROPIC_API_KEY` was available here. To get Anthropic's
-actual billing counts, change one thing: swap `count_tokens()`'s httpx
-call for `anthropic.Anthropic().messages.count_tokens(model=..., messages=...).input_tokens`,
-add `anthropic` to the script's `dependencies`, and drop the vault/proxy
-plumbing. The `--pair NAME ROWS JSON_FILE TOON_FILE` capture format and
-the report table stay the same.
+actual billing counts: swap `count_tokens()`'s httpx call for
+`anthropic.Anthropic().messages.count_tokens(model=..., messages=...).input_tokens`,
+add `anthropic` to the script's `dependencies`, and remove the
+`load_vault`/`require_secrets` plumbing (an Anthropic key has no vault
+lookup to perform — `anthropic.Anthropic()` reads `ANTHROPIC_API_KEY`
+from the environment directly). The `--pair NAME ROWS JSON_FILE
+TOON_FILE` capture format and the report table stay the same.
