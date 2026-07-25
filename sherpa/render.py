@@ -21,18 +21,33 @@ import toon
 # and desyncing the array's declared count from its contents; raw control
 # characters violate the \uXXXX escaping the spec requires. Quoting contains
 # both — it does not add the \u escaping a fully conformant encoder would.
-_safe_unquoted = toon.primitives.is_safe_unquoted
+#
+# Installation must survive re-execution of this module (importlib.reload, or
+# a test loading it a second time via spec_from_file_location): re-executing
+# would otherwise wrap the already-installed wrapper, and a module-global
+# reference to the pristine function would rebind to that wrapper and recurse
+# until the stack blows. The pristine function is therefore held in a closure,
+# the wrapper is marked, and a marked function is left alone. `__wrapped__`
+# lets a caller that needs the pristine encoder (see the conformance suite)
+# recover it.
+def _install_stricter_quoting() -> None:
+    pristine = toon.primitives.is_safe_unquoted
+    if getattr(pristine, "_sherpa_stricter_quoting", False):
+        return
+
+    def stricter_quoting(value: str, delimiter: str = ",") -> bool:
+        if value.startswith("#"):
+            return False
+        if any(ord(character) < 0x20 for character in value):
+            return False
+        return pristine(value, delimiter)
+
+    stricter_quoting._sherpa_stricter_quoting = True
+    stricter_quoting.__wrapped__ = pristine
+    toon.primitives.is_safe_unquoted = stricter_quoting
 
 
-def _stricter_quoting(value: str, delimiter: str = ",") -> bool:
-    if value.startswith("#"):
-        return False
-    if any(ord(character) < 0x20 for character in value):
-        return False
-    return _safe_unquoted(value, delimiter)
-
-
-toon.primitives.is_safe_unquoted = _stricter_quoting
+_install_stricter_quoting()
 
 TOOL_PREAMBLE = """sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sherpa.render import bin_line, emit, fail, parse_strict, truncate"""
