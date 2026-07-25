@@ -110,7 +110,10 @@ def cmd_list(_argv: list[str]) -> int:
     home = _find_home()
     width = 24
     for _, meta in _list_tools(home):
-        print(f"  {meta.get('name', ''):<{width}} {meta.get('description', '')}")
+        name = meta.get("name", "")
+        if meta.get("axi"):
+            name += " [axi]"
+        print(f"  {name:<{width}} {meta.get('description', '')}")
     return 0
 
 

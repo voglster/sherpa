@@ -46,6 +46,7 @@ def _parse_tool_metadata(filepath: Path) -> dict | None:
         "description": meta["description"],
         "categories": meta["categories"],
         "secrets": meta.get("secrets", []),
+        "axi": meta.get("axi", False),
         "path": str(filepath.relative_to(PROJECT_ROOT)),
         "mtime": filepath.stat().st_mtime,
     }
