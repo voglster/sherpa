@@ -133,6 +133,13 @@ test subprocess.
   hazard: a blank review is an empty finding list, which reads as "no problems found".
 - **A finding citing no rubric item number** — rejected as unparseable rather than
   guessed at, per the rubric's own contract.
+- **A comment-discipline finding that states no replacement** — rejected. Rubric item
+  16 requires the model to name the rename, extraction, or restructuring that carries
+  the intent without the prose. This is the design's main defence against the item-13
+  failure mode: a rule a model cannot fail to satisfy generates confident findings
+  against clean code, so the rule must demand evidence in a checkable form. It also
+  means the finding arrives carrying its own fix, which is what makes auto-apply
+  possible for this item at all.
 - **A fix that does not apply cleanly** — that finding moves to *raised*, the run
   continues.
 - **Tests fail after fixes** — revert to the checkpoint, everything becomes *raised*.

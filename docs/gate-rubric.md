@@ -25,7 +25,14 @@ rather than guessed at.
 13. Contextual hints appear on list and mutation output only, and are omitted on detail-view output; each hint names a full `sherpa` invocation.
 14. `axi: true` is present in the tool's YAML docstring.
 15. The commit message contains no "🤖 Generated with Claude Code" line and no "Co-Authored-By: Claude" line.
-16. Every comment in the diff exists only where naming and structure could not carry the intent — no narration comments (e.g. `# Arrange`/`# Act`/`# Assert`), and no comment that merely restates what a well-named symbol already says.
+16. A comment is evidence that the code failed to express its intent. Python is expressive enough that most comments are a naming or structuring failure wearing a disguise. For every comment added in the diff, report a violation **only if you can state the replacement** — the specific rename, extracted helper, or restructuring that carries the same intent without the prose. A finding that cannot name its replacement is not a finding; leave the comment alone. Two kinds of comment survive this test: one stating a fact the language cannot express (a non-obvious external-schema constraint a reader would otherwise get wrong), and one explaining *why* deliberately clever code is clever.
+17. No narration comments — a comment whose text restates what the next line or block plainly does, including sequence markers like `# Arrange` / `# Act` / `# Assert`, `# Setup` / `# Teardown`, and `# Step 1` / `# First` / `# Then` / `# Finally`.
 
 Items 1–14 come from the "Compliance checklist" in `docs/SHERPA_STANDARDS.md`.
-Items 15–16 come from `~/.claude/CLAUDE.md`.
+Items 15–17 come from `~/.claude/CLAUDE.md`.
+
+Items 16 and 17 split what was previously one item, along the line the model
+benchmark drew: 17 is a string match a deterministic check should own, 16 is the
+judgement only a model can make. Item 16's "name the replacement or it is not a
+finding" rule exists because its predecessor was unfalsifiable — the same defect
+that makes item 13 report violations against clean code.
