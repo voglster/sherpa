@@ -1,0 +1,102 @@
+[
+  {
+    "model": "gemma4:31b",
+    "trials": 5,
+    "usable": 5,
+    "mean_caught": 2,
+    "caught_per_trial": [
+      2,
+      2,
+      2,
+      2,
+      2
+    ],
+    "always_caught": [
+      4,
+      7
+    ],
+    "ever_caught": [
+      4,
+      7
+    ],
+    "mean_false_positives": 1,
+    "median_seconds": 90.6,
+    "max_completion_tokens": 2163,
+    "truncations": 0
+  },
+  {
+    "model": "qwen3.6:27b-q4_K_M",
+    "trials": 5,
+    "usable": 5,
+    "mean_caught": 2.2,
+    "caught_per_trial": [
+      2,
+      2,
+      3,
+      2,
+      2
+    ],
+    "always_caught": [
+      4,
+      7
+    ],
+    "ever_caught": [
+      3,
+      4,
+      7
+    ],
+    "mean_false_positives": 0.4,
+    "median_seconds": 202.1,
+    "max_completion_tokens": 5032,
+    "truncations": 0
+  },
+  {
+    "model": "glm-4.7-flash:latest",
+    "trials": 5,
+    "usable": 5,
+    "mean_caught": 1.8,
+    "caught_per_trial": [
+      2,
+      2,
+      1,
+      2,
+      2
+    ],
+    "always_caught": [
+      7
+    ],
+    "ever_caught": [
+      4,
+      7
+    ],
+    "mean_false_positives": 0.2,
+    "median_seconds": 40.6,
+    "max_completion_tokens": 6872,
+    "truncations": 0
+  },
+  {
+    "model": "qwen3.6:35b-a3b-q8_0",
+    "trials": 5,
+    "usable": 5,
+    "mean_caught": 2,
+    "caught_per_trial": [
+      2,
+      2,
+      2,
+      2,
+      2
+    ],
+    "always_caught": [
+      4,
+      7
+    ],
+    "ever_caught": [
+      4,
+      7
+    ],
+    "mean_false_positives": 1,
+    "median_seconds": 111.0,
+    "max_completion_tokens": 4643,
+    "truncations": 0
+  }
+]

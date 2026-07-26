@@ -1,0 +1,447 @@
+[
+  {
+    "model": "gemma4:31b",
+    "seconds": 68.5,
+    "finish_reason": "stop",
+    "prompt_tokens": 1077,
+    "completion_tokens": 1332,
+    "reasoning_chars": 4242,
+    "caught": [
+      4,
+      7
+    ],
+    "missed": [
+      3
+    ],
+    "false_positives": [
+      13
+    ],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 4: Errors are printed via a bare print instead of fail().\nVIOLATION item 7: The help key in emitted output is a bare string instead of a list of strings.\nVIOLATION item 13: A contextual hint is included in a detail-view output.\n\nDONE",
+    "host": "http://10.0.6.46:11434",
+    "trial": 1
+  },
+  {
+    "model": "gemma4:31b",
+    "seconds": 90.6,
+    "finish_reason": "stop",
+    "prompt_tokens": 1077,
+    "completion_tokens": 1889,
+    "reasoning_chars": 6157,
+    "caught": [
+      4,
+      7
+    ],
+    "missed": [
+      3
+    ],
+    "false_positives": [
+      13
+    ],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 4: Error in load_widget_config is printed via bare print instead of fail().\nVIOLATION item 7: The help key in the emitted output is a string instead of a list of strings.\nVIOLATION item 13: Contextual hint is present in the detail-view output of cmd_show.\n\nDONE",
+    "host": "http://10.0.6.46:11434",
+    "trial": 2
+  },
+  {
+    "model": "gemma4:31b",
+    "seconds": 71.3,
+    "finish_reason": "stop",
+    "prompt_tokens": 1077,
+    "completion_tokens": 1488,
+    "reasoning_chars": 4783,
+    "caught": [
+      4,
+      7
+    ],
+    "missed": [
+      3
+    ],
+    "false_positives": [
+      13
+    ],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 4: Error is printed via a bare `print()` instead of `fail()`.\nVIOLATION item 7: The `help` key in emitted output is a bare string instead of a list of strings.\nVIOLATION item 13: Contextual hint is present in detail-view output.\n\nDONE",
+    "host": "http://10.0.6.46:11434",
+    "trial": 3
+  },
+  {
+    "model": "gemma4:31b",
+    "seconds": 103.7,
+    "finish_reason": "stop",
+    "prompt_tokens": 1077,
+    "completion_tokens": 2163,
+    "reasoning_chars": 7081,
+    "caught": [
+      4,
+      7
+    ],
+    "missed": [
+      3
+    ],
+    "false_positives": [
+      13
+    ],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 4: Error in load_widget_config is printed via bare print instead of fail().\nVIOLATION item 7: The help key in cmd_show is a bare string instead of a list of strings.\nVIOLATION item 13: Contextual hint is present in the detail-view output of cmd_show.\n\nDONE",
+    "host": "http://10.0.6.46:11434",
+    "trial": 4
+  },
+  {
+    "model": "gemma4:31b",
+    "seconds": 92.7,
+    "finish_reason": "stop",
+    "prompt_tokens": 1077,
+    "completion_tokens": 1936,
+    "reasoning_chars": 6271,
+    "caught": [
+      4,
+      7
+    ],
+    "missed": [
+      3
+    ],
+    "false_positives": [
+      13
+    ],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 4: Errors use a bare print instead of fail().\nVIOLATION item 7: The help key is a bare string instead of a list of strings.\nVIOLATION item 13: Detail-view output contains a contextual hint.\n\nDONE",
+    "host": "http://10.0.6.46:11434",
+    "trial": 5
+  },
+  {
+    "model": "qwen3.6:27b-q4_K_M",
+    "seconds": 222.8,
+    "finish_reason": "stop",
+    "prompt_tokens": 1029,
+    "completion_tokens": 5032,
+    "reasoning_chars": 18240,
+    "caught": [
+      4,
+      7
+    ],
+    "missed": [
+      3
+    ],
+    "false_positives": [
+      13
+    ],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 4: Uses a bare print() call for error reporting instead of the required fail() function.\nVIOLATION item 7: Specifies the help key as a bare string instead of a list of strings.\nVIOLATION item 13: Includes a contextual hint in the cmd_show detail-view output, which must omit hints.\nDONE",
+    "host": "http://10.0.6.46:11434",
+    "trial": 1
+  },
+  {
+    "model": "qwen3.6:27b-q4_K_M",
+    "seconds": 176.0,
+    "finish_reason": "stop",
+    "prompt_tokens": 1029,
+    "completion_tokens": 4088,
+    "reasoning_chars": 14760,
+    "caught": [
+      4,
+      7
+    ],
+    "missed": [
+      3
+    ],
+    "false_positives": [],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 4: Error handling uses a bare print() call instead of the required fail() utility.\nVIOLATION item 7: The help key in the emitted output is a bare string instead of a list of strings.\nDONE",
+    "host": "http://10.0.6.46:11434",
+    "trial": 2
+  },
+  {
+    "model": "qwen3.6:27b-q4_K_M",
+    "seconds": 184.3,
+    "finish_reason": "stop",
+    "prompt_tokens": 1029,
+    "completion_tokens": 3486,
+    "reasoning_chars": 12533,
+    "caught": [
+      3,
+      4,
+      7
+    ],
+    "missed": [],
+    "false_positives": [],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 3: Exits with code 1 for a missing configuration file instead of code 2 for a caller environment issue.\nVIOLATION item 4: Uses a bare print statement to report an error instead of calling fail().\nVIOLATION item 7: The emitted help key is a bare string instead of a list of strings.\nDONE",
+    "host": "http://10.0.6.46:11434",
+    "trial": 3
+  },
+  {
+    "model": "qwen3.6:27b-q4_K_M",
+    "seconds": 210.8,
+    "finish_reason": "stop",
+    "prompt_tokens": 1029,
+    "completion_tokens": 4110,
+    "reasoning_chars": 14783,
+    "caught": [
+      4,
+      7
+    ],
+    "missed": [
+      3
+    ],
+    "false_positives": [
+      13
+    ],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 4: Errors are handled with a bare print statement instead of using the fail() function.\nVIOLATION item 7: The help key in the emitted output contains a bare string instead of a list of strings.\nVIOLATION item 13: Contextual hints are included in the detail-view output of cmd_show when they should be omitted.\nDONE",
+    "host": "http://10.0.6.46:11434",
+    "trial": 4
+  },
+  {
+    "model": "qwen3.6:27b-q4_K_M",
+    "seconds": 202.1,
+    "finish_reason": "stop",
+    "prompt_tokens": 1029,
+    "completion_tokens": 3832,
+    "reasoning_chars": 13655,
+    "caught": [
+      4,
+      7
+    ],
+    "missed": [
+      3
+    ],
+    "false_positives": [],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 4: Error handling uses a bare print() call instead of the required fail() function.\nVIOLATION item 7: The help key in the emitted output is a bare string instead of a list of strings.\nDONE",
+    "host": "http://10.0.6.46:11434",
+    "trial": 5
+  },
+  {
+    "model": "glm-4.7-flash:latest",
+    "seconds": 42.6,
+    "finish_reason": "stop",
+    "prompt_tokens": 965,
+    "completion_tokens": 4687,
+    "reasoning_chars": 17590,
+    "caught": [
+      4,
+      7
+    ],
+    "missed": [
+      3
+    ],
+    "false_positives": [],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 4: Error printed directly to stderr instead of via fail()\nVIOLATION item 7: help key in emitted output is a bare string instead of a list\nDONE",
+    "host": "http://10.0.6.46:11434",
+    "trial": 1
+  },
+  {
+    "model": "glm-4.7-flash:latest",
+    "seconds": 17.0,
+    "finish_reason": "stop",
+    "prompt_tokens": 965,
+    "completion_tokens": 2047,
+    "reasoning_chars": 7587,
+    "caught": [
+      4,
+      7
+    ],
+    "missed": [
+      3
+    ],
+    "false_positives": [],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 4: Error is printed to stderr via raw print instead of fail()\nVIOLATION item 7: help key is a bare string instead of a list of strings\nDONE",
+    "host": "http://10.0.6.46:11434",
+    "trial": 2
+  },
+  {
+    "model": "glm-4.7-flash:latest",
+    "seconds": 39.8,
+    "finish_reason": "stop",
+    "prompt_tokens": 965,
+    "completion_tokens": 3282,
+    "reasoning_chars": 12681,
+    "caught": [
+      7
+    ],
+    "missed": [
+      3,
+      4
+    ],
+    "false_positives": [],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 7: The emitted `help` key is a bare string instead of a list of strings\nDONE",
+    "host": "http://10.0.6.46:11434",
+    "trial": 3
+  },
+  {
+    "model": "glm-4.7-flash:latest",
+    "seconds": 40.6,
+    "finish_reason": "stop",
+    "prompt_tokens": 965,
+    "completion_tokens": 3647,
+    "reasoning_chars": 13529,
+    "caught": [
+      4,
+      7
+    ],
+    "missed": [
+      3
+    ],
+    "false_positives": [
+      5
+    ],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 4: Implements error handling with raw `print` on stderr and `sys.exit`, violating the mandate to use `fail()` for errors.\nVIOLATION item 5: Uses `sys.exit(1)` instead of `fail()`, which means the requirement for every `fail()` call to include a `help:` line is not met.\nVIOLATION item 7: Field `help` in emitted JSON is a bare string \"sherpa widget list to see every widget\", whereas the specification requires a list of strings.\n\nDONE",
+    "host": "http://10.0.6.46:11434",
+    "trial": 4
+  },
+  {
+    "model": "glm-4.7-flash:latest",
+    "seconds": 59.3,
+    "finish_reason": "stop",
+    "prompt_tokens": 965,
+    "completion_tokens": 6872,
+    "reasoning_chars": 26428,
+    "caught": [
+      4,
+      7
+    ],
+    "missed": [
+      3
+    ],
+    "false_positives": [],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 4: Error is printed to stderr using print() instead of via fail().\nVIOLATION item 7: help key in emitted output is a bare string instead of a list of strings.\nDONE",
+    "host": "http://10.0.6.46:11434",
+    "trial": 5
+  },
+  {
+    "model": "qwen3.6:35b-a3b-q8_0",
+    "seconds": 144.4,
+    "finish_reason": "stop",
+    "prompt_tokens": 1029,
+    "completion_tokens": 4643,
+    "reasoning_chars": 17030,
+    "caught": [
+      4,
+      7
+    ],
+    "missed": [
+      3
+    ],
+    "false_positives": [
+      13
+    ],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 4: The missing config error uses a bare print() to stderr instead of routing through fail().\nVIOLATION item 7: The help key in the emitted output is a bare string instead of a list of strings.\nVIOLATION item 13: A contextual hint is included in detail-view output, violating the rule that hints be omitted on detail views.\nDONE",
+    "host": "http://10.0.6.45:11434",
+    "trial": 1
+  },
+  {
+    "model": "qwen3.6:35b-a3b-q8_0",
+    "seconds": 98.4,
+    "finish_reason": "stop",
+    "prompt_tokens": 1029,
+    "completion_tokens": 4031,
+    "reasoning_chars": 14932,
+    "caught": [
+      4,
+      7
+    ],
+    "missed": [
+      3
+    ],
+    "false_positives": [
+      13
+    ],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 4: Errors are printed to stderr using a bare print() call instead of routing them to stdout through fail().\nVIOLATION item 7: The help key in the emitted output is assigned a bare string instead of a list of strings.\nVIOLATION item 13: A contextual hint is included in the detail-view output, which must be omitted for non-list/mutation commands.\nDONE",
+    "host": "http://10.0.6.45:11434",
+    "trial": 2
+  },
+  {
+    "model": "qwen3.6:35b-a3b-q8_0",
+    "seconds": 111.0,
+    "finish_reason": "stop",
+    "prompt_tokens": 1029,
+    "completion_tokens": 4239,
+    "reasoning_chars": 15640,
+    "caught": [
+      4,
+      7
+    ],
+    "missed": [
+      3
+    ],
+    "false_positives": [
+      13
+    ],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 4: The config loader prints errors to stderr via a raw print call instead of stdout via fail().\nVIOLATION item 7: The emitted output uses a bare string for the help key instead of a list of strings.\nVIOLATION item 13: Contextual hints are included in detail-view output where they should be omitted per policy.\nDONE",
+    "host": "http://10.0.6.45:11434",
+    "trial": 3
+  },
+  {
+    "model": "qwen3.6:35b-a3b-q8_0",
+    "seconds": 97.1,
+    "finish_reason": "stop",
+    "prompt_tokens": 1029,
+    "completion_tokens": 3793,
+    "reasoning_chars": 13737,
+    "caught": [
+      4,
+      7
+    ],
+    "missed": [
+      3
+    ],
+    "false_positives": [
+      13
+    ],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 4: The code uses a raw `print()` to stderr instead of handling errors via `fail()` to stdout.\nVIOLATION item 7: The `help` key in the emitted payload is a bare string rather than a list of strings.\nVIOLATION item 13: Contextual hints should be omitted on detail-view output, but one is added in `cmd_show`.\nDONE",
+    "host": "http://10.0.6.45:11434",
+    "trial": 4
+  },
+  {
+    "model": "qwen3.6:35b-a3b-q8_0",
+    "seconds": 135.7,
+    "finish_reason": "stop",
+    "prompt_tokens": 1029,
+    "completion_tokens": 4264,
+    "reasoning_chars": 15480,
+    "caught": [
+      4,
+      7
+    ],
+    "missed": [
+      3
+    ],
+    "false_positives": [
+      13
+    ],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 4: Uses raw print to stderr and sys.exit() instead of fail() for error handling.\nVIOLATION item 7: The help key in emitted output is a bare string instead of a list of strings.\nVIOLATION item 13: Contextual hints are included in detail-view output where the rubric requires them to be omitted.\nDONE",
+    "host": "http://10.0.6.45:11434",
+    "trial": 5
+  }
+]
