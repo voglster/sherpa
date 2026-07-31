@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Benchmark candidate models on the REAL gate workload.
 
-Prompt = the full 16-item gate rubric + a diff carrying three planted violations
-and some deliberately clean code. Scores which rubric items each model cites,
-so correctness is measured rather than latency alone.
+Prompt = the full 17-item gate rubric + a diff carrying planted violations and
+some deliberately clean code. Scores which rubric items each model cites, so
+correctness is measured rather than latency alone. Two fixture diffs are
+available via --diff: "contract" (items 3, 4, 7 -- mechanical checks) and
+"judgement" (items 16, 17 -- comment discipline, which requires judgement
+rather than pattern matching).
 
 Reasoning is ON by default and the token budget is set high enough that no
 candidate can be truncated mid-answer. Reasoning tokens count against
@@ -11,7 +14,7 @@ max_tokens, so a small budget silently scores thinking models on a starved
 response -- that is what made the first ranking provisional.
 
 Run: uv run --script scripts/gate_bench.py
-     uv run --script scripts/gate_bench.py --reasoning none   # old behaviour
+     uv run --script scripts/gate_bench.py --diff judgement --reasoning none
 """
 
 import argparse
@@ -84,6 +87,75 @@ Then output a final line: DONE
 Report only real violations that are visible in the diff. Do not report an item
 if the diff does not violate it."""
 
+JUDGEMENT_EXPECTED_ITEMS = {16, 17}
+
+JUDGEMENT_DIFF = '''\
+--- a/tools/widget.py
++++ b/tools/widget.py
+@@ -20,6 +20,38 @@ from sherpa.render import bin_line, emit, fail, parse_strict, truncate
+
++# The upstream feed pads every window to a multiple of 300 seconds, so a
++# 290-second request silently returns 300 seconds of samples.
++WINDOW_QUANTUM_SECONDS = 300
++
++MAX_RETRIES = 3
++
++
++def parse_window(raw: str) -> int:
++    """Parse the window string and return the window as an integer.
++
++    Args:
++        raw: the window string
++
++    Returns:
++        the window as an integer
++    """
++    # convert to seconds
++    s = int(raw.rstrip("s"))
++    return s
++
++
++def test_widget_1(tmp_path):
++    # Arrange
++    config = tmp_path / "widget.json"
++    config.write_text('{"name": "left"}')
++
++    # Act
++    result = load_widget_config(config)
++
++    # Assert
++    assert result["name"] == "left"
+'''
+
+
+def build_prompt(diff: str) -> str:
+    return f"""You are a code review gate. Check the diff below against the rubric.
+
+{RUBRIC}
+
+---
+
+Diff under review:
+
+```diff
+{diff}
+```
+
+Report every rubric violation you find. For each one output:
+
+VIOLATION item <N> <path>:<line> | <one short sentence>
+
+For a violation of item 16, output an additional line immediately after it:
+
+REPLACEMENT | <the rename, extraction, or restructuring that carries the intent>
+
+A violation of item 16 without a REPLACEMENT line is not a violation — do not
+report it. Then output a final line: DONE
+
+Report only real violations that are visible in the diff. Do not report an item
+if the diff does not violate it."""
+
+
 GATE_HOST = "http://10.0.6.46:11434"  # 4090, every model <= 19.9 GB
 ESCALATION_HOST = "http://10.0.6.45:11434"  # Strix Halo, 125 GB unified
 
@@ -97,10 +169,33 @@ CANDIDATES = [
 VIOLATION_RE = re.compile(r"VIOLATION\s+item\s+(\d+)", re.I)
 
 
-def run(host: str, model: str, max_tokens: int, reasoning: str | None) -> dict:
+def vote(trials: list[dict], threshold: float) -> dict:
+    usable = [t for t in trials if "error" not in t and not t["empty"]]
+    if not usable:
+        return {"confident": [], "raised": [], "usable": 0}
+    tally: dict[int, int] = {}
+    for trial in usable:
+        for item in set(trial["caught"]) | set(trial["false_positives"]):
+            tally[item] = tally.get(item, 0) + 1
+    needed = threshold * len(usable)
+    return {
+        "confident": sorted(i for i, n in tally.items() if n >= needed),
+        "raised": sorted(i for i, n in tally.items() if n < needed),
+        "usable": len(usable),
+    }
+
+
+def run(
+    host: str,
+    model: str,
+    max_tokens: int,
+    reasoning: str | None,
+    diff: str,
+    expected: set[int],
+) -> dict:
     body = {
         "model": model,
-        "messages": [{"role": "user", "content": PROMPT}],
+        "messages": [{"role": "user", "content": build_prompt(diff)}],
         "max_tokens": max_tokens,
     }
     if reasoning is not None:
@@ -131,9 +226,9 @@ def run(host: str, model: str, max_tokens: int, reasoning: str | None) -> dict:
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": usage.get("completion_tokens"),
         "reasoning_chars": len(reasoning_text),
-        "caught": sorted(cited & EXPECTED_ITEMS),
-        "missed": sorted(EXPECTED_ITEMS - cited),
-        "false_positives": sorted(cited - EXPECTED_ITEMS),
+        "caught": sorted(cited & expected),
+        "missed": sorted(expected - cited),
+        "false_positives": sorted(cited - expected),
         "truncated": choice.get("finish_reason") == "length",
         "empty": not content,
         "content": content,
@@ -181,12 +276,27 @@ def main() -> None:
         help="reasoning_effort to send; omit the flag to leave it unset (reasoning on)",
     )
     parser.add_argument(
-        "--out", type=Path, default=Path(__file__).parent / "results-reasoning.json"
+        "--diff",
+        choices=("contract", "judgement"),
+        default="contract",
+        help="which fixture diff to run the gate against",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="defaults to scripts/results-<diff>.json",
     )
     args = parser.parse_args()
 
+    if args.diff == "judgement":
+        diff, expected = JUDGEMENT_DIFF, JUDGEMENT_EXPECTED_ITEMS
+    else:
+        diff, expected = DIFF, EXPECTED_ITEMS
+    out = args.out or Path(__file__).parent / f"results-{args.diff}.json"
+
     print(
-        f"trials={args.trials} max_tokens={args.max_tokens} "
+        f"diff={args.diff} trials={args.trials} max_tokens={args.max_tokens} "
         f"reasoning_effort={args.reasoning or '<unset>'}",
         flush=True,
     )
@@ -195,11 +305,11 @@ def main() -> None:
     for host, model in CANDIDATES:
         for trial in range(1, args.trials + 1):
             print(f"-- {model} trial {trial}/{args.trials} ...", flush=True)
-            result = run(host, model, args.max_tokens, args.reasoning)
+            result = run(host, model, args.max_tokens, args.reasoning, diff, expected)
             result["host"] = host
             result["trial"] = trial
             results.append(result)
-            args.out.write_text(json.dumps(results, indent=2) + "\n")
+            out.write_text(json.dumps(results, indent=2) + "\n")
             if "error" in result:
                 print(f"   ERROR {result['error']}", flush=True)
                 continue
@@ -212,27 +322,40 @@ def main() -> None:
                 flush=True,
             )
 
-    print(f"\nwrote {args.out}", flush=True)
+    print(f"\nwrote {out}", flush=True)
 
     summaries = [
         summarise(model, [r for r in results if r["model"] == model])
         for _, model in CANDIDATES
     ]
-    print("\n=== ranking (mean caught desc, then median seconds asc) ===", flush=True)
+    print(
+        f"\n=== ranking (mean caught desc, then median seconds asc; {len(expected)} planted) ===",
+        flush=True,
+    )
     for s in sorted(
         summaries, key=lambda s: (-s["mean_caught"], s["median_seconds"] or 1e9)
     ):
         seconds = "n/a" if s["median_seconds"] is None else f"{s['median_seconds']:6.1f}s"
         truncated = f"  truncated={s['truncations']}" if s["truncations"] else ""
         print(
-            f"  {s['model']:24} {s['mean_caught']:.2f}/3 mean caught {s['caught_per_trial']}"
+            f"  {s['model']:24} {s['mean_caught']:.2f}/{len(expected)} mean caught "
+            f"{s['caught_per_trial']}"
             f"  always={s['always_caught']}  {s['mean_false_positives']:.2f} false-pos"
             f"  {seconds}  peak_out={s['max_completion_tokens']}"
             f"  usable={s['usable']}/{s['trials']}{truncated}",
             flush=True,
         )
 
-    (args.out.parent / (args.out.stem + "-summary.json")).write_text(
+    for model in {model for _, model in CANDIDATES}:
+        trials = [r for r in results if r["model"] == model]
+        ranking = vote(trials, threshold=0.6)
+        print(
+            f"  vote@0.6 {model:24} confident={ranking['confident']} "
+            f"raised={ranking['raised']}  usable={ranking['usable']}",
+            flush=True,
+        )
+
+    (out.parent / (out.stem + "-summary.json")).write_text(
         json.dumps(summaries, indent=2) + "\n"
     )
 

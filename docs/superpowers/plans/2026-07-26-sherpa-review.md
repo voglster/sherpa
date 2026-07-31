@@ -13,7 +13,7 @@
 - Python 3.11+, `uv` for all execution. Never `pip install`, never `pipx`, never `pip install --user`.
 - `tools/review.py` is a standalone PEP 723 script run as `uv run --script tools/review.py`. It reaches shared code via a two-line `sys.path` insert then `from sherpa.render import bin_line, emit, fail, parse_strict, truncate`. **Do not convert this into a package.**
 - **AXI-conformant** per `docs/SHERPA_STANDARDS.md`: TOON on stdout via `emit()`, errors on stdout via `fail()`, exit codes `0` success / `1` uncooperative external world / `2` caller must change flags or environment, `axi: true` in the YAML docstring, `parse_strict` for flag rejection, `--json` on every subcommand, a no-args home view with `bin:` and `description:` lines.
-- Tests run as `uv run --with pytest --with 'python-toon==0.1.3' pytest tests/ -q`. Baseline on `feat/review` is whatever `master` had — confirm before starting and treat that as the regression bar.
+- Tests run as `uv run --with pytest --with 'python-toon==0.1.3' --with redis pytest tests/ -q`. Baseline on `feat/review` is whatever `master` had — confirm before starting and treat that as the regression bar.
 - Test convention: load modules by path with `importlib.util.spec_from_file_location` (see `tests/test_render.py:14-18`).
 - Commit messages: no "Generated with Claude Code", no "Co-Authored-By: Claude". Auto-committing is authorized. **Do not push without asking.**
 - Comments only where naming and structure cannot carry the intent — this codebase's own rubric item 16 applies to this code. No narration comments.
@@ -327,7 +327,7 @@ Expected: 6 passed.
 
 ```yaml
 rubric: docs/gate-rubric.md
-test: uv run --with pytest --with python-toon==0.1.3 pytest tests/ -q
+test: uv run --with pytest --with python-toon==0.1.3 --with redis pytest tests/ -q
 base: master
 ```
 
@@ -1060,7 +1060,7 @@ Expected: 37 passed.
 
 - [ ] **Step 5: Run the whole suite for regressions**
 
-Run: `uv run --with pytest --with 'python-toon==0.1.3' pytest tests/ -q`
+Run: `uv run --with pytest --with 'python-toon==0.1.3' --with redis pytest tests/ -q`
 Expected: the Task 1 baseline plus 37, no failures.
 
 - [ ] **Step 6: Commit**

@@ -1,0 +1,119 @@
+[
+  {
+    "model": "gemma4:31b",
+    "seconds": 1326.9,
+    "finish_reason": "stop",
+    "prompt_tokens": 1388,
+    "completion_tokens": 2570,
+    "reasoning_chars": 7290,
+    "caught": [
+      16,
+      17
+    ],
+    "missed": [],
+    "false_positives": [],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 16 tools/widget.py:37 | Comment redundant given the operation.\nREPLACEMENT | Rename 's' to 'seconds'.\nVIOLATION item 17 tools/widget.py:43 | Narration comment sequence marker '# Arrange'.\nVIOLATION item 17 tools/widget.py:47 | Narration comment sequence marker '# Act'.\nVIOLATION item 17 tools/widget.py:50 | Narration comment sequence marker '# Assert'.\n\nDONE",
+    "host": "http://10.0.6.46:11434",
+    "trial": 1
+  },
+  {
+    "model": "gemma4:31b",
+    "seconds": 123.6,
+    "finish_reason": "stop",
+    "prompt_tokens": 1388,
+    "completion_tokens": 4838,
+    "reasoning_chars": 15362,
+    "caught": [
+      17
+    ],
+    "missed": [
+      16
+    ],
+    "false_positives": [],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 17 tools/widget.py:37 | Narration comment restates logic plainly.\nVIOLATION item 17 tools/widget.py:43 | Sequence marker # Arrange is forbidden.\nVIOLATION item 17 tools/widget.py:47 | Sequence marker # Act is forbidden.\nVIOLATION item 17 tools/widget.py:50 | Sequence marker # Assert is forbidden.\n\nDONE",
+    "host": "http://10.0.6.46:11434",
+    "trial": 2
+  },
+  {
+    "model": "gemma4:31b",
+    "seconds": 82.4,
+    "finish_reason": "stop",
+    "prompt_tokens": 1388,
+    "completion_tokens": 3023,
+    "reasoning_chars": 10085,
+    "caught": [
+      16,
+      17
+    ],
+    "missed": [],
+    "false_positives": [],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 16 tools/widget.py:39 | Comment describes intent that should be captured by naming.\nREPLACEMENT | Rename parse_window to parse_window_to_seconds\nVIOLATION item 17 tools/widget.py:44 | Narration comment # Arrange\nVIOLATION item 17 tools/widget.py:48 | Narration comment # Act\nVIOLATION item 17 tools/widget.py:51 | Narration comment # Assert\n\nDONE",
+    "host": "http://10.0.6.46:11434",
+    "trial": 3
+  },
+  {
+    "model": "gemma4:31b",
+    "seconds": 66.0,
+    "finish_reason": "stop",
+    "prompt_tokens": 1388,
+    "completion_tokens": 2579,
+    "reasoning_chars": 8179,
+    "caught": [
+      16,
+      17
+    ],
+    "missed": [],
+    "false_positives": [],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 16 tools/widget.py:34 | Comment indicates that variable 's' is poorly named.\nREPLACEMENT | Rename 's' to 'seconds'.\nVIOLATION item 17 tools/widget.py:34 | Narration comment restates the logic of the next line.\nVIOLATION item 17 tools/widget.py:40 | Sequence marker '# Arrange'.\nVIOLATION item 17 tools/widget.py:44 | Sequence marker '# Act'.\nVIOLATION item 17 tools/widget.py:48 | Sequence marker '# Assert'.\n\nDONE",
+    "host": "http://10.0.6.46:11434",
+    "trial": 4
+  },
+  {
+    "model": "gemma4:31b",
+    "seconds": 26.5,
+    "finish_reason": "stop",
+    "prompt_tokens": 1388,
+    "completion_tokens": 1009,
+    "reasoning_chars": 3130,
+    "caught": [
+      17
+    ],
+    "missed": [
+      16
+    ],
+    "false_positives": [],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 17 tools/widget.py:34 | Comment restates what the next line plainly does.\nVIOLATION item 17 tools/widget.py:39 | Contains forbidden sequence marker # Arrange.\nVIOLATION item 17 tools/widget.py:43 | Contains forbidden sequence marker # Act.\nVIOLATION item 17 tools/widget.py:46 | Contains forbidden sequence marker # Assert.\n\nDONE",
+    "host": "http://10.0.6.46:11434",
+    "trial": 5
+  },
+  {
+    "model": "qwen3.6:27b-q4_K_M",
+    "seconds": 147.3,
+    "finish_reason": "stop",
+    "prompt_tokens": 1359,
+    "completion_tokens": 6826,
+    "reasoning_chars": 21733,
+    "caught": [
+      17
+    ],
+    "missed": [
+      16
+    ],
+    "false_positives": [],
+    "truncated": false,
+    "empty": false,
+    "content": "VIOLATION item 17 tools/widget.py:37 | Narration comment restates what the next line plainly does.\nVIOLATION item 17 tools/widget.py:43 | Sequence marker explicitly listed as prohibited narration.\nVIOLATION item 17 tools/widget.py:47 | Sequence marker explicitly listed as prohibited narration.\nVIOLATION item 17 tools/widget.py:50 | Sequence marker explicitly listed as prohibited narration.\nDONE",
+    "host": "http://10.0.6.46:11434",
+    "trial": 1
+  }
+]
