@@ -8,6 +8,7 @@ import subprocess
 from fastmcp import FastMCP
 from pathlib import Path
 
+from sherpa import config
 from sherpa.indexer import get_all_tools, get_all_workflows, get_tool_by_name, index_if_changed, PROJECT_ROOT
 
 mcp = FastMCP("sherpa")
@@ -58,7 +59,8 @@ def tool_search(query: str) -> dict:
     if not tokens:
         return {"results": [], "total": 0}
 
-    tools = get_all_tools()
+    hidden = config.hidden_tools()
+    tools = [t for t in get_all_tools() if t["name"] not in hidden]
     workflows = get_all_workflows()
 
     scored = []

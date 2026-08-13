@@ -43,6 +43,22 @@ sherpa help notify    # usage block plus the tool's own --help
 
 Then run anything: `sherpa <tool> [args...]`.
 
+## Trimming what shows up
+
+A toolbox this size is a lot to hand a newcomer at once, so tools can be withheld from
+discovery:
+
+```bash
+sherpa sherpa_admin hide youtube unsplash_search   # drop them from list/search/tool_search
+sherpa sherpa_admin show youtube                   # put one back
+sherpa sherpa_admin status                         # what's active, what's hidden, where config lives
+sherpa list --all                                  # everything, hidden ones marked
+```
+
+Hidden is not disabled: `sherpa <tool>`, `sherpa help <tool>` and `tool_run` still work on a
+hidden tool. This is progressive disclosure, not access control. The list lives under `hidden`
+in `~/.config/sherpa/config.toml`, and `sherpa list` always reports how many it withheld.
+
 ## Secrets
 
 Tools declare the vault keys they need in their docstring header:

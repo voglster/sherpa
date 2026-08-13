@@ -72,6 +72,36 @@ def _parse_metadata(script: Path) -> dict:
     return meta
 
 
+def _read_config() -> dict:
+    """Mirror of sherpa/config.py's reader — the CLI ships as a standalone wheel."""
+    if not CONFIG_PATH.exists():
+        return {}
+    try:
+        return tomllib.loads(CONFIG_PATH.read_text())
+    except (tomllib.TOMLDecodeError, OSError):
+        return {}
+
+
+def _hidden_tools() -> set[str]:
+    return set(_read_config().get("hidden", []))
+
+
+def _toml_string(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _write_config(config: dict) -> None:
+    lines = []
+    if config.get("home"):
+        lines.append(f"home = {_toml_string(str(config['home']))}\n")
+    if config.get("hidden"):
+        array = ", ".join(_toml_string(name) for name in config["hidden"])
+        lines.append(f"hidden = [{array}]\n")
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text("".join(lines))
+
+
 def _list_tools(home: Path) -> list[tuple[Path, dict]]:
     out = []
     for script in sorted((home / "tools").glob("*.py")):
@@ -98,33 +128,51 @@ def _print_top_help() -> None:
         "\n"
         "Usage:\n"
         "  sherpa <tool> [args...]    Run a tool with the given args\n"
-        "  sherpa list                List all available tools\n"
-        "  sherpa search <query>      Search tools by name/description/category\n"
+        "  sherpa list [--all]        List available tools (--all includes hidden ones)\n"
+        "  sherpa search [--all] <query>\n"
+        "                             Search tools by name/description/category\n"
         "  sherpa help <tool>         Show usage for a specific tool\n"
         "  sherpa where               Print the resolved $SHERPA_HOME\n"
         "  sherpa set-home <path>     Persist a default Sherpa home in ~/.config/sherpa/config.toml\n"
     )
 
 
-def cmd_list(_argv: list[str]) -> int:
+def cmd_list(argv: list[str]) -> int:
     home = _find_home()
+    show_all = "--all" in argv
+    hidden = _hidden_tools()
     width = 24
+    withheld = 0
     for _, meta in _list_tools(home):
         name = meta.get("name", "")
+        is_hidden = name in hidden
+        if is_hidden and not show_all:
+            withheld += 1
+            continue
         if meta.get("axi"):
             name += " [axi]"
+        if is_hidden:
+            name += " [hidden]"
         print(f"  {name:<{width}} {meta.get('description', '')}")
+    if withheld:
+        print(f"\n  {withheld} hidden — 'sherpa list --all' to see them, "
+              f"'sherpa sherpa_admin show <tool>' to restore one")
     return 0
 
 
 def cmd_search(argv: list[str]) -> int:
+    show_all = "--all" in argv
+    argv = [a for a in argv if a != "--all"]
     if not argv:
         sys.exit("Usage: sherpa search <query>")
     home = _find_home()
+    hidden = _hidden_tools()
     query = " ".join(argv).lower()
     width = 24
     matches = 0
     for _, meta in _list_tools(home):
+        if not show_all and meta.get("name", "") in hidden:
+            continue
         blob = " ".join([
             meta.get("name", ""),
             meta.get("description", ""),
@@ -176,8 +224,9 @@ def cmd_set_home(argv: list[str]) -> int:
     path = Path(argv[0]).expanduser().resolve()
     if not (path / "tools").is_dir():
         sys.exit(f"{path} does not contain a tools/ dir")
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(f'home = "{path}"\n')
+    config = _read_config()
+    config["home"] = str(path)
+    _write_config(config)
     print(f"Sherpa home set to {path}")
     return 0
 
