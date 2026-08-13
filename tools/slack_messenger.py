@@ -16,13 +16,20 @@ usage: |
   send --channel general --text 'Hey @(jane doe) check this out'
   send --channel general --text 'reply' --thread 1774551827.458609
   send --channel general --blocks /tmp/blocks.json --text 'fallback'
+  send --channel general --attach ./SKILL.md --text 'here is the skill'
+  send --channel general --attach ./a.png --attach ./b.png --title 'Screens'
   dm --user <name> --text 'Hey, quick question...'
   dm --user-id U01ABC23DEF --file /tmp/msg.txt
+  dm --user wesley --attach ./report.md --title 'Weekly report'
   channels [--filter general] [--refresh]
   users [--filter swap] [--refresh]
 notes: |
   @(name) in message text becomes a Slack @mention. Errors if ambiguous (e.g. multiple "nathan"s).
   Jira ticket keys (e.g. KB-123) are auto-linked. Channel/user lookups are cached locally.
+  --file/--stdin supply the message BODY; --attach uploads a real file (repeatable).
+  With --attach the message text becomes the upload's initial comment.
+  Text over 4000 chars is uploaded as a file attachment rather than truncated by Slack;
+  pass --no-upload-fallback to send it as-is instead.
 """
 
 import argparse
@@ -30,6 +37,7 @@ import asyncio
 import json
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 import httpx
@@ -40,6 +48,7 @@ SLACK_ID_RE = re.compile(r"^[CGUWDBT][A-Z0-9]{8,}$")
 JIRA_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
 MENTION_RE = re.compile(r"@\(([^)]+)\)")
 RATE_LIMIT_THRESHOLD = 30  # seconds — auto-retry if Retry-After <= this
+SLACK_TEXT_LIMIT = 4000  # chars; Slack truncates chat.postMessage text beyond this
 
 
 def _load_secret(key: str) -> str:
@@ -341,10 +350,71 @@ async def _open_dm(client: httpx.AsyncClient, headers: dict, user_id: str) -> st
     return data["channel"]["id"]
 
 
+# --- File uploads ---
+
+
+async def _upload_one(client: httpx.AsyncClient, headers: dict, path: Path, title: str | None) -> dict:
+    """Reserve an upload URL, PUT the bytes, and return the completeUpload descriptor."""
+    content = path.read_bytes()
+    if not content:
+        print(f"Cannot upload an empty file: {path}", file=sys.stderr)
+        sys.exit(2)
+
+    reservation = await _slack_get(
+        client,
+        headers,
+        "https://slack.com/api/files.getUploadURLExternal",
+        {"filename": path.name, "length": len(content)},
+    )
+    resp = await client.post(
+        reservation["upload_url"],
+        headers=headers,
+        files={"file": (path.name, content)},
+    )
+    if resp.status_code >= 400:
+        print(f"Upload of {path.name} failed: HTTP {resp.status_code}", file=sys.stderr)
+        sys.exit(2)
+    return {"id": reservation["file_id"], "title": title or path.name}
+
+
+async def _upload_files(
+    client: httpx.AsyncClient,
+    headers: dict,
+    channel_id: str,
+    paths: list[Path],
+    title: str | None,
+    initial_comment: str | None,
+    thread_ts: str | None,
+) -> dict:
+    files = [await _upload_one(client, headers, p, title) for p in paths]
+    payload: dict = {"files": files, "channel_id": channel_id}
+    if initial_comment:
+        payload["initial_comment"] = initial_comment
+    if thread_ts:
+        payload["thread_ts"] = thread_ts
+    return await _slack_post(client, headers, "https://slack.com/api/files.completeUploadExternal", payload)
+
+
+def _resolve_attachments(args: argparse.Namespace) -> list[Path]:
+    paths = [Path(a).expanduser() for a in (getattr(args, "attach", None) or [])]
+    for path in paths:
+        if not path.is_file():
+            print(f"Attachment not found: {path}", file=sys.stderr)
+            sys.exit(1)
+    return paths
+
+
+def _spill_to_file(text: str) -> Path:
+    """Write over-length message text to a temp file so it can be uploaded intact."""
+    path = Path(tempfile.mkdtemp(prefix="slack_messenger_")) / "message.md"
+    path.write_text(text)
+    return path
+
+
 # --- Text resolution ---
 
 
-def _resolve_text(args: argparse.Namespace) -> str:
+def _resolve_text(args: argparse.Namespace, *, required: bool = True) -> str:
     """Resolve message text from --text, --file, or --stdin."""
     if getattr(args, "file", None):
         return Path(args.file).read_text().strip()
@@ -352,8 +422,56 @@ def _resolve_text(args: argparse.Namespace) -> str:
         return sys.stdin.read().strip()
     if getattr(args, "text", None):
         return args.text
+    if not required:
+        return ""
     print("One of --text, --file, or --stdin is required", file=sys.stderr)
     sys.exit(1)
+
+
+# --- Delivery ---
+
+
+async def _deliver(client: httpx.AsyncClient, headers: dict, channel_id: str, args: argparse.Namespace) -> dict:
+    """Post a message, or upload attachments with the message as their initial comment."""
+    attachments = _resolve_attachments(args)
+    if attachments and args.blocks:
+        print("--blocks cannot be combined with --attach", file=sys.stderr)
+        sys.exit(1)
+
+    raw_text = _resolve_text(args, required=not attachments)
+    text = await _linkify_mentions(client, headers, _linkify_jira_keys(raw_text)) if raw_text else ""
+
+    if not attachments and len(text) > SLACK_TEXT_LIMIT and not args.no_upload_fallback:
+        print(
+            f"Message is {len(text)} chars, over Slack's {SLACK_TEXT_LIMIT}-char limit — "
+            "uploading it as a file instead of letting Slack truncate it. "
+            "Pass --no-upload-fallback to send it as text anyway.",
+            file=sys.stderr,
+        )
+        attachments = [_spill_to_file(raw_text)]
+        text = ""
+
+    if attachments:
+        data = await _upload_files(
+            client, headers, channel_id, attachments, args.title, text or None, args.thread
+        )
+        return {
+            "ts": next((s.get("ts") for f in data.get("files", []) for s in _shares(f)), None),
+            "files": [{"id": f.get("id"), "permalink": f.get("permalink")} for f in data.get("files", [])],
+        }
+
+    payload = {"channel": channel_id, "text": text}
+    if args.thread:
+        payload["thread_ts"] = args.thread
+    if args.blocks:
+        payload["blocks"] = json.loads(Path(args.blocks).read_text())
+    data = await _slack_post(client, headers, "https://slack.com/api/chat.postMessage", payload)
+    return {"ts": data.get("ts")}
+
+
+def _shares(file_info: dict) -> list[dict]:
+    shares = file_info.get("shares", {})
+    return [s for scope in shares.values() for entries in scope.values() for s in entries]
 
 
 # --- Subcommands ---
@@ -367,18 +485,11 @@ async def _cmd_send(args: argparse.Namespace) -> None:
             channel = await _channel_info(client, headers, args.channel_id)
         else:
             channel = await _resolve_channel(client, headers, args.channel)
-        text = _linkify_jira_keys(_resolve_text(args))
-        text = await _linkify_mentions(client, headers, text)
-        payload = {"channel": channel["id"], "text": text}
-        if args.thread:
-            payload["thread_ts"] = args.thread
-        if args.blocks:
-            payload["blocks"] = json.loads(Path(args.blocks).read_text())
-        data = await _slack_post(client, headers, "https://slack.com/api/chat.postMessage", payload)
+        result = await _deliver(client, headers, channel["id"], args)
         print(json.dumps({
             "ok": True,
             "channel": channel.get("name", channel["id"]),
-            "ts": data.get("ts"),
+            **result,
         }))
 
 
@@ -391,18 +502,11 @@ async def _cmd_dm(args: argparse.Namespace) -> None:
         else:
             user = await _resolve_user(client, headers, args.user)
         dm_channel_id = await _open_dm(client, headers, user["id"])
-        text = _linkify_jira_keys(_resolve_text(args))
-        text = await _linkify_mentions(client, headers, text)
-        payload = {"channel": dm_channel_id, "text": text}
-        if args.thread:
-            payload["thread_ts"] = args.thread
-        if args.blocks:
-            payload["blocks"] = json.loads(Path(args.blocks).read_text())
-        data = await _slack_post(client, headers, "https://slack.com/api/chat.postMessage", payload)
+        result = await _deliver(client, headers, dm_channel_id, args)
         print(json.dumps({
             "ok": True,
             "user": user.get("real_name", user.get("name", user["id"])),
-            "ts": data.get("ts"),
+            **result,
         }))
 
 
@@ -453,6 +557,14 @@ async def _cmd_users(args: argparse.Namespace) -> None:
 # --- CLI ---
 
 
+def _add_attach_args(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument("--attach", action="append", metavar="PATH",
+                     help="Upload a real file (repeatable); message text becomes its initial comment")
+    sub.add_argument("--title", default=None, help="Title for the uploaded file(s)")
+    sub.add_argument("--no-upload-fallback", action="store_true",
+                     help="Send over-length text as-is instead of uploading it as a file")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Send Slack messages to channels and DMs.")
     subparsers = parser.add_subparsers(dest="command")
@@ -467,6 +579,7 @@ def main():
     send_text.add_argument("--stdin", action="store_true", help="Read message text from stdin")
     send_parser.add_argument("--thread", default=None, help="Thread timestamp to reply to")
     send_parser.add_argument("--blocks", default=None, help="Path to Block Kit JSON file")
+    _add_attach_args(send_parser)
 
     dm_parser = subparsers.add_parser("dm", help="Send a direct message to a user")
     dm_user = dm_parser.add_mutually_exclusive_group(required=True)
@@ -478,6 +591,7 @@ def main():
     dm_text.add_argument("--stdin", action="store_true", help="Read message text from stdin")
     dm_parser.add_argument("--thread", default=None, help="Thread timestamp to reply to")
     dm_parser.add_argument("--blocks", default=None, help="Path to Block Kit JSON file")
+    _add_attach_args(dm_parser)
 
     channels_parser = subparsers.add_parser("channels", help="List channels")
     channels_parser.add_argument("--filter", default=None, help="Substring filter on channel name")
