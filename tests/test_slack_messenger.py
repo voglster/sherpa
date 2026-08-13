@@ -82,6 +82,27 @@ def test_plain_text_posts_a_message(slack):
     assert payload == {"channel": "C1", "text": "hello"}
 
 
+def test_escape_sequences_in_text_become_real_whitespace(slack):
+    deliver(FakeClient(), make_args(text=r"line one\nline two\ttabbed"))
+
+    assert slack["post"][0][1]["text"] == "line one\nline two\ttabbed"
+
+
+def test_doubled_backslash_keeps_a_literal_escape_sequence(slack):
+    deliver(FakeClient(), make_args(text=r"regex is \\n and \d"))
+
+    assert slack["post"][0][1]["text"] == r"regex is \n and \d"
+
+
+def test_file_text_keeps_backslash_n_literal(slack, tmp_path):
+    snippet = tmp_path / "snippet.txt"
+    snippet.write_text(r"print('a\nb')")
+
+    deliver(FakeClient(), make_args(file=str(snippet)))
+
+    assert slack["post"][0][1]["text"] == r"print('a\nb')"
+
+
 def test_attachment_is_uploaded_with_text_as_initial_comment(slack, tmp_path):
     doc = tmp_path / "SKILL.md"
     doc.write_text("# skill\n")

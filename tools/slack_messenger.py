@@ -26,6 +26,8 @@ usage: |
 notes: |
   @(name) in message text becomes a Slack @mention. Errors if ambiguous (e.g. multiple "nathan"s).
   Jira ticket keys (e.g. KB-123) are auto-linked. Channel/user lookups are cached locally.
+  --text interprets \n, \t and \r as real characters (\\ sends a literal backslash);
+  --file/--stdin are taken verbatim, so code snippets keep their backslashes.
   --file/--stdin supply the message BODY; --attach uploads a real file (repeatable).
   With --attach the message text becomes the upload's initial comment.
   Text over 4000 chars is uploaded as a file attachment rather than truncated by Slack;
@@ -49,6 +51,7 @@ JIRA_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
 MENTION_RE = re.compile(r"@\(([^)]+)\)")
 RATE_LIMIT_THRESHOLD = 30  # seconds — auto-retry if Retry-After <= this
 SLACK_TEXT_LIMIT = 4000  # chars; Slack truncates chat.postMessage text beyond this
+_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\"}
 
 
 def _load_secret(key: str) -> str:
@@ -414,6 +417,16 @@ def _spill_to_file(text: str) -> Path:
 # --- Text resolution ---
 
 
+def _unescape(text: str) -> str:
+    r"""Turn the escape sequences a caller can only type as text into real characters.
+
+    Argv carries no line breaks, so `--text 'a\nb'` arrives as a literal backslash-n and
+    Slack would render it that way. `\\` yields one backslash, and any other escape is
+    left alone so regexes and Windows paths survive.
+    """
+    return re.sub(r"\\(.)", lambda m: _ESCAPES.get(m.group(1), m.group(0)), text)
+
+
 def _resolve_text(args: argparse.Namespace, *, required: bool = True) -> str:
     """Resolve message text from --text, --file, or --stdin."""
     if getattr(args, "file", None):
@@ -421,7 +434,7 @@ def _resolve_text(args: argparse.Namespace, *, required: bool = True) -> str:
     if getattr(args, "stdin", False):
         return sys.stdin.read().strip()
     if getattr(args, "text", None):
-        return args.text
+        return _unescape(args.text)
     if not required:
         return ""
     print("One of --text, --file, or --stdin is required", file=sys.stderr)
