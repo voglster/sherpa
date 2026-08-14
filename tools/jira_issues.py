@@ -347,14 +347,80 @@ def _walk_list_items(tokens, start: int, end: int) -> list:
     return items
 
 
+# ADF's code mark combines with link and nothing else: a text node carrying
+# [code, strong] makes Jira reject the whole document with an opaque 400. Code and
+# any link survive, the rest is dropped — losing bold beats losing the href.
+EXCLUSIVE_MARKS = {"code"}
+CODE_COMPATIBLE_MARKS = {"link"}
+
+ADF_NODE_TYPES = {
+    "doc", "paragraph", "text", "heading", "bulletList", "orderedList", "listItem",
+    "codeBlock", "blockquote", "rule", "hardBreak", "panel", "table", "tableRow",
+    "tableCell", "tableHeader", "mediaSingle", "media", "emoji", "mention",
+    "inlineCard", "expand", "nestedExpand", "status", "date",
+}
+
+
+def adf_problems(node: dict, path: str = "doc") -> list[str]:
+    """Report structural faults Jira would reject, naming the offending source text.
+
+    Exists because --dry-run printing a payload says nothing about whether the real
+    call will succeed — the worst possible signal when the API answers with a bare
+    INVALID_INPUT.
+    """
+    problems: list[str] = []
+    if isinstance(node, dict):
+        ntype = node.get("type")
+        if ntype and ntype not in ADF_NODE_TYPES:
+            problems.append(f"{path}: unsupported node type {ntype!r}")
+        if ntype == "text":
+            marks = [m.get("type") for m in node.get("marks", [])]
+            exclusive = [m for m in marks if m in EXCLUSIVE_MARKS]
+            conflicting = [m for m in marks
+                           if m not in EXCLUSIVE_MARKS and m not in CODE_COMPATIBLE_MARKS]
+            if exclusive and conflicting:
+                problems.append(
+                    f"{path}: {exclusive[0]!r} cannot combine with "
+                    f"{', '.join(repr(m) for m in conflicting)} "
+                    f"on text {node.get('text', '')!r}"
+                )
+            if not node.get("text"):
+                problems.append(f"{path}: empty text node")
+        for child in node.get("content", []) or []:
+            problems.extend(adf_problems(child, f"{path}.{ntype}"))
+    return problems
+
+
+def validated_adf(markdown: str) -> dict:
+    """Convert markdown to ADF, refusing to build a document Jira would reject.
+
+    Jira answers an invalid document with a bare 400 INVALID_INPUT that names
+    nothing, so the offending construct has to be named here or not at all.
+    Reports on stderr and exits 2, the convention of the unconverted
+    subcommands that call this — see `_load_secret` on the two channels.
+    """
+    adf = _md_to_adf(markdown)
+    problems = adf_problems(adf)
+    if problems:
+        print(f"Rendered ADF is invalid ({len(problems)} problem(s)):", file=sys.stderr)
+        for problem in problems[:5]:
+            print(f"  {problem}", file=sys.stderr)
+        sys.exit(2)
+    return adf
+
+
 def _walk_inline(tokens) -> list:
     nodes: list = []
     mark_stack: list = []
 
     def text_node(s: str) -> dict:
         node = {"type": "text", "text": s}
-        if mark_stack:
-            node["marks"] = [dict(m) for m in mark_stack]
+        marks = [dict(m) for m in mark_stack]
+        if any(m["type"] in EXCLUSIVE_MARKS for m in marks):
+            marks = [m for m in marks
+                     if m["type"] in EXCLUSIVE_MARKS or m["type"] in CODE_COMPATIBLE_MARKS]
+        if marks:
+            node["marks"] = marks
         return node
 
     for t in tokens:
@@ -539,7 +605,7 @@ def cmd_create(args: argparse.Namespace) -> None:
     if args.parent:
         fields["parent"] = {"key": args.parent}
     if description is not None:
-        fields["description"] = _md_to_adf(description)
+        fields["description"] = validated_adf(description)
 
     if args.dry_run:
         print(json.dumps({"fields": fields, "sprint": bool(args.sprint)}, indent=2))
@@ -656,7 +722,7 @@ def cmd_update(args: argparse.Namespace) -> None:
     if args.summary:
         fields["summary"] = args.summary
     if description is not None:
-        fields["description"] = _md_to_adf(description)
+        fields["description"] = validated_adf(description)
     if args.labels:
         fields["labels"] = args.labels
     if args.assignee:
@@ -993,7 +1059,7 @@ def cmd_comment(args: argparse.Namespace) -> None:
         print("Provide --body, --body-file, or --body-stdin", file=sys.stderr)
         sys.exit(1)
 
-    adf = _md_to_adf(body)
+    adf = validated_adf(body)
     if args.dry_run:
         print(json.dumps({"issue_key": args.issue_key, "body": adf}, indent=2))
         return

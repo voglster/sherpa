@@ -140,3 +140,124 @@ def test_unconverted_subcommands_share_the_missing_secret_exit_code(capsys, monk
         jira_issues._load_secret("JIRA_API_TOKEN")
     assert capsys.readouterr().err == "MISSING_SECRET: JIRA_API_TOKEN\n"
     assert exit_info.value.code == 2
+
+
+# --- markdown -> ADF marks ---
+
+
+def marks_of(adf: dict, text: str) -> list[str]:
+    """Mark types on the first text node matching `text`, in document order."""
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get("type") == "text" and node.get("text") == text:
+                yield [m["type"] for m in node.get("marks", [])]
+            for value in node.values():
+                yield from walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                yield from walk(value)
+    return next(walk(adf), [])
+
+
+def href_of(adf: dict, text: str) -> str | None:
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get("type") == "text" and node.get("text") == text:
+                for mark in node.get("marks", []):
+                    if mark["type"] == "link":
+                        yield mark["attrs"]["href"]
+            for value in node.values():
+                yield from walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                yield from walk(value)
+    return next(walk(adf), None)
+
+
+def test_bold_wrapped_inline_code_emits_code_alone():
+    adf = jira_issues._md_to_adf("**`Foo`**")
+
+    assert marks_of(adf, "Foo") == ["code"]
+
+
+def test_code_inside_a_bolded_bullet_lead_in_emits_code_alone():
+    adf = jira_issues._md_to_adf("- **`PendingJobIndexMiddleware` fails open.**")
+
+    assert marks_of(adf, "PendingJobIndexMiddleware") == ["code"]
+    assert marks_of(adf, " fails open.") == ["strong"]
+
+
+def test_linked_inline_code_keeps_the_link_and_drops_the_bold():
+    """ADF forbids code+strong but explicitly permits code+link, so the href survives."""
+    adf = jira_issues._md_to_adf("[**`config.py`**](http://x/y)")
+
+    assert sorted(marks_of(adf, "config.py")) == ["code", "link"]
+    assert href_of(adf, "config.py") == "http://x/y"
+
+
+def test_non_code_marks_still_combine():
+    adf = jira_issues._md_to_adf("***both***")
+
+    assert sorted(marks_of(adf, "both")) == ["em", "strong"]
+
+
+def test_no_text_node_ever_carries_code_with_another_mark():
+    source = "**`a`** and *`b`* and ~~`c`~~ and [`d`](http://e/f)"
+
+    adf = jira_issues._md_to_adf(source)
+
+    for name in ("a", "b", "c"):
+        assert marks_of(adf, name) == ["code"]
+    assert sorted(marks_of(adf, "d")) == ["code", "link"]
+
+
+# --- ADF validation (what --dry-run checks) ---
+
+
+def test_validation_passes_a_clean_document():
+    assert jira_issues.adf_problems(jira_issues._md_to_adf("plain **text**")) == []
+
+
+def test_validation_accepts_code_with_a_link():
+    ok = {"type": "doc", "version": 1, "content": [
+        {"type": "paragraph", "content": [
+            {"type": "text", "text": "Foo", "marks": [
+                {"type": "code"}, {"type": "link", "attrs": {"href": "http://x/y"}}]}]}]}
+
+    assert jira_issues.adf_problems(ok) == []
+
+
+def test_validation_catches_an_exclusive_mark_collision():
+    bad = {"type": "doc", "version": 1, "content": [
+        {"type": "paragraph", "content": [
+            {"type": "text", "text": "Foo",
+             "marks": [{"type": "code"}, {"type": "strong"}]}]}]}
+
+    problems = jira_issues.adf_problems(bad)
+
+    assert len(problems) == 1
+    assert "Foo" in problems[0] and "code" in problems[0]
+
+
+def test_validation_catches_an_unsupported_node_type():
+    bad = {"type": "doc", "version": 1, "content": [{"type": "flowchart", "content": []}]}
+
+    assert any("flowchart" in p for p in jira_issues.adf_problems(bad))
+
+
+def test_validated_adf_returns_the_document_when_clean():
+    assert jira_issues.validated_adf("**bold** and `code`")["type"] == "doc"
+
+
+def test_validated_adf_refuses_an_invalid_document(monkeypatch, capsys):
+    bad = {"type": "doc", "version": 1, "content": [
+        {"type": "paragraph", "content": [
+            {"type": "text", "text": "Foo",
+             "marks": [{"type": "code"}, {"type": "strong"}]}]}]}
+    monkeypatch.setattr(jira_issues, "_md_to_adf", lambda text: bad)
+
+    with pytest.raises(SystemExit) as exit_info:
+        jira_issues.validated_adf("anything")
+
+    assert exit_info.value.code == 2
+    assert "Foo" in capsys.readouterr().err
