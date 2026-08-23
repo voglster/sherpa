@@ -6,6 +6,7 @@ dependencies stay isolated from the CLI's own environment.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -17,7 +18,7 @@ import yaml
 
 CONFIG_PATH = Path.home() / ".config" / "sherpa" / "config.toml"
 
-RESERVED = {"list", "search", "help", "where", "set-home", "-h", "--help"}
+RESERVED = {"list", "search", "help", "where", "set-home", "manifest", "-h", "--help"}
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +54,10 @@ def _find_home() -> Path:
 # Tool metadata
 # ---------------------------------------------------------------------------
 
-_DOCSTRING_RE = re.compile(r'^"""(.*?)"""', re.DOTALL | re.MULTILINE)
+# `r"""` as well as `"""`: a docstring documenting an escape sequence has to be
+# raw or Python expands it before any YAML parser sees it, and a header that only
+# one of this repo's two parsers can read is a tool that silently half-exists.
+_DOCSTRING_RE = re.compile(r'^r?"""(.*?)"""', re.DOTALL | re.MULTILINE)
 
 
 def _parse_metadata(script: Path) -> dict:
@@ -133,6 +137,7 @@ def _print_top_help() -> None:
         "                             Search tools by name/description/category\n"
         "  sherpa help <tool>         Show usage for a specific tool\n"
         "  sherpa where               Print the resolved $SHERPA_HOME\n"
+        "  sherpa manifest            Machine-readable index of tools that declare operations\n"
         "  sherpa set-home <path>     Persist a default Sherpa home in ~/.config/sherpa/config.toml\n"
     )
 
@@ -213,6 +218,50 @@ def cmd_help(argv: list[str]) -> int:
     return result.returncode
 
 
+def cmd_manifest(_argv: list[str]) -> int:
+    """Emit the machine-readable index: every tool that declares `operations:`.
+
+    `sherpa list` is for a person choosing a tool; this is for a caller deciding
+    what it is allowed to invoke. The two answer different questions, which is
+    why the gate is different: `list` withholds hidden tools and shows everything
+    else, while this shows only tools that have declared a tier and a command
+    line per subcommand. A tool with no declaration is reported by name under
+    `undeclared` rather than being silently absent — "sherpa has no jira tool"
+    and "the jira tool has not said what its subcommands do" are different
+    problems with different fixes.
+
+    Hidden is progressive disclosure, not access control, so a hidden tool still
+    appears here and is flagged. A consumer that wants to honour hiding can.
+    """
+    home = _find_home()
+    hidden = _hidden_tools()
+
+    tools = []
+    undeclared = []
+    for script, meta in _list_tools(home):
+        name = meta.get("name", script.stem)
+        operations = meta.get("operations")
+        if not isinstance(operations, dict) or not operations:
+            undeclared.append(name)
+            continue
+        entry = {
+            "name": name,
+            "description": meta.get("description", ""),
+            "secrets": meta.get("secrets", []),
+            "operations": operations,
+        }
+        if meta.get("risk"):
+            entry["risk"] = meta["risk"]
+        if meta.get("outputBudget"):
+            entry["outputBudget"] = meta["outputBudget"]
+        if name in hidden:
+            entry["hidden"] = True
+        tools.append(entry)
+
+    print(json.dumps({"home": str(home), "tools": tools, "undeclared": sorted(undeclared)}, indent=2))
+    return 0
+
+
 def cmd_where(_argv: list[str]) -> int:
     print(_find_home())
     return 0
@@ -254,6 +303,7 @@ def main() -> None:
         "help": cmd_help,
         "where": cmd_where,
         "set-home": cmd_set_home,
+        "manifest": cmd_manifest,
     }
     if cmd in dispatch:
         sys.exit(dispatch[cmd](rest))

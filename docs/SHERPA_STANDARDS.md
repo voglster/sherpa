@@ -43,6 +43,60 @@ The module docstring is YAML with these fields:
 | `secrets` | No | List of vault key names the tool requires. |
 | `usage` | No | Multi-line CLI usage examples showing subcommands and args. Returned in `tool_search` results. |
 | `axi` | No | `true` once the tool has been converted to the AXI contract below. See "Migration state" under New Tool Checklist. |
+| `operations` | No | Per-subcommand tier and command line, for callers that authorize rather than browse. See below. |
+| `risk` | No | `low`, `medium`, `high` or `critical` — how much a *write* by this tool costs if it is wrong. Default `medium`. |
+| `outputBudget` | No | Bytes of output a caller should keep before filing the rest away. Default 3000. |
+
+### `operations` — declaring a tool to an agent that must authorize it
+
+A docstring says what a tool is *for*. `operations` says what each of its
+subcommands *does to the world*, and it exists because that cannot be inferred
+from the other fields and must not be guessed:
+
+```yaml
+operations:
+  get:
+    tier: read
+    argv: ["get", "{issue}"]
+  search:
+    tier: read
+    argv: ["search"]
+    optional:
+      jql: "--jql"
+      mine: "--mine"
+  comment:
+    tier: write
+    argv: ["comment", "{issue}", "--body", "{body}"]
+  transition:
+    tier: dangerous
+    argv: ["transition", "{issue}", "--status", "{status}"]
+    notes: "Moves someone else's board."
+```
+
+| Key | Meaning |
+|-----|---------|
+| `tier` | `read` (returns information), `write` (changes something recoverable), `dangerous` (changes something that is not). Required. |
+| `argv` | The command line, with `{name}` where an argument goes. The first element is the subcommand and may **not** be a placeholder. Required. |
+| `optional` | Argument name to flag. Appended when the argument is given; a `true` value appends the flag alone. |
+| `notes` | One line on anything the argument names do not convey. |
+
+The placeholders in `argv` *are* the required arguments — there is no second
+list to keep in step with it. `tool_run` and `sherpa <tool>` ignore all of this
+and go on taking a raw argument string; it is for a caller that has to decide,
+before running anything, whether this particular subcommand is allowed.
+
+Declaring is opt-in and per subcommand. A tool that declares nothing is absent
+from `sherpa manifest` — reported by name under `undeclared`, so the difference
+between "no such tool" and "that tool has not said what it does" stays visible.
+
+Two rules worth stating, because both were learned the hard way:
+
+- **A subcommand may not come from an argument.** `argv: ["{command}"]` hands
+  the choice of subcommand, and with it the tier, back to the caller — which is
+  the thing declaring was for.
+- **A value that starts with `-` is not a value.** Sherpa tools reject unknown
+  flags, but a *known* flag arriving as a value is the case that would not fail.
+  A caller is expected to refuse it; do not rely on `parse_strict` for that.
 
 ## The render API
 
@@ -127,6 +181,7 @@ A reviewer can run this against any tool to confirm it meets the contract:
 - [ ] No-args invocation shows live content plus `bin:` and `description:` lines
 - [ ] Contextual hints appear on list/mutation output only, never on detail views
 - [ ] `axi: true` present in the docstring
+- [ ] `operations` declares every subcommand with a tier and an argv, if the tool is meant to be reachable by an agent that authorizes
 
 ---
 

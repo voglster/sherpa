@@ -52,6 +52,12 @@ def _parse_tool_metadata(filepath: Path) -> dict | None:
     }
     if meta.get("usage"):
         result["usage"] = meta["usage"]
+    # Carried through for callers that authorize rather than browse: `operations`
+    # is what says which subcommands exist and what each one costs the world.
+    if meta.get("operations"):
+        result["operations"] = meta["operations"]
+    if meta.get("risk"):
+        result["risk"] = meta["risk"]
     return result
 
 

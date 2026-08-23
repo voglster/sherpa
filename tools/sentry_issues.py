@@ -15,6 +15,17 @@ usage: |
   fetch https://sentry.example.com/organizations/myorg/issues/9993/?environment=production
   resolve 9993
   resolve https://sentry.example.com/organizations/myorg/issues/9993/ [--base-url URL]
+risk: medium
+operations:
+  fetch:
+    tier: read
+    argv: ["fetch", "{issue}"]
+    notes: "issue is a number or the full Sentry URL."
+  resolve:
+    tier: write
+    argv: ["resolve", "{issue}"]
+    optional:
+      base_url: "--base-url"
 """
 
 import argparse

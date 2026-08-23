@@ -88,6 +88,26 @@ Its command is `uv run --directory . python -m sherpa.server`. The `.` is relati
 so **when you wire the server into another project, replace `.` with the absolute path to your
 Sherpa clone** — otherwise the server starts in the wrong directory and finds no tools.
 
+### For an agent that authorizes before it runs
+
+`tool_run` takes a tool name and an argument string, which is the right shape for
+an assistant a person is watching and the wrong one for an agent deciding on its
+own whether it may act — a single entry point cannot be read-only for
+`jira_issues get` and destructive for `jira_issues transition`.
+
+Tools can therefore declare their subcommands: a tier (`read` / `write` /
+`dangerous`) and a command-line template per subcommand, under `operations` in
+the docstring. See [`docs/SHERPA_STANDARDS.md`](docs/SHERPA_STANDARDS.md).
+
+```bash
+sherpa manifest    # JSON: every tool that declares operations, plus the names of those that do not
+```
+
+Declaring changes nothing about how a tool runs — `sherpa <tool>` and `tool_run`
+are unaffected. It only makes the tool visible to a caller that has to know, in
+advance, what a subcommand costs. `writ` reads this to register each declared
+tool as a separate capability with its own risk tier and approval rules.
+
 `CLAUDE.md` at the repo root is the agent-facing companion to this file: discovery, running
 tools, and the missing-secret recovery loop. If your agent has no MCP support, paste this into
 its instructions and let it use the shell directly:

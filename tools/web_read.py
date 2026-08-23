@@ -9,6 +9,11 @@ description: Fetch a URL and return clean readable markdown via Jina Reader
 categories: [web, read, fetch, research]
 usage: |
   fetch 'https://example.com/page'
+risk: low
+operations:
+  fetch:
+    tier: read
+    argv: ["fetch", "{url}"]
 """
 
 import argparse

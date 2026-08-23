@@ -14,6 +14,18 @@ secrets:
 usage: |
   pulse [--project KEY] [--days 7]
   epic-progress [--project KEY]
+operations:
+  pulse:
+    tier: read
+    argv: ["pulse"]
+    optional:
+      project: "--project"
+      days: "--days"
+  epic-progress:
+    tier: read
+    argv: ["epic-progress"]
+    optional:
+      project: "--project"
 """
 
 import argparse

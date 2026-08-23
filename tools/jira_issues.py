@@ -28,6 +28,51 @@ usage: |
   Note: only `search` has been converted to the AXI contract (TOON output,
   strict flags, emit/fail). The other subcommands above are unconverted
   follow-on work and still use the pre-AXI JSON/argparse conventions.
+risk: medium
+operations:
+  get:
+    tier: read
+    argv: ["get", "{issue}"]
+  search:
+    tier: read
+    argv: ["search"]
+    optional:
+      jql: "--jql"
+      project: "--project"
+      status: "--status"
+      fields: "--fields"
+      mine: "--mine"
+      current_sprint: "--current-sprint"
+    notes: "Give jql, or project/status; mine and current_sprint are flags, not values."
+  sprints:
+    tier: read
+    argv: ["sprints"]
+    optional:
+      board: "--board"
+  comment:
+    tier: write
+    argv: ["comment", "{issue}", "--body", "{body}"]
+  create:
+    tier: write
+    argv: ["create", "--summary", "{summary}"]
+    optional:
+      description: "--description"
+      project: "--project"
+      type: "--type"
+      parent: "--parent"
+      sprint: "--sprint"
+  update:
+    tier: write
+    argv: ["update", "{issue}"]
+    optional:
+      summary: "--summary"
+      description: "--description"
+      assignee: "--assignee"
+      sprint: "--sprint"
+  transition:
+    tier: dangerous
+    argv: ["transition", "{issue}", "--status", "{status}"]
+    notes: "Moves someone else's board. The status must exist on the issue's workflow."
 """
 
 import argparse

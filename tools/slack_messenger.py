@@ -3,7 +3,13 @@
 # requires-python = ">=3.11"
 # dependencies = ["httpx"]
 # ///
-"""
+# A raw docstring: the notes below mention \n and \t as literal escape
+# sequences, and in a cooked string Python turns them into real newlines
+# before any YAML parser sees them — which ends the block scalar early and
+# makes the whole header unparseable to `ast.get_docstring` (the indexer
+# path), so this tool was silently missing from the MCP index. The CLI's
+# regex reads the source text and never saw it.
+r"""
 name: slack_messenger
 description: Send Slack messages to channels and DMs. Supports @(name) for user mentions and auto-links Jira keys. Fuzzy user/channel lookup with local caching.
 categories: [slack, messaging, communication]
@@ -32,6 +38,29 @@ notes: |
   With --attach the message text becomes the upload's initial comment.
   Text over 4000 chars is uploaded as a file attachment rather than truncated by Slack;
   pass --no-upload-fallback to send it as-is instead.
+risk: high
+operations:
+  channels:
+    tier: read
+    argv: ["channels"]
+    optional:
+      filter: "--filter"
+      refresh: "--refresh"
+  users:
+    tier: read
+    argv: ["users"]
+    optional:
+      filter: "--filter"
+      refresh: "--refresh"
+  send:
+    tier: write
+    argv: ["send", "--channel", "{channel}", "--text", "{text}"]
+    optional:
+      thread: "--thread"
+    notes: "Posts publicly and cannot be unsent. @(name) in text becomes a mention."
+  dm:
+    tier: write
+    argv: ["dm", "--user", "{user}", "--text", "{text}"]
 """
 
 import argparse

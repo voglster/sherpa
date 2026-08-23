@@ -9,6 +9,13 @@ description: Search the web using DuckDuckGo and return results as JSON
 categories: [web, search, research]
 usage: |
   search 'your query here' [--limit 5]
+risk: low
+operations:
+  search:
+    tier: read
+    argv: ["search", "{query}"]
+    optional:
+      limit: "--limit"
 """
 
 import argparse

@@ -13,6 +13,26 @@ usage: |
   get <key>
   list
   remove <key>
+risk: medium
+operations:
+  list:
+    tier: read
+    argv: ["list"]
+  get:
+    tier: read
+    argv: ["get", "{key}"]
+  search:
+    tier: read
+    argv: ["search", "{query}"]
+  add:
+    tier: write
+    argv: ["add", "{key}", "{value}"]
+    optional:
+      tags: "--tags"
+      description: "--description"
+  remove:
+    tier: dangerous
+    argv: ["remove", "{key}"]
 """
 
 import argparse

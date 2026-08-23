@@ -30,6 +30,51 @@ notes: |
   linked note — giving a full picture in one call.
   Use read to get full note content. Use create/append/edit for modifications.
   Obsidian must be running. The CLI connects via /run/user/<uid>/.obsidian-cli.sock.
+risk: medium
+operations:
+  search:
+    tier: read
+    argv: ["search", "--query", "{query}"]
+    optional:
+      limit: "--limit"
+      context: "--context"
+  read:
+    tier: read
+    argv: ["read", "--file", "{file}"]
+  context:
+    tier: read
+    argv: ["context", "--file", "{file}"]
+    optional:
+      depth: "--depth"
+  links:
+    tier: read
+    argv: ["links", "--file", "{file}"]
+  backlinks:
+    tier: read
+    argv: ["backlinks", "--file", "{file}"]
+  tags:
+    tier: read
+    argv: ["tags"]
+    optional:
+      file: "--file"
+  create:
+    tier: write
+    argv: ["create", "--name", "{name}", "--content", "{content}"]
+    optional:
+      path: "--path"
+  append:
+    tier: write
+    argv: ["append", "--file", "{file}", "--content", "{content}"]
+  edit:
+    tier: dangerous
+    argv: ["edit", "--file", "{file}", "--content", "{content}"]
+    notes: "Replaces the note whole. Use append to add to one."
+  rename:
+    tier: dangerous
+    argv: ["rename", "--file", "{file}", "--name", "{name}"]
+  delete:
+    tier: dangerous
+    argv: ["delete", "--file", "{file}"]
 """
 
 import argparse
