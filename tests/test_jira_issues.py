@@ -211,6 +211,66 @@ def test_no_text_node_ever_carries_code_with_another_mark():
     assert sorted(marks_of(adf, "d")) == ["code", "link"]
 
 
+# --- markdown tables ---
+
+
+TABLE_MD = "| Env | Host |\n| --- | ---: |\n| prod | `a.example` |\n|  | **b** |\n"
+
+
+def only_table(markdown: str) -> dict:
+    nodes = [n for n in jira_issues._md_to_adf(markdown)["content"] if n["type"] == "table"]
+    assert len(nodes) == 1
+    return nodes[0]
+
+
+def test_a_pipe_table_becomes_a_real_table_node():
+    table = only_table(TABLE_MD)
+
+    assert [row["type"] for row in table["content"]] == ["tableRow"] * 3
+
+
+def test_the_first_row_becomes_header_cells():
+    header, first_body, _ = only_table(TABLE_MD)["content"]
+
+    assert [c["type"] for c in header["content"]] == ["tableHeader", "tableHeader"]
+    assert [c["type"] for c in first_body["content"]] == ["tableCell", "tableCell"]
+
+
+def test_cell_content_is_a_paragraph_carrying_inline_marks():
+    body_row = only_table(TABLE_MD)["content"][1]
+
+    cell = body_row["content"][1]
+    assert cell["content"][0]["type"] == "paragraph"
+    assert cell["content"][0]["content"][0]["marks"] == [{"type": "code"}]
+
+
+def test_an_empty_cell_holds_no_empty_text_node():
+    last_row = only_table(TABLE_MD)["content"][2]
+
+    assert last_row["content"][0]["content"] == [{"type": "paragraph"}]
+
+
+def test_a_rendered_table_is_a_valid_document():
+    assert jira_issues.adf_problems(jira_issues._md_to_adf(TABLE_MD)) == []
+
+
+def test_a_table_survives_the_round_trip_back_to_markdown():
+    rendered = jira_issues._adf_to_text(jira_issues._md_to_adf(TABLE_MD))
+
+    assert rendered.splitlines() == [
+        "| Env | Host |",
+        "| --- | --- |",
+        "| prod | `a.example` |",
+        "|  | **b** |",
+    ]
+
+
+def test_text_around_a_table_still_renders_as_paragraphs():
+    types = [n["type"] for n in jira_issues._md_to_adf(f"Intro\n\n{TABLE_MD}\nOutro\n")["content"]]
+
+    assert types == ["paragraph", "table", "paragraph"]
+
+
 # --- ADF validation (what --dry-run checks) ---
 
 

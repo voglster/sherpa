@@ -249,7 +249,9 @@ def _resolve_body(
 # Markdown -> Atlassian Document Format (ADF) converter (minimal)
 # ---------------------------------------------------------------------------
 
-_MD_PARSER = MarkdownIt("commonmark", {"breaks": False, "html": False}).enable("strikethrough")
+_MD_PARSER = (MarkdownIt("commonmark", {"breaks": False, "html": False})
+              .enable("strikethrough")
+              .enable("table"))
 
 
 def _md_to_adf(text: str) -> dict:
@@ -257,8 +259,8 @@ def _md_to_adf(text: str) -> dict:
 
     Supports: headings, paragraphs, hard/soft line breaks, bold/italic/strike,
     inline code, links, bullet + ordered + nested lists, fenced + indented code
-    blocks, blockquotes, and thematic breaks. Unknown constructs (tables,
-    images) fall back to a best-effort textual representation.
+    blocks, blockquotes, thematic breaks, and GFM pipe tables. Unknown
+    constructs (images) fall back to a best-effort textual representation.
     """
     tokens = _MD_PARSER.parse(text or "")
     content = _walk_blocks(tokens, 0, len(tokens))
@@ -325,12 +327,62 @@ def _walk_blocks(tokens, start: int, end: int) -> list:
             inner = _walk_blocks(tokens, i + 1, j)
             nodes.append({"type": "blockquote", "content": inner or [{"type": "paragraph", "content": [{"type": "text", "text": ""}]}]})
             i = j + 1
+        elif t.type == "table_open":
+            j = _find_close(tokens, i, "table_open", "table_close")
+            nodes.append(_walk_table(tokens, i + 1, j))
+            i = j + 1
         elif t.type == "hr":
             nodes.append({"type": "rule"})
             i += 1
         else:
             i += 1
     return nodes
+
+
+def _walk_table(tokens, start: int, end: int) -> dict:
+    rows = []
+    i = start
+    while i < end:
+        if tokens[i].type == "tr_open":
+            j = _find_close(tokens, i, "tr_open", "tr_close")
+            rows.append({"type": "tableRow", "content": _walk_table_cells(tokens, i + 1, j)})
+            i = j + 1
+        else:
+            i += 1
+    return {
+        "type": "table",
+        "attrs": {"isNumberColumnEnabled": False, "layout": "default"},
+        "content": rows,
+    }
+
+
+def _walk_table_cells(tokens, start: int, end: int) -> list:
+    cells = []
+    i = start
+    while i < end:
+        t = tokens[i]
+        if t.type in ("th_open", "td_open"):
+            close_type = t.type.replace("_open", "_close")
+            j = _find_close(tokens, i, t.type, close_type)
+            inline = []
+            for k in range(i + 1, j):
+                if tokens[k].type == "inline":
+                    inline.extend(_walk_inline(tokens[k].children or []))
+            # An ADF cell holds blocks, never inline text; a cell that renders to
+            # nothing must stay a contentless paragraph, since an empty text node
+            # is one of the documents Jira rejects outright.
+            paragraph = {"type": "paragraph"}
+            if inline:
+                paragraph["content"] = inline
+            cells.append({
+                "type": "tableHeader" if t.type == "th_open" else "tableCell",
+                "attrs": {},
+                "content": [paragraph],
+            })
+            i = j + 1
+        else:
+            i += 1
+    return cells
 
 
 def _walk_list_items(tokens, start: int, end: int) -> list:
@@ -541,7 +593,27 @@ def _render_block(node: dict) -> str:
         return "\n".join(f"> {ln}" if ln else ">" for ln in inner.split("\n"))
     if ntype == "rule":
         return "---"
+    if ntype == "table":
+        return _render_table(node)
     return ""
+
+
+def _render_table(node: dict) -> str:
+    rows = [
+        [_render_cell(cell) for cell in row.get("content", []) or []]
+        for row in node.get("content", []) or []
+    ]
+    if not rows:
+        return ""
+    width = max(len(r) for r in rows)
+    lines = ["| " + " | ".join((row + [""] * width)[:width]) + " |" for row in rows]
+    lines.insert(1, "| " + " | ".join(["---"] * width) + " |")
+    return "\n".join(lines)
+
+
+def _render_cell(cell: dict) -> str:
+    blocks = (_render_block(b) or "" for b in cell.get("content", []) or [])
+    return " ".join(" ".join(b.split()) for b in blocks if b.strip()).replace("|", "\\|")
 
 
 # ---------------------------------------------------------------------------
