@@ -11,7 +11,7 @@
 # regex reads the source text and never saw it.
 r"""
 name: slack_messenger
-description: Send Slack messages to channels and DMs. Supports @(name) for user mentions and auto-links Jira keys. Fuzzy user/channel lookup with local caching.
+description: Send Slack messages to channels and DMs. Supports @(name) for user mentions and auto-links Jira keys and GitHub PRs. Fuzzy user/channel lookup with local caching.
 categories: [slack, messaging, communication]
 secrets:
   - SLACK_USER_TOKEN
@@ -32,6 +32,8 @@ usage: |
 notes: |
   @(name) in message text becomes a Slack @mention. Errors if ambiguous (e.g. multiple "nathan"s).
   Jira ticket keys (e.g. KB-123) are auto-linked. Channel/user lookups are cached locally.
+  GitHub PRs are auto-linked too: paste the PR URL or write the shorthand owner/repo#123,
+  and it renders as #123 (or owner/repo#123 when the message spans several repos).
   --text interprets \n, \t and \r as real characters (\\ sends a literal backslash);
   --file/--stdin are taken verbatim, so code snippets keep their backslashes.
   --file/--stdin supply the message BODY; --attach uploads a real file (repeatable).
@@ -76,7 +78,17 @@ import httpx
 VAULT_PATH = Path.home() / ".sherpa" / "vault.json"
 CACHE_DIR = Path.home() / ".sherpa" / "cache"
 SLACK_ID_RE = re.compile(r"^[CGUWDBT][A-Z0-9]{8,}$")
-JIRA_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
+JIRA_KEY_RE = r"\b(?P<jira>[A-Z][A-Z0-9]+-\d+)\b"
+GITHUB_REPO_RE = r"(?P<owner>[\w.-]+)/(?P<repo>[\w.-]+)"
+# Slack links and bare URLs are the segments a reference must never be rewritten inside.
+LINK_TOKEN_RE = re.compile(r"(<[^>]+>|https?://\S+)")
+# Deeper paths (/files, /commits) are left alone: only the PR itself gets a label.
+GITHUB_PR_URL_RE = re.compile(
+    rf"(?P<url>https://github\.com/{GITHUB_REPO_RE}/pull/(?P<pr>\d+))/?(?![\w/])"
+)
+PLAIN_REF_RE = re.compile(
+    rf"(?<![\w./-]){GITHUB_REPO_RE}#(?P<pr>\d+)\b|{JIRA_KEY_RE}"
+)
 MENTION_RE = re.compile(r"@\(([^)]+)\)")
 RATE_LIMIT_THRESHOLD = 30  # seconds — auto-retry if Retry-After <= this
 SLACK_TEXT_LIMIT = 4000  # chars; Slack truncates chat.postMessage text beyond this
@@ -92,28 +104,67 @@ def _load_secret(key: str) -> str:
     return value
 
 
-def _linkify_jira_keys(text: str) -> str:
-    """Replace Jira ticket keys (e.g. KB-12345) with Slack-formatted links.
+def _linkify_refs(text: str) -> str:
+    """Replace Jira keys and GitHub pull-request references with Slack links.
 
-    Skips keys that already appear inside a URL or Slack <link|label> block.
+    Jira keys (KB-12345), bare PR URLs and the ``owner/repo#123`` shorthand all
+    become ``<url|label>``. PR labels are bare ``#123`` unless the message spans
+    more than one repository, in which case every label carries its repo.
+    Anything already inside a Slack ``<...>`` link is left untouched, so running
+    this twice is a no-op.
     """
     vault = json.loads(VAULT_PATH.read_text()) if VAULT_PATH.exists() else {}
-    jira_url = vault.get("JIRA_URL")
-    if not jira_url:
-        return text
-    jira_url = jira_url.rstrip("/")
+    jira_url = vault.get("JIRA_URL", "").rstrip("/")
 
-    # Split on Slack link/URL tokens so we only touch plain-text segments.
-    # Matches Slack links <...> and bare URLs (http/https).
-    _link_re = re.compile(r"(<[^>]+>|https?://\S+)")
-    parts = _link_re.split(text)
-    for i, part in enumerate(parts):
-        if _link_re.match(part):
-            continue  # already a link — leave it alone
-        parts[i] = JIRA_KEY_RE.sub(
-            lambda m: f"<{jira_url}/browse/{m.group(1)}|{m.group(1)}>", part
-        )
-    return "".join(parts)
+    tokens = [t for t in LINK_TOKEN_RE.split(text) if t]
+    repos = _referenced_repos(tokens)
+    label = _pr_labeller(qualified=len(repos) > 1)
+
+    for i, token in enumerate(tokens):
+        if LINK_TOKEN_RE.fullmatch(token):
+            tokens[i] = _link_bare_pr_url(token, label)
+        else:
+            tokens[i] = PLAIN_REF_RE.sub(lambda m: _plain_ref_link(m, jira_url, label), token)
+    return "".join(tokens)
+
+
+def _referenced_repos(tokens: list[str]) -> set[tuple[str, str]]:
+    """Every owner/repo a PR reference in these tokens points at."""
+    repos = set()
+    for token in tokens:
+        if LINK_TOKEN_RE.fullmatch(token):
+            if match := GITHUB_PR_URL_RE.match(token):
+                repos.add((match["owner"], match["repo"]))
+        else:
+            repos.update(
+                (m["owner"], m["repo"]) for m in PLAIN_REF_RE.finditer(token) if m["pr"]
+            )
+    return repos
+
+
+def _pr_labeller(qualified: bool):
+    def label(owner: str, repo: str, number: str) -> str:
+        return f"{owner}/{repo}#{number}" if qualified else f"#{number}"
+
+    return label
+
+
+def _link_bare_pr_url(url: str, label) -> str:
+    match = GITHUB_PR_URL_RE.match(url)
+    if not match:
+        return url
+    trailing = url[match.end():]
+    return f"<{match['url']}|{label(match['owner'], match['repo'], match['pr'])}>{trailing}"
+
+
+def _plain_ref_link(match: re.Match, jira_url: str, label) -> str:
+    if match["pr"]:
+        owner, repo, number = match["owner"], match["repo"], match["pr"]
+        url = f"https://github.com/{owner}/{repo}/pull/{number}"
+        return f"<{url}|{label(owner, repo, number)}>"
+    if not jira_url:
+        return match[0]
+    return f"<{jira_url}/browse/{match['jira']}|{match['jira']}>"
 
 
 # --- Cache helpers ---
@@ -481,7 +532,7 @@ async def _deliver(client: httpx.AsyncClient, headers: dict, channel_id: str, ar
         sys.exit(1)
 
     raw_text = _resolve_text(args, required=not attachments)
-    text = await _linkify_mentions(client, headers, _linkify_jira_keys(raw_text)) if raw_text else ""
+    text = await _linkify_mentions(client, headers, _linkify_refs(raw_text)) if raw_text else ""
 
     if not attachments and len(text) > SLACK_TEXT_LIMIT and not args.no_upload_fallback:
         print(

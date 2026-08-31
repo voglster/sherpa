@@ -54,7 +54,7 @@ def slack(monkeypatch):
 
     monkeypatch.setattr(slack_messenger, "_slack_get", fake_get)
     monkeypatch.setattr(slack_messenger, "_slack_post", fake_post)
-    monkeypatch.setattr(slack_messenger, "_linkify_jira_keys", lambda text: text)
+    monkeypatch.setattr(slack_messenger, "_linkify_refs", lambda text: text)
 
     async def no_mentions(client, headers, text):
         return text
@@ -195,3 +195,75 @@ def test_empty_attachment_is_rejected(slack, tmp_path):
         deliver(FakeClient(), make_args(attach=[str(empty)]))
 
     assert exit_info.value.code == 2
+
+
+@pytest.fixture
+def vault(monkeypatch, tmp_path):
+    path = tmp_path / "vault.json"
+    path.write_text('{"JIRA_URL": "https://acme.atlassian.net/"}')
+    monkeypatch.setattr(slack_messenger, "VAULT_PATH", path)
+    return path
+
+
+def test_jira_key_becomes_a_link(vault):
+    assert slack_messenger._linkify_refs("see KB-123 please") == (
+        "see <https://acme.atlassian.net/browse/KB-123|KB-123> please"
+    )
+
+
+def test_bare_pr_url_gets_a_short_label(vault):
+    assert slack_messenger._linkify_refs("review https://github.com/acme/api/pull/1715 today") == (
+        "review <https://github.com/acme/api/pull/1715|#1715> today"
+    )
+
+
+def test_pr_url_keeps_trailing_punctuation_outside_the_link(vault):
+    assert slack_messenger._linkify_refs("ship https://github.com/acme/api/pull/7.") == (
+        "ship <https://github.com/acme/api/pull/7|#7>."
+    )
+
+
+def test_shorthand_expands_to_a_pr_link(vault):
+    assert slack_messenger._linkify_refs("acme/api#42 is ready") == (
+        "<https://github.com/acme/api/pull/42|#42> is ready"
+    )
+
+
+def test_labels_are_repo_qualified_when_the_message_spans_repos(vault):
+    assert slack_messenger._linkify_refs("acme/api#42 and https://github.com/acme/web/pull/9") == (
+        "<https://github.com/acme/api/pull/42|acme/api#42> and "
+        "<https://github.com/acme/web/pull/9|acme/web#9>"
+    )
+
+
+def test_existing_slack_link_is_left_alone(vault):
+    text = "<https://github.com/acme/api/pull/1715|the diff> for KB-9"
+    assert slack_messenger._linkify_refs(text) == (
+        "<https://github.com/acme/api/pull/1715|the diff> for "
+        "<https://acme.atlassian.net/browse/KB-9|KB-9>"
+    )
+
+
+def test_linkifying_twice_changes_nothing(vault):
+    text = "KB-1 https://github.com/acme/api/pull/2 acme/api#3"
+    once = slack_messenger._linkify_refs(text)
+    assert slack_messenger._linkify_refs(once) == once
+
+
+def test_non_pr_github_urls_are_untouched(vault):
+    for url in (
+        "https://github.com/acme/api/issues/12",
+        "https://github.com/acme/api/pull/12/files",
+        "https://github.com/acme/api/commit/abc123",
+    ):
+        assert slack_messenger._linkify_refs(url) == url
+
+
+def test_jira_keys_are_left_bare_without_a_configured_jira_url(monkeypatch, tmp_path):
+    empty = tmp_path / "vault.json"
+    empty.write_text("{}")
+    monkeypatch.setattr(slack_messenger, "VAULT_PATH", empty)
+
+    assert slack_messenger._linkify_refs("KB-5 and acme/api#6") == (
+        "KB-5 and <https://github.com/acme/api/pull/6|#6>"
+    )
