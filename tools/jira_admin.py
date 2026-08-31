@@ -13,7 +13,7 @@ secrets:
   - JIRA_API_TOKEN
 usage: |
   epic <ISSUE_KEY> --epic <EPIC_KEY>
-  subtask <PARENT_KEY> --type dev|validate|bug [--assignee name] [--summary '...']
+  subtask <PARENT_KEY> --type dev|validate|bug [--assignee name] [--summary '...'] [--project KEY]
   complete-subtask <PARENT_KEY> --type dev|validate
   assign-subtask <PARENT_KEY> --type dev|validate --assignee <name>
   users <query>           Search Jira users and cache the match
@@ -25,6 +25,57 @@ usage: |
   link <ISSUE_KEY> --blocks <TARGET>    Create a 'Blocks' link
   link <ISSUE_KEY> --type <NAME> --to <TARGET>  Create a custom link type
   weblink <ISSUE_KEY> --url <URL> [--title '...']  Attach an external URL to an issue
+operations:
+  users-search:
+    tier: write
+    argv: ["users", "{query}"]
+    optional:
+      select: "--select"
+    notes: "Searching caches the match locally; --select picks from an ambiguous result."
+  users-list:
+    tier: read
+    argv: ["users", "--list"]
+  users-alias:
+    tier: write
+    argv: ["users", "--alias", "{alias}", "--account-id", "{account_id}"]
+  users-clear:
+    tier: dangerous
+    argv: ["users", "--clear"]
+    notes: "Drops every cached alias, including hand-made ones no search will recreate."
+  epic:
+    tier: write
+    argv: ["epic", "{issue_key}", "--epic", "{epic_key}"]
+    notes: "Re-parents an issue on a shared board."
+  subtask:
+    tier: write
+    argv: ["subtask", "{parent_key}", "--type", "{type}"]
+    optional:
+      assignee: "--assignee"
+      summary: "--summary"
+      project: "--project"
+  assign-subtask:
+    tier: write
+    argv: ["assign-subtask", "{parent_key}", "--type", "{type}", "--assignee", "{assignee}"]
+    notes: "Puts the work on someone else's plate."
+  complete-subtask:
+    tier: dangerous
+    argv: ["complete-subtask", "{parent_key}", "--type", "{type}"]
+    notes: "Transitions a subtask to Done, which fires whatever the workflow hangs off that."
+  link-relates:
+    tier: write
+    argv: ["link", "{issue_key}", "--relates", "{target}"]
+  link-blocks:
+    tier: write
+    argv: ["link", "{issue_key}", "--blocks", "{target}"]
+  link-custom:
+    tier: write
+    argv: ["link", "{issue_key}", "--type", "{link_type}", "--to", "{target}"]
+  weblink:
+    tier: write
+    argv: ["weblink", "{issue_key}", "--url", "{url}"]
+    optional:
+      title: "--title"
+risk: medium
 """
 
 import argparse

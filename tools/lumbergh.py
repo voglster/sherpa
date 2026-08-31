@@ -21,6 +21,54 @@ usage: |
   [--session NAME] prompts list
   [--session NAME] prompts get <name_or_id>
   [--session NAME] prompts set <name_or_id> <text>
+operations:
+  sessions-list:
+    tier: read
+    argv: ["sessions", "list"]
+  todos-list:
+    tier: read
+    argv: ["todos", "list"]
+  todos-add:
+    tier: write
+    argv: ["todos", "add", "{text}"]
+    optional:
+      description: "--description"
+  todos-done:
+    tier: write
+    argv: ["todos", "done", "{index}"]
+  todos-undone:
+    tier: write
+    argv: ["todos", "undone", "{index}"]
+  todos-remove:
+    tier: dangerous
+    argv: ["todos", "remove", "{index}"]
+    notes: "Deletes the todo outright; done/undone is what marking it off looks like."
+  todos-move:
+    tier: write
+    argv: ["todos", "move", "{index}", "{target_session}"]
+  scratchpad-get:
+    tier: read
+    argv: ["scratchpad", "get"]
+  scratchpad-set:
+    tier: write
+    argv: ["scratchpad", "set", "{content}"]
+    notes: "Replaces the whole scratchpad; append is the additive form."
+  scratchpad-append:
+    tier: write
+    argv: ["scratchpad", "append", "{content}"]
+  prompts-list:
+    tier: read
+    argv: ["prompts", "list"]
+  prompts-get:
+    tier: read
+    argv: ["prompts", "get", "{name_or_id}"]
+  prompts-set:
+    tier: write
+    argv: ["prompts", "set", "{name_or_id}", "{text}"]
+notes: |
+  --session is a top-level flag and has to precede the resource, so it cannot be
+  declared as a trailing `optional`. A declared call gets the default: the session
+  auto-detected from the working directory.
 """
 
 import argparse

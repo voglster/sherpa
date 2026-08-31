@@ -12,6 +12,23 @@ usage: |
   get <KEY>
   list
   delete <KEY>
+operations:
+  list:
+    tier: read
+    argv: ["list"]
+    notes: "Key names only; values are never listed."
+  get:
+    tier: read
+    argv: ["get", "{key}"]
+    notes: "Prints the secret in clear text to stdout."
+  set:
+    tier: write
+    argv: ["set", "{key}", "{value}"]
+    notes: "Overwrites any existing value for the key without warning."
+  delete:
+    tier: dangerous
+    argv: ["delete", "{key}"]
+    notes: "The vault is the only copy — a deleted secret has to be reissued at its source."
 """
 
 import argparse

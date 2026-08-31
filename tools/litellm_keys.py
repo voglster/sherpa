@@ -17,6 +17,32 @@ usage: |
   list [--fields models,spend,created] [--json]
   info <alias|hash> [--json]
   delete <alias|hash> [--json]
+operations:
+  list:
+    tier: read
+    argv: ["list"]
+    optional:
+      fields: "--fields"
+  info:
+    tier: read
+    argv: ["info", "{ident}"]
+  generate:
+    tier: write
+    argv: ["generate", "--name", "{name}"]
+    optional:
+      models: "--models"
+      note: "--note"
+      vault: "--vault"
+      env_file: "--env-file"
+      var: "--var"
+      op: "--op"
+      clip: "--clip"
+      reveal: "--reveal"
+    notes: "Mints a live proxy key. --reveal prints the secret; --clip puts it on the clipboard."
+  delete:
+    tier: dangerous
+    argv: ["delete", "{ident}"]
+    notes: "Revokes the key immediately and it cannot be minted back — anything still using it breaks."
 """
 
 import argparse

@@ -113,6 +113,19 @@ def test_hiding_is_reported_and_not_obeyed(home, monkeypatch):
 
 REAL_TOOLS = sorted((_ROOT / "tools").glob("*.py"))
 
+# Declaring is opt-in per the standards, which made "no operations" indistinguishable
+# from "nobody got to it yet" — every tool predating the feature skipped the
+# well-formedness check silently, and so would every tool added after it. These three
+# cannot declare rather than have not:
+#
+#   fleet   — a retired tombstone; it prints a migration notice and exits 1.
+#   notify  — takes the message as its first positional, so it has no subcommand to
+#             put in argv[0], and argv[0] may not be a placeholder.
+#   reindex — takes no arguments at all, so there is likewise no subcommand.
+#
+# Anything else missing `operations` is a gap, and fails here.
+UNDECLARABLE = {"fleet", "notify", "reindex"}
+
 
 @pytest.mark.parametrize("script", REAL_TOOLS, ids=lambda p: p.stem)
 def test_both_docstring_parsers_agree(script):
@@ -159,7 +172,11 @@ def test_declarations_are_well_formed(script):
     meta = yaml.safe_load(match.group(1)) or {}
     operations = meta.get("operations")
     if not operations:
-        pytest.skip("undeclared")
+        assert script.stem in UNDECLARABLE, (
+            f"{script.stem}: no `operations` block. Declare one, or add the tool to "
+            "UNDECLARABLE with the reason it cannot have subcommands."
+        )
+        return
 
     usage = meta.get("usage", "")
     for name, spec in operations.items():

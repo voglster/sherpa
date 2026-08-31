@@ -9,12 +9,60 @@ description: Image editing toolkit — crop, resize, beautify screenshots, optim
 categories: [image, screenshot, design, web, slides, icons, editing]
 usage: |
   crop <input> -o <output> --region X,Y,W,H
-  resize <input> -o <output> [--width PX] [--height PX] [--scale 0.5] [--fit cover|contain|stretch]
-  beautify <input> -o <output> [--title TEXT] [--background 'linear-gradient(135deg,#667eea,#764ba2)'] [--radius 12] [--shadow 40] [--padding 60] [--crop X,Y,W,H]
+  resize <input> -o <output> [--width PX] [--height PX] [--scale 0.5] [--fit cover|contain|stretch] [--quality 95]
+  beautify <input> -o <output> [--title TEXT] [--background 'linear-gradient(135deg,#667eea,#764ba2)'] [--radius 12] [--shadow 40] [--padding 60] [--crop X,Y,W,H] [--no-chrome]
   annotate <input> -o <output> --region X,Y,W,H [--type oval|arrow|highlight] [--style sharpie|rigid] [--color '#ff3333'] [--width 4]
   convert <input> -o <output.webp> [--quality 85]
   icon <input> -o <output> --sizes 16,32,64,128 [--padding 10%]
   info <input>
+operations:
+  info:
+    tier: read
+    argv: ["info", "{input}"]
+  crop:
+    tier: write
+    argv: ["crop", "{input}", "-o", "{output}", "--region", "{region}"]
+  resize:
+    tier: write
+    argv: ["resize", "{input}", "-o", "{output}"]
+    optional:
+      width: "--width"
+      height: "--height"
+      scale: "--scale"
+      fit: "--fit"
+      quality: "--quality"
+  beautify:
+    tier: write
+    argv: ["beautify", "{input}", "-o", "{output}"]
+    optional:
+      title: "--title"
+      background: "--background"
+      radius: "--radius"
+      shadow: "--shadow"
+      padding: "--padding"
+      crop: "--crop"
+      no_chrome: "--no-chrome"
+  annotate:
+    tier: write
+    argv: ["annotate", "{input}", "-o", "{output}", "--region", "{region}"]
+    optional:
+      type: "--type"
+      style: "--style"
+      color: "--color"
+      width: "--width"
+  convert:
+    tier: write
+    argv: ["convert", "{input}", "-o", "{output}"]
+    optional:
+      quality: "--quality"
+  icon:
+    tier: write
+    argv: ["icon", "{input}", "-o", "{output}", "--sizes", "{sizes}"]
+    optional:
+      padding: "--padding"
+notes: |
+  Every subcommand but `info` writes to the -o path, overwriting it if it exists.
+  The input file is never modified.
 """
 
 import argparse

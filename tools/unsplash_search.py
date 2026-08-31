@@ -12,6 +12,20 @@ secrets:
 usage: |
   search --query 'mountain sunset' [--count 5] [--orientation landscape]
   download --query 'mountain sunset' [--output photo.jpg] [--size regular]
+operations:
+  search:
+    tier: read
+    argv: ["search", "--query", "{query}"]
+    optional:
+      count: "--count"
+      orientation: "--orientation"
+  download:
+    tier: write
+    argv: ["download", "--query", "{query}"]
+    optional:
+      output: "--output"
+      size: "--size"
+    notes: "Writes --output, which defaults to ./photo.jpg and is overwritten."
 """
 
 import argparse

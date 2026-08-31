@@ -11,7 +11,24 @@ secrets:
   - SLACK_USER_TOKEN
 usage: |
   start [--work 25] [--break 5] [--status 'Custom status text']
-  stop
+  status
+  cancel
+operations:
+  status:
+    tier: read
+    argv: ["status"]
+  start:
+    tier: write
+    argv: ["start"]
+    optional:
+      work: "--work"
+      break: "--break"
+      status: "--status"
+    notes: "Sets your Slack status and presence and turns on DND until the session ends."
+  cancel:
+    tier: write
+    argv: ["cancel"]
+    notes: "Ends the running session and restores status, presence and DND."
 """
 
 import argparse

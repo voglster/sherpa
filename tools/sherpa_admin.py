@@ -13,6 +13,22 @@ usage: |
   list [--all] [--json]
   hide <TOOL> [TOOL...] [--json]
   show <TOOL> [TOOL...] [--json]
+operations:
+  status:
+    tier: read
+    argv: ["status"]
+  list:
+    tier: read
+    argv: ["list"]
+    optional:
+      all: "--all"
+  hide:
+    tier: write
+    argv: ["hide", "{tool}"]
+    notes: "Withholds a tool from discovery. It still runs; `show` puts it back."
+  show:
+    tier: write
+    argv: ["show", "{tool}"]
 notes: |
   Hidden tools disappear from `sherpa list`, `sherpa search` and the agent-facing
   tool_search. They still run: `sherpa <tool>`, `sherpa help <tool>` and tool_run

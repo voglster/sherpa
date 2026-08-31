@@ -12,6 +12,17 @@ secrets:
 usage: |
   generate --prompt 'a cat wearing a top hat' [--output cat.png] [--count 1] [--aspect 1:1]
   generate --prompt 'same scene but at sunset' --image reference.png [--reference-type subject] [--output out.png]
+operations:
+  generate:
+    tier: write
+    argv: ["generate", "--prompt", "{prompt}"]
+    optional:
+      output: "--output"
+      count: "--count"
+      aspect: "--aspect"
+      image: "--image"
+      reference_type: "--reference-type"
+    notes: "Bills the Gemini API and writes --output, which defaults to ./output.png and is overwritten."
 """
 
 import argparse

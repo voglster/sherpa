@@ -85,9 +85,18 @@ list to keep in step with it. `tool_run` and `sherpa <tool>` ignore all of this
 and go on taking a raw argument string; it is for a caller that has to decide,
 before running anything, whether this particular subcommand is allowed.
 
-Declaring is opt-in and per subcommand. A tool that declares nothing is absent
-from `sherpa manifest` — reported by name under `undeclared`, so the difference
-between "no such tool" and "that tool has not said what it does" stays visible.
+Declaring is per subcommand, and every tool is expected to declare. A tool that
+declares nothing is absent from `sherpa manifest` — reported by name under
+`undeclared`, so the difference between "no such tool" and "that tool has not
+said what it does" stays visible.
+
+It was opt-in when it landed, so as not to force changes on the tools that came
+before it, and that left "no operations" indistinguishable from "nobody got to
+it yet": the well-formedness check skipped those tools silently, and would have
+skipped every tool added afterwards too. `tests/test_manifest.py` now fails a
+tool with no `operations` block unless it is listed in `UNDECLARABLE` there with
+the reason it *cannot* declare — today only a retired tombstone and two tools
+that take no subcommand at all, since `argv[0]` may not be a placeholder.
 
 Two rules worth stating, because both were learned the hard way:
 
@@ -181,7 +190,7 @@ A reviewer can run this against any tool to confirm it meets the contract:
 - [ ] No-args invocation shows live content plus `bin:` and `description:` lines
 - [ ] Contextual hints appear on list/mutation output only, never on detail views
 - [ ] `axi: true` present in the docstring
-- [ ] `operations` declares every subcommand with a tier and an argv, if the tool is meant to be reachable by an agent that authorizes
+- [ ] `operations` declares every subcommand with a tier and an argv — or the tool is in `UNDECLARABLE` in `tests/test_manifest.py` with the reason it cannot
 
 ---
 

@@ -13,6 +13,30 @@ usage: |
   info <URL_OR_VIDEO_ID> [--full] [--fields channel,upload_date,url,view_count] [--no-auto-update] [--json]
   version [--json]
   update [--json]
+operations:
+  version:
+    tier: read
+    argv: ["version"]
+  info:
+    tier: read
+    argv: ["info", "{target}"]
+    optional:
+      full: "--full"
+      fields: "--fields"
+      no_auto_update: "--no-auto-update"
+  transcript:
+    tier: read
+    argv: ["transcript", "{target}"]
+    optional:
+      refresh: "--refresh"
+      interval: "--interval"
+      fields: "--fields"
+      no_auto_update: "--no-auto-update"
+    notes: "Writes the transcript to the cache and returns its path; --refresh replaces a cached copy."
+  update:
+    tier: write
+    argv: ["update"]
+    notes: "Upgrades the yt-dlp install shared by every caller on this machine."
 """
 
 import argparse

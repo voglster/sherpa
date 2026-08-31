@@ -12,10 +12,41 @@ secrets:
   - MONGO_RO_PASSWORD
 usage: |
   search <QUERY>
-  collections --instance <KEY>
+  config --instance <KEY>
+  collections --instance <KEY> --db <DB> [--rw]
   find --instance <KEY> --db <DB> --collection <COLL> [--filter '{}'] [--projection '{}'] [--limit 10] [--sort '{}'] [--rw]
   count --instance <KEY> --db <DB> --collection <COLL> [--filter '{}'] [--rw]
   aggregate --instance <KEY> --db <DB> --collection <COLL> --pipeline '[...]' [--rw]
+operations:
+  search:
+    tier: read
+    argv: ["search", "{query}"]
+  config:
+    tier: read
+    argv: ["config", "--instance", "{instance}"]
+  collections:
+    tier: read
+    argv: ["collections", "--instance", "{instance}", "--db", "{db}"]
+  find:
+    tier: read
+    argv: ["find", "--instance", "{instance}", "--db", "{db}", "--collection", "{collection}"]
+    optional:
+      filter: "--filter"
+      projection: "--projection"
+      limit: "--limit"
+      sort: "--sort"
+  count:
+    tier: read
+    argv: ["count", "--instance", "{instance}", "--db", "{db}", "--collection", "{collection}"]
+    optional:
+      filter: "--filter"
+  aggregate:
+    tier: read
+    argv: ["aggregate", "--instance", "{instance}", "--db", "{db}", "--collection", "{collection}", "--pipeline", "{pipeline}"]
+    notes: "Reads a customer database. A $out or $merge stage would write, which is why --rw is undeclared."
+notes: |
+  --rw swaps in read-write credentials and is deliberately absent from `operations`,
+  so the surface an authorizing caller can reach stays read-only.
 """
 
 import argparse

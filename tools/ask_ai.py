@@ -14,6 +14,27 @@ usage: |
   models
   default [MODEL]
   ask [-m MODEL] [-s SYSTEM] [-t TEMP] [--max-tokens N] [--think|--no-think] PROMPT
+operations:
+  models:
+    tier: read
+    argv: ["models"]
+  default:
+    tier: read
+    argv: ["default"]
+  set-default:
+    tier: write
+    argv: ["default", "{model}"]
+    notes: "Same subcommand as `default`; naming a model sets it."
+  ask:
+    tier: read
+    argv: ["ask", "{prompt}"]
+    optional:
+      model: "-m"
+      system: "-s"
+      temperature: "-t"
+      max_tokens: "--max-tokens"
+      think: "--think"
+    notes: "Bills the LiteLLM proxy and sends the prompt off the machine."
 """
 
 import argparse
