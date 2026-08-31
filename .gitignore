@@ -30,3 +30,6 @@ gemini_share_to_md.py
 
 # OS
 .DS_Store
+
+# Claude Code local settings
+.claude/settings.local.json
