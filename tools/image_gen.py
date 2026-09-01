@@ -5,13 +5,18 @@
 # ///
 """
 name: image_gen
-description: Generate images using Google Imagen via the Gemini API
-categories: [image, genai, creative, imagen]
+description: Generate images with Gemini (gemini-2.5-flash-image), from a text prompt or guided by a reference image.
+categories: [image, genai, creative, gemini]
 secrets:
   - GEMINI_API_KEY
 usage: |
   generate --prompt 'a cat wearing a top hat' [--output cat.png] [--count 1] [--aspect 1:1]
   generate --prompt 'same scene but at sunset' --image reference.png [--reference-type subject] [--output out.png]
+notes: |
+  Reference images are passed alongside the prompt, so --reference-type only changes
+  how the image is described to the model: `subject` says to keep what is in it,
+  `style` says to borrow how it looks.
+  --count issues one request per image; the model returns a single image per call.
 operations:
   generate:
     tier: write
@@ -27,6 +32,8 @@ operations:
 
 import argparse
 import json
+import logging
+import mimetypes
 import sys
 from pathlib import Path
 
@@ -34,6 +41,17 @@ from google import genai
 from google.genai import types
 
 VAULT_PATH = Path.home() / ".sherpa" / "vault.json"
+
+MODEL = "gemini-2.5-flash-image"
+
+REFERENCE_INSTRUCTION = {
+    "subject": "Use the attached image as the subject.",
+    "style": "Use the attached image as a style reference.",
+}
+
+# The SDK warns that automatic function calling belongs in Chat.send_message. We
+# pass no tools, so there is no function calling to move anywhere.
+logging.getLogger("google_genai.models").setLevel(logging.ERROR)
 
 
 def _load_secret(key: str) -> str:
@@ -45,79 +63,71 @@ def _load_secret(key: str) -> str:
     return value
 
 
-def cmd_generate(args: argparse.Namespace) -> None:
-    api_key = _load_secret("GEMINI_API_KEY")
-    client = genai.Client(api_key=api_key)
+def _reference_part(path: Path, reference_type: str) -> types.Part:
+    mime_type, _ = mimetypes.guess_type(path.name)
+    if not (mime_type or "").startswith("image/"):
+        print(f"Not a recognised image file: {path}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Using reference image: {path} ({reference_type})", file=sys.stderr)
+    return types.Part.from_bytes(data=path.read_bytes(), mime_type=mime_type)
 
-    reference_images = None
+
+def _output_path(output: str, index: int, count: int) -> str:
+    if count == 1:
+        return output
+    stem, suffix = Path(output).stem, Path(output).suffix
+    return f"{stem}_{index + 1}{suffix}"
+
+
+def _extract_image(response) -> bytes:
+    """The image bytes, or an explanation of why the model returned none."""
+    candidate = (response.candidates or [None])[0]
+    parts = candidate.content.parts if candidate and candidate.content else []
+    for part in parts or []:
+        if part.inline_data:
+            return part.inline_data.data
+
+    refusal = " ".join(part.text.strip() for part in parts or [] if part.text)
+    reason = getattr(candidate, "finish_reason", None)
+    detail = refusal or (f"finish_reason={reason}" if reason else "no reason given")
+    print(f"No image returned: {detail}", file=sys.stderr)
+    sys.exit(2)
+
+
+def cmd_generate(args: argparse.Namespace) -> None:
+    client = genai.Client(api_key=_load_secret("GEMINI_API_KEY"))
+
+    contents = [args.prompt]
     if args.image:
         image_path = Path(args.image)
         if not image_path.exists():
             print(f"Image not found: {args.image}", file=sys.stderr)
             sys.exit(1)
-        ref_image = types.Image.from_file(location=str(image_path))
-        if args.reference_type == "style":
-            reference_images = [
-                types.StyleReferenceImage(
-                    reference_image=ref_image,
-                    reference_id=0,
-                ),
-            ]
-        else:
-            reference_images = [
-                types.SubjectReferenceImage(
-                    reference_image=ref_image,
-                    reference_id=0,
-                ),
-            ]
-        print(f"Using reference image: {args.image} ({args.reference_type})", file=sys.stderr)
+        contents = [
+            f"{REFERENCE_INSTRUCTION[args.reference_type]} {args.prompt}",
+            _reference_part(image_path, args.reference_type),
+        ]
+
+    config = types.GenerateContentConfig(
+        response_modalities=["IMAGE"],
+        image_config=types.ImageConfig(aspect_ratio=args.aspect),
+    )
 
     print(f"Generating image: {args.prompt!r}", file=sys.stderr)
 
-    if reference_images:
-        config = types.EditImageConfig(
-            number_of_images=args.count,
-            aspect_ratio=args.aspect,
-        )
-        response = client.models.edit_image(
-            model="imagen-3.0-capability-001",
-            prompt=args.prompt,
-            reference_images=reference_images,
-            config=config,
-        )
-    else:
-        config = types.GenerateImagesConfig(
-            number_of_images=args.count,
-            aspect_ratio=args.aspect,
-        )
-        response = client.models.generate_images(
-            model="imagen-4.0-generate-001",
-            prompt=args.prompt,
-            config=config,
-        )
-
-    if not response.generated_images:
-        print("No images returned by the API", file=sys.stderr)
-        sys.exit(2)
-
     outputs = []
-    for i, img in enumerate(response.generated_images):
-        if args.count == 1:
-            filename = args.output
-        else:
-            stem = Path(args.output).stem
-            suffix = Path(args.output).suffix
-            filename = f"{stem}_{i + 1}{suffix}"
-
-        img.image.save(filename)
+    for i in range(args.count):
+        response = client.models.generate_content(model=MODEL, contents=contents, config=config)
+        filename = _output_path(args.output, i, args.count)
+        Path(filename).write_bytes(_extract_image(response))
         print(f"Saved: {filename}", file=sys.stderr)
         outputs.append(filename)
 
-    print(json.dumps({"prompt": args.prompt, "files": outputs}))
+    print(json.dumps({"prompt": args.prompt, "model": MODEL, "files": outputs}))
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate images using Google Imagen.")
+    parser = argparse.ArgumentParser(description="Generate images using Gemini.")
     sub = parser.add_subparsers(dest="command")
 
     p = sub.add_parser("generate", help="Generate an image from a text prompt")
