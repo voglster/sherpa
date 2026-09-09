@@ -480,3 +480,20 @@ def test_multiple_matches_still_ask_the_caller_to_refine(monkeypatch, capsys):
         jira_issues._resolve_account_id("jane")
     assert "Multiple users match" in capsys.readouterr().err
     assert client.myself_calls == 0
+
+NAMED_FIELD_ISSUE = {
+    "names": {"customfield_10110": "Acceptance Criteria", "summary": "Summary"},
+    "fields": {"customfield_10110": {"type": "doc", "version": 1, "content": []}, "summary": "s"},
+}
+
+
+def test_a_custom_field_is_found_by_its_display_name():
+    assert jira_issues._named_field(NAMED_FIELD_ISSUE, "Acceptance Criteria") is not None
+
+
+def test_an_absent_custom_field_reads_as_none():
+    assert jira_issues._named_field(NAMED_FIELD_ISSUE, "Story Points") is None
+
+
+def test_a_fetch_without_expanded_names_reads_as_none():
+    assert jira_issues._named_field({"fields": {"summary": "s"}}, "Acceptance Criteria") is None

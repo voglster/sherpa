@@ -727,9 +727,21 @@ def cmd_create(args: argparse.Namespace) -> None:
         print(json.dumps({"key": issue_key, "id": issue["id"], "self": issue["self"]}))
 
 
+def _named_field(issue: dict, field_name: str):
+    """Value of a custom field by its display name, from an `expand=names` fetch.
+
+    Custom field ids differ per Jira site, so the id is resolved from the
+    `names` map the expand returns rather than hardcoded.
+    """
+    for field_id, name in (issue.get("names") or {}).items():
+        if name == field_name:
+            return issue["fields"].get(field_id)
+    return None
+
+
 def cmd_get(args: argparse.Namespace) -> None:
     with _client() as client:
-        resp = client.get(f"/rest/api/3/issue/{args.issue_key}")
+        resp = client.get(f"/rest/api/3/issue/{args.issue_key}", params={"expand": "names"})
         if resp.status_code != 200:
             print(f"Failed to fetch issue: {resp.status_code} {resp.text}", file=sys.stderr)
             sys.exit(2)
@@ -748,6 +760,7 @@ def cmd_get(args: argparse.Namespace) -> None:
             "created": fields.get("created"),
             "updated": fields.get("updated"),
             "description_text": _adf_to_text(fields.get("description")),
+            "acceptance_criteria_text": _adf_to_text(_named_field(data, "Acceptance Criteria")),
         }
         links = []
         for link in fields.get("issuelinks", []):
