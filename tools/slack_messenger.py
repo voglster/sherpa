@@ -213,6 +213,15 @@ class _RateLimitRetry(Exception):
         self.wait = wait
 
 
+def _fail_on_slack_error(data: dict) -> None:
+    error = data.get("error", "unknown_error")
+    # missing_scope is only actionable with the scope name Slack names in the body.
+    needed, have = data.get("needed"), data.get("provided")
+    detail = f" (needs {needed}; token has {have})" if needed else ""
+    print(f"Slack API error: {error}{detail}", file=sys.stderr)
+    sys.exit(2)
+
+
 async def _slack_get(client: httpx.AsyncClient, headers: dict, url: str, params: dict | None = None) -> dict:
     while True:
         resp = await client.get(url, headers=headers, params=params or {})
@@ -223,9 +232,7 @@ async def _slack_get(client: httpx.AsyncClient, headers: dict, url: str, params:
             continue
         data = resp.json()
         if not data.get("ok"):
-            error = data.get("error", "unknown_error")
-            print(f"Slack API error: {error}", file=sys.stderr)
-            sys.exit(2)
+            _fail_on_slack_error(data)
         return data
 
 
@@ -239,9 +246,7 @@ async def _slack_post(client: httpx.AsyncClient, headers: dict, url: str, payloa
             continue
         data = resp.json()
         if not data.get("ok"):
-            error = data.get("error", "unknown_error")
-            print(f"Slack API error: {error}", file=sys.stderr)
-            sys.exit(2)
+            _fail_on_slack_error(data)
         return data
 
 
