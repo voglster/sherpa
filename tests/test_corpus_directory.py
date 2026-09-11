@@ -192,6 +192,24 @@ def test_autherror_from_users_info_propagates(tmp_path):
         sync_directory(conn, client, "gravitate", me=None)
 
 
+def test_autherror_from_conversations_members_propagates(tmp_path):
+    """AuthError from conversations.members must propagate out of sync_directory."""
+    client = FakeSlack({
+        "auth.test": [{"ok": True, "user_id": "U_ME"}],
+        "users.list": [{"ok": True, "members": [
+            {"id": "U_ME", "name": "jim", "profile": {"real_name": "Jim Vogel"}},
+            {"id": "U_ALICE", "name": "alice", "profile": {"real_name": "Alice Smith"}},
+        ]}],
+        "conversations.list": [{"ok": True, "channels": [
+            {"id": "D_DM", "is_im": True, "user": "U_ALICE"},
+        ]}],
+        "conversations.members": [{"ok": False, "error": "token_revoked"}],
+    })
+    conn = open_db(tmp_path / "c.db")
+    with pytest.raises(AuthError):
+        sync_directory(conn, client, "gravitate", me=None)
+
+
 def test_tier_for_ranks_dms_then_posted_then_lurked():
     assert tier_for({"kind": "im"}, has_posted=False) == 1
     assert tier_for({"kind": "mpim"}, has_posted=False) == 1

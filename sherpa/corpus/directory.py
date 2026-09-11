@@ -114,6 +114,11 @@ class _UserResolver:
             pass
 
         placeholder = f"Unknown user ({user_id})"
+        # Cache negative result: this prevents repeated users.info calls for the same
+        # unresolvable user across multiple syncs. Self-heals for users who later appear
+        # in users.list (overwritten in next sync's first loop), but persists as Unknown
+        # for external Slack Connect users and deactivated accounts. This is a narrow
+        # tradeoff acceptable for now.
         self.conn.execute(
             "INSERT INTO users (workspace, id, name, display_name, is_me)"
             " VALUES (?, ?, ?, ?, ?)"
@@ -154,10 +159,10 @@ def _fetch_member_ids(channel: dict, kind: str, client: SlackClient) -> list:
     try:
         for member in client.paginate("conversations.members", "members", channel=channel["id"]):
             members.append(member)
-    except SlackError:
-        pass
     except AuthError:
         raise
+    except SlackError:
+        pass
     return members
 
 
