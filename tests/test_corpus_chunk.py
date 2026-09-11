@@ -116,3 +116,49 @@ def test_unchanged_chunk_keeps_its_embedded_flag(conn):
     conn.commit()
     build_chunks(conn, "w", "C1")
     assert conn.execute("SELECT embedded FROM chunks").fetchone()[0] == 1
+
+
+def test_extending_a_still_open_window_replaces_the_stale_chunk_not_duplicates_it(conn):
+    for i in range(3):
+        insert(conn, 1000.0 + i * 60, "Jim Vogel", f"m{i}")
+    conn.commit()
+    build_chunks(conn, "w", "C1")
+    old_id, old_last = conn.execute("SELECT id, msg_last_id FROM chunks").fetchone()
+
+    insert(conn, 1000.0 + 3 * 60, "Jim Vogel", "m3")
+    conn.commit()
+    count = build_chunks(conn, "w", "C1")
+
+    rows = conn.execute("SELECT id, msg_first_id, msg_last_id FROM chunks").fetchall()
+    assert count == 1
+    assert len(rows) == 1
+    assert rows[0]["msg_first_id"] == "w:C1:1000.0"
+    assert rows[0]["msg_last_id"] == "w:C1:1180.0"
+    assert rows[0]["msg_last_id"] != old_last
+    assert conn.execute(
+        "SELECT count(*) FROM chunks WHERE id = ?", (old_id,)
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT count(*) FROM chunks_fts WHERE chunk_id = ?", (old_id,)
+    ).fetchone()[0] == 0
+
+
+def test_rebuild_removes_the_vector_row_of_a_replaced_chunk(conn):
+    for i in range(3):
+        insert(conn, 1000.0 + i * 60, "Jim Vogel", f"m{i}")
+    conn.commit()
+    build_chunks(conn, "w", "C1")
+    old_id = conn.execute("SELECT id FROM chunks").fetchone()[0]
+    conn.execute(
+        "INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, ?)",
+        (old_id, b"\x00" * (768 * 4)),
+    )
+    conn.commit()
+
+    insert(conn, 1000.0 + 3 * 60, "Jim Vogel", "m3")
+    conn.commit()
+    build_chunks(conn, "w", "C1")
+
+    assert conn.execute(
+        "SELECT count(*) FROM chunks_vec WHERE chunk_id = ?", (old_id,)
+    ).fetchone()[0] == 0

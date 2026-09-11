@@ -44,12 +44,20 @@ def rechunk_all(conn: sqlite3.Connection, workspace: str) -> int:
 
 
 def build_chunks(conn: sqlite3.Connection, workspace: str, channel_id: str) -> int:
+    """Make the stored chunks for one channel exactly match its current windowing.
+
+    Windows are keyed by (msg_first_id, msg_last_id). An unchanged window's row is
+    left untouched — including its `embedded` flag, so Task 8 does not re-embed it.
+    A changed or new window is (re)written. Any stored chunk whose key is no longer
+    produced (e.g. a still-open window that grew because new messages arrived) is
+    deleted, along with its `chunks_fts` and `chunks_vec` rows, so no orphan survives
+    incremental ingestion. Returns the number of chunks now stored for the channel —
+    the size of the resulting authoritative set, not a count of writes.
+    """
     messages = conn.execute(
         "SELECT * FROM messages WHERE workspace = ? AND channel_id = ? ORDER BY ts",
         (workspace, channel_id),
     ).fetchall()
-    if not messages:
-        return 0
 
     threads: dict[float, list] = {}
     loose = []
@@ -63,12 +71,32 @@ def build_chunks(conn: sqlite3.Connection, workspace: str, channel_id: str) -> i
     for thread_messages in threads.values():
         windows.extend(_split_oversized(thread_messages))
 
-    written = 0
+    current_keys = set()
     for window in windows:
         if window:
-            written += _write(conn, workspace, channel_id, window)
+            current_keys.add((window[0]["id"], window[-1]["id"]))
+            _write(conn, workspace, channel_id, window)
+
+    _delete_stale(conn, workspace, channel_id, current_keys)
     conn.commit()
-    return written
+    return len(current_keys)
+
+
+def _delete_stale(
+    conn: sqlite3.Connection, workspace: str, channel_id: str, keep_keys: set[tuple[str, str]]
+) -> None:
+    stale = [
+        row["id"]
+        for row in conn.execute(
+            "SELECT id, msg_first_id, msg_last_id FROM chunks WHERE workspace = ? AND channel_id = ?",
+            (workspace, channel_id),
+        )
+        if (row["msg_first_id"], row["msg_last_id"]) not in keep_keys
+    ]
+    for chunk_id in stale:
+        conn.execute("DELETE FROM chunks WHERE id = ?", (chunk_id,))
+        conn.execute("DELETE FROM chunks_fts WHERE chunk_id = ?", (chunk_id,))
+        conn.execute("DELETE FROM chunks_vec WHERE chunk_id = ?", (chunk_id,))
 
 
 def _window(messages: list) -> list[list]:
