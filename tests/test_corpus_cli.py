@@ -338,6 +338,99 @@ def test_with_reports_the_true_total_when_capped_and_limit_expands_it(workspace,
     assert full["total"] == 5
 
 
+@pytest.mark.parametrize("command", ["with", "owed"])
+@pytest.mark.parametrize("bad_limit", ["0", "-1"])
+def test_limit_below_one_is_rejected_not_clamped(workspace, capsys, command, bad_limit):
+    """`--limit 0` must not report a false empty state, and `--limit -1` must not
+    silently defeat the cap (SQLite treats a negative LIMIT as no limit at all) --
+    both are the exact "confident, wrong answer" failure mode this project exists
+    to prevent, so both must be rejected loudly (exit 2) rather than clamped.
+    """
+    config, _ = workspace
+    _seeded_db_with_many_chunks(config.parent / "c.db", 5).close()
+
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(
+            [command, "Hunter Reeves", "--limit", bad_limit, "--config", str(config), "--stale-ok"]
+        )
+    assert caught.value.code == 2
+    out = capsys.readouterr().out
+    assert out.startswith("error:")
+    assert "help:" in out
+    assert "--limit" in out
+
+
+@pytest.mark.parametrize("command", ["with", "owed"])
+def test_limit_one_still_works(workspace, capsys, command):
+    config, _ = workspace
+    _seeded_db_with_many_chunks(config.parent / "c.db", 5).close()
+
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(
+            [command, "Hunter Reeves", "--limit", "1", "--config", str(config), "--stale-ok", "--json"]
+        )
+    assert caught.value.code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["total"] == 5
+
+
+@pytest.mark.parametrize("bad_k", ["0", "-1", "-5"])
+def test_search_k_below_one_is_rejected(workspace, capsys, bad_k):
+    config, _ = workspace
+    _seeded_db(config.parent / "c.db").close()
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(
+            ["search", "flag work", "--k", bad_k, "--config", str(config), "--stale-ok"]
+        )
+    assert caught.value.code == 2
+    out = capsys.readouterr().out
+    assert out.startswith("error:")
+    assert "help:" in out
+    assert "--k" in out
+
+
+@pytest.mark.parametrize("bad_context", ["-1", "-100"])
+def test_search_context_below_zero_is_rejected(workspace, capsys, bad_context):
+    config, _ = workspace
+    _seeded_db(config.parent / "c.db").close()
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(
+            ["search", "flag work", "--context", bad_context, "--config", str(config), "--stale-ok"]
+        )
+    assert caught.value.code == 2
+    out = capsys.readouterr().out
+    assert out.startswith("error:")
+    assert "help:" in out
+    assert "--context" in out
+
+
+def test_search_context_zero_is_allowed(workspace, capsys, monkeypatch):
+    """`--context 0` is a legitimate request (no surrounding messages), unlike a
+    negative value -- it must not be rejected."""
+    config, _ = workspace
+    _seeded_db(config.parent / "c.db").close()
+    monkeypatch.setattr(corpus_tool, "make_embedder", lambda vault=None: FakeEmbedder())
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(
+            ["search", "flag work", "--context", "0", "--config", str(config), "--stale-ok", "--json"]
+        )
+    assert caught.value.code == 0
+
+
+def test_search_k_one_still_works(workspace, capsys, monkeypatch):
+    config, _ = workspace
+    _seeded_db(config.parent / "c.db").close()
+    monkeypatch.setattr(corpus_tool, "make_embedder", lambda vault=None: FakeEmbedder())
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(
+            ["search", "flag work", "--k", "1", "--config", str(config), "--stale-ok", "--json"]
+        )
+    assert caught.value.code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+
+
 def test_thread_at_known_permalink_returns_a_result(workspace, capsys):
     config, _ = workspace
     _seeded_db(config.parent / "c.db").close()

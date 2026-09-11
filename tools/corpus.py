@@ -225,7 +225,29 @@ def with_health(payload: dict, conn, config, stale_ok: bool) -> dict:
     return payload
 
 
+def _require_at_least(value: int, floor: int, flag: str, invocation: str) -> None:
+    """Reject an out-of-range numeric flag rather than clamping it.
+
+    Clamping is the wrong failure mode here: `--limit 0` silently turned into
+    `--limit 1` would hand back a result the caller did not ask for, and SQLite
+    treats a negative `LIMIT` as "no limit at all" -- so a negative value doesn't
+    even fail loudly on its own, it silently defeats the cap it was supposed to
+    apply. Both look, from the caller's side, exactly like the failure mode this
+    project exists to prevent: a confident, wrong answer with nothing to flag it.
+    Rejecting means the caller must change the flag before retrying is worth
+    attempting, which is exit 2.
+    """
+    if value < floor:
+        fail(
+            f"{flag} must be at least {floor} (got {value})",
+            help=invocation,
+            usage=True,
+        )
+
+
 def cmd_search(args, config) -> int:
+    _require_at_least(args.k, 1, "--k", f"sherpa corpus search {args.query!r} --k 5")
+    _require_at_least(args.context, 0, "--context", f"sherpa corpus search {args.query!r} --context 3")
     conn = open_db(config.db)
     filters = Filters(
         person=args.from_person,
@@ -266,6 +288,7 @@ def _paginated(payload: dict, page, invocation: str) -> dict:
 
 
 def cmd_with(args, config) -> int:
+    _require_at_least(args.limit, 1, "--limit", f'sherpa corpus with "{args.person}" --limit 50')
     conn = open_db(config.db)
     page = conversation_with(
         conn, args.person, since=parse_since(args.since) if args.since else None, limit=args.limit
@@ -282,6 +305,7 @@ def cmd_with(args, config) -> int:
 
 
 def cmd_owed(args, config) -> int:
+    _require_at_least(args.limit, 1, "--limit", f'sherpa corpus owed "{args.person}" --limit 50')
     conn = open_db(config.db)
     page = sent_to(conn, args.person, limit=args.limit)
     payload = _paginated(
