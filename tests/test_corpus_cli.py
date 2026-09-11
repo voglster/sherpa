@@ -131,7 +131,7 @@ class _StubEmbedder:
 
 def test_search_warns_loudly_when_the_corpus_is_stale(workspace, capsys, monkeypatch):
     config, _ = workspace
-    monkeypatch.setattr(corpus_tool, "make_embedder", lambda: _StubEmbedder())
+    monkeypatch.setattr(corpus_tool, "make_embedder", lambda vault=None: _StubEmbedder())
     with pytest.raises(SystemExit):
         corpus_tool.main(["search", "anything", "--config", str(config), "--json"])
     payload = json.loads(capsys.readouterr().out)
@@ -140,7 +140,7 @@ def test_search_warns_loudly_when_the_corpus_is_stale(workspace, capsys, monkeyp
 
 def test_stale_ok_suppresses_the_warning(workspace, capsys, monkeypatch):
     config, _ = workspace
-    monkeypatch.setattr(corpus_tool, "make_embedder", lambda: _StubEmbedder())
+    monkeypatch.setattr(corpus_tool, "make_embedder", lambda vault=None: _StubEmbedder())
     with pytest.raises(SystemExit):
         corpus_tool.main(["search", "anything", "--config", str(config), "--stale-ok", "--json"])
     payload = json.loads(capsys.readouterr().out)
@@ -150,7 +150,7 @@ def test_stale_ok_suppresses_the_warning(workspace, capsys, monkeypatch):
 def test_search_returns_hits_and_exits_0(workspace, capsys, monkeypatch, tmp_path):
     config, _ = workspace
     _seeded_db(config.parent / "c.db").close()
-    monkeypatch.setattr(corpus_tool, "make_embedder", lambda: FakeEmbedder())
+    monkeypatch.setattr(corpus_tool, "make_embedder", lambda vault=None: FakeEmbedder())
     with pytest.raises(SystemExit) as caught:
         corpus_tool.main(["search", "flag work", "--config", str(config), "--stale-ok", "--json"])
     assert caught.value.code == 0
@@ -162,7 +162,7 @@ def test_search_returns_hits_and_exits_0(workspace, capsys, monkeypatch, tmp_pat
 def test_search_with_no_matches_reports_a_definitive_empty_state(workspace, capsys, monkeypatch):
     config, _ = workspace
     open_db(config.parent / "c.db").close()
-    monkeypatch.setattr(corpus_tool, "make_embedder", lambda: FakeEmbedder())
+    monkeypatch.setattr(corpus_tool, "make_embedder", lambda vault=None: FakeEmbedder())
     with pytest.raises(SystemExit) as caught:
         corpus_tool.main(["search", "nothing here", "--config", str(config), "--stale-ok", "--json"])
     assert caught.value.code == 0
@@ -181,11 +181,62 @@ def test_search_embedding_error_notifies_and_exits_1(workspace, capsys, monkeypa
         def embed(self, texts):
             raise EmbeddingError("gateway down")
 
-    monkeypatch.setattr(corpus_tool, "make_embedder", lambda: _BrokenEmbedder())
+    monkeypatch.setattr(corpus_tool, "make_embedder", lambda vault=None: _BrokenEmbedder())
     with pytest.raises(SystemExit) as caught:
         corpus_tool.main(["search", "anything", "--config", str(config), "--stale-ok"])
     assert caught.value.code == 1
     assert "gateway down" in capsys.readouterr().out
+
+
+def test_make_embedder_reads_the_given_vault_path_not_the_real_one(tmp_path, monkeypatch):
+    """`make_embedder` must honor an explicit vault path rather than always reading
+    ~/.sherpa/vault.json -- otherwise `--vault` on a read subcommand is decorative and
+    the CLI's embedding key resolution silently depends on whatever happens to be on
+    the machine running it.
+    """
+    fake_home = tmp_path / "not-home"
+    fake_home.mkdir()
+    monkeypatch.setattr(corpus_tool.Path, "home", lambda: fake_home)
+
+    given_vault = tmp_path / "given.json"
+    given_vault.write_text(json.dumps({"LITELLM_KEY_CORPUS": "given-key"}))
+
+    embedder = corpus_tool.make_embedder(given_vault)
+    assert embedder._key == "given-key"
+
+
+def test_search_missing_embedding_secret_reports_on_stderr_and_exits_2(workspace, tmp_path, capsys, monkeypatch):
+    """Hermeticity guard: a read subcommand must resolve `LITELLM_KEY_CORPUS` from the
+    `--vault` it was given, never the real `~/.sherpa/vault.json` -- otherwise this test's
+    outcome would depend on ambient state on whatever machine runs the suite. `make_embedder`
+    is deliberately NOT monkeypatched here so the real vault-reading code path runs.
+
+    The fake "real" vault below deliberately DOES carry a valid-looking
+    `LITELLM_KEY_CORPUS`, so this only passes if `--vault` actually overrides it -- a build
+    that silently falls back to `~/.sherpa/vault.json` would find that key and succeed
+    instead of reporting the secret as missing.
+    """
+    config, _ = workspace
+    open_db(config.parent / "c.db").close()
+
+    fake_home = tmp_path / "not-home"
+    (fake_home / ".sherpa").mkdir(parents=True)
+    (fake_home / ".sherpa" / "vault.json").write_text(
+        json.dumps({"LITELLM_KEY_CORPUS": "should-not-be-used"})
+    )
+    monkeypatch.setattr(corpus_tool.Path, "home", lambda: fake_home)
+
+    given_vault = tmp_path / "given.json"
+    given_vault.write_text(json.dumps({"SLACK_USER_TOKEN_GRAVITATE": "xoxp-x"}))
+
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(
+            ["search", "anything", "--config", str(config), "--vault", str(given_vault), "--stale-ok"]
+        )
+    assert caught.value.code == 2
+    captured = capsys.readouterr()
+    assert "MISSING_SECRET: LITELLM_KEY_CORPUS" in captured.err
+    assert captured.out.startswith("error:")
 
 
 def test_with_returns_conversation_and_owed_filters_to_my_messages(workspace, capsys):
@@ -244,7 +295,7 @@ def test_sync_also_chunks_and_embeds(workspace, monkeypatch, capsys):
     config, vault = workspace
     monkeypatch.setattr(corpus_tool, "notify", lambda *a, **k: None)
     monkeypatch.setattr(corpus_tool, "HttpSlackClient", lambda token: object())
-    monkeypatch.setattr(corpus_tool, "make_embedder", lambda: FakeEmbedder())
+    monkeypatch.setattr(corpus_tool, "make_embedder", lambda vault=None: FakeEmbedder())
 
     def _fake_ingest(conn, client, name, me, budget_seconds):
         _insert_message(conn, 1000.0, "Hunter Reeves", "can you take the flag work?")
@@ -283,7 +334,7 @@ def test_sync_exits_1_when_some_channels_merely_fail(workspace, monkeypatch, cap
     config, vault = workspace
     monkeypatch.setattr(corpus_tool, "notify", lambda *a, **k: None)
     monkeypatch.setattr(corpus_tool, "HttpSlackClient", lambda token: object())
-    monkeypatch.setattr(corpus_tool, "make_embedder", lambda: FakeEmbedder())
+    monkeypatch.setattr(corpus_tool, "make_embedder", lambda vault=None: FakeEmbedder())
 
     def _partial_failure(*args, **kwargs):
         return IngestReport(

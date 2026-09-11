@@ -126,6 +126,7 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
     with_parser.add_argument("person")
     with_parser.add_argument("--since", default=None)
     with_parser.add_argument("--config", default=None)
+    with_parser.add_argument("--vault", default=None)
     with_parser.add_argument("--json", action="store_true")
     with_parser.add_argument("--stale-ok", dest="stale_ok", action="store_true")
     registry["with"] = with_parser
@@ -133,6 +134,7 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
     owed_parser = subparsers.add_parser("owed", allow_abbrev=False)
     owed_parser.add_argument("person")
     owed_parser.add_argument("--config", default=None)
+    owed_parser.add_argument("--vault", default=None)
     owed_parser.add_argument("--json", action="store_true")
     owed_parser.add_argument("--stale-ok", dest="stale_ok", action="store_true")
     registry["owed"] = owed_parser
@@ -140,6 +142,7 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
     thread_parser = subparsers.add_parser("thread", allow_abbrev=False)
     thread_parser.add_argument("permalink")
     thread_parser.add_argument("--config", default=None)
+    thread_parser.add_argument("--vault", default=None)
     thread_parser.add_argument("--json", action="store_true")
     thread_parser.add_argument("--stale-ok", dest="stale_ok", action="store_true")
     registry["thread"] = thread_parser
@@ -174,8 +177,8 @@ def parse_since(value: str) -> float:
         )
 
 
-def make_embedder():
-    vault_path = Path.home() / ".sherpa" / "vault.json"
+def make_embedder(vault_path: Path | str | None = None):
+    vault_path = Path(vault_path) if vault_path else Path.home() / ".sherpa" / "vault.json"
     vault = json.loads(vault_path.read_text()) if vault_path.exists() else {}
     key = vault.get("LITELLM_KEY_CORPUS") or vault.get("LITELLM_KEY", "")
     if not key:
@@ -223,7 +226,7 @@ def cmd_search(args, config) -> int:
         since=parse_since(args.since) if args.since else None,
     )
     try:
-        hits = search(conn, args.query, make_embedder(), filters=filters, k=args.k, context=args.context)
+        hits = search(conn, args.query, make_embedder(args.vault), filters=filters, k=args.k, context=args.context)
     except EmbeddingError as error:
         notify("Slack corpus: embedding gateway down", error.detail)
         fail(
@@ -328,7 +331,7 @@ def cmd_sync(args, config) -> int:
 
         rechunk_all(conn, workspace.name)
         try:
-            embedded = embed_pending(conn, make_embedder())
+            embedded = embed_pending(conn, make_embedder(args.vault))
         except EmbeddingError as error:
             notify("Slack corpus: embedding gateway down", error.detail)
             fail(
