@@ -20,6 +20,8 @@ corpus_tool = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(corpus_tool)
 
 from sherpa.corpus.db import open_db
+from sherpa.corpus.ingest import IngestReport
+from sherpa.corpus.slack import AuthError
 
 
 @pytest.fixture
@@ -71,6 +73,65 @@ def test_status_emits_json_when_asked(workspace, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert "workspaces" in payload
     assert caught.value.code == 2  # never synced is not healthy
+
+
+@pytest.mark.parametrize("command,positional", [
+    ("search", "foo"),
+    ("with", "alice"),
+    ("owed", "alice"),
+    ("thread", "https://x.slack.com/archives/C1/p1"),
+])
+def test_unimplemented_subcommand_exits_2_not_1(workspace, command, positional, capsys):
+    """Retrying an unimplemented subcommand can never succeed, so it must be 2, not 1.
+
+    Exit 1 means "the world was uncooperative, retry is reasonable" per
+    docs/SHERPA_STANDARDS.md; an agent that saw 1 here would retry a command
+    that cannot ever succeed until Task 10 lands. Checking only "it failed"
+    would not catch a regression to the wrong exit code.
+    """
+    config, _ = workspace
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main([command, positional, "--config", str(config)])
+    assert caught.value.code == 2
+    assert capsys.readouterr().out.startswith("error:")
+
+
+def test_sync_exits_2_when_token_is_rejected(workspace, monkeypatch, capsys):
+    """A rejected token means retrying identically will never work: exit 2."""
+    config, vault = workspace
+    monkeypatch.setattr(corpus_tool, "notify", lambda *a, **k: None)
+    monkeypatch.setattr(corpus_tool, "HttpSlackClient", lambda token: object())
+
+    def _raise_auth_error(*args, **kwargs):
+        raise AuthError("invalid_auth")
+
+    monkeypatch.setattr(corpus_tool, "ingest_workspace", _raise_auth_error)
+
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(["sync", "--config", str(config), "--vault", str(vault)])
+    assert caught.value.code == 2
+    assert capsys.readouterr().out.startswith("error:")
+
+
+def test_sync_exits_1_when_some_channels_merely_fail(workspace, monkeypatch, capsys):
+    """A channel-level hiccup is the world being uncooperative: exit 1, not 2."""
+    config, vault = workspace
+    monkeypatch.setattr(corpus_tool, "notify", lambda *a, **k: None)
+    monkeypatch.setattr(corpus_tool, "HttpSlackClient", lambda token: object())
+
+    def _partial_failure(*args, **kwargs):
+        return IngestReport(
+            workspace="gravitate",
+            messages=3,
+            channels_done=2,
+            channels_failed=[("C1", "http_503")],
+        )
+
+    monkeypatch.setattr(corpus_tool, "ingest_workspace", _partial_failure)
+
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(["sync", "--config", str(config), "--vault", str(vault)])
+    assert caught.value.code == 1
 
 
 def test_operations_declares_every_subcommand():

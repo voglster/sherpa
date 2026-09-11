@@ -205,9 +205,11 @@ def cmd_status(args, config) -> int:
 
 
 def cmd_unimplemented(args, config) -> int:
+    """Fail as `usage=True`: retrying identically can never work until Task 10 ships."""
     fail(
         f"'{args.command}' is not implemented yet",
         help="sherpa corpus status",
+        usage=True,
     )
 
 
