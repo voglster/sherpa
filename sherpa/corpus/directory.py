@@ -31,6 +31,8 @@ def sync_directory(conn: sqlite3.Connection, client: SlackClient, workspace: str
             ),
         )
 
+    resolver = _UserResolver(conn, client, workspace)
+
     for channel in client.paginate(
         "conversations.list",
         "channels",
@@ -38,18 +40,21 @@ def sync_directory(conn: sqlite3.Connection, client: SlackClient, workspace: str
         exclude_archived=True,
     ):
         kind = _kind(channel)
+        name = _resolve_channel_name(channel, kind, resolver)
+        member_ids = _fetch_member_ids(channel, kind, client)
+
         conn.execute(
             "INSERT INTO channels (workspace, id, name, kind, is_member, member_ids)"
             " VALUES (?, ?, ?, ?, ?, ?)"
             " ON CONFLICT (workspace, id) DO UPDATE SET"
-            " name = excluded.name, kind = excluded.kind, is_member = excluded.is_member",
+            " name = excluded.name, kind = excluded.kind, is_member = excluded.is_member, member_ids = excluded.member_ids",
             (
                 workspace,
                 channel["id"],
-                _name(channel, kind),
+                name,
                 kind,
                 1 if channel.get("is_member") or kind in ("im", "mpim") else 0,
-                json.dumps(channel.get("members", [])),
+                json.dumps(member_ids),
             ),
         )
 
@@ -65,10 +70,79 @@ def _kind(channel: dict) -> str:
     return "private" if channel.get("is_private") else "public"
 
 
-def _name(channel: dict, kind: str) -> str:
+class _UserResolver:
+    """Resolves user IDs to names, fetching via users.info when needed."""
+
+    def __init__(self, conn: sqlite3.Connection, client: SlackClient, workspace: str) -> None:
+        self.conn = conn
+        self.client = client
+        self.workspace = workspace
+        self._cache = {
+            row["id"]: row["name"]
+            for row in conn.execute("SELECT id, name FROM users WHERE workspace = ?", (workspace,))
+        }
+
+    def resolve(self, user_id: str) -> str:
+        """Resolve user ID to name, fetching via users.info if not in cache."""
+        if user_id in self._cache:
+            return self._cache[user_id]
+
+        try:
+            user_info = self.client.call("users.info", user=user_id)
+            if user_info.get("ok"):
+                user = user_info["user"]
+                profile = user.get("profile", {})
+                name = profile.get("real_name") or user.get("name") or user_id
+                self.conn.execute(
+                    "INSERT INTO users (workspace, id, name, display_name, is_me)"
+                    " VALUES (?, ?, ?, ?, ?)"
+                    " ON CONFLICT (workspace, id) DO UPDATE SET"
+                    " name = excluded.name, display_name = excluded.display_name",
+                    (
+                        self.workspace,
+                        user_id,
+                        name,
+                        profile.get("display_name", ""),
+                        0,
+                    ),
+                )
+                self._cache[user_id] = name
+                return name
+        except Exception:
+            pass
+
+        placeholder = f"<{user_id}>"
+        self._cache[user_id] = placeholder
+        return placeholder
+
+
+def _resolve_channel_name(channel: dict, kind: str, resolver: _UserResolver) -> str:
+    """Resolve channel name at write time, handling DM and group DM naming."""
     if kind == "im":
-        return channel.get("user", channel["id"])
-    return channel.get("name", channel["id"])
+        user_id = channel.get("user", channel["id"])
+        return resolver.resolve(user_id)
+    elif kind == "mpim":
+        members = channel.get("members", [])
+        if members:
+            names = [resolver.resolve(uid) for uid in members]
+            return ", ".join(names)
+        return channel.get("name", channel["id"])
+    else:
+        return channel.get("name", channel["id"])
+
+
+def _fetch_member_ids(channel: dict, kind: str, client: SlackClient) -> list:
+    """Fetch member IDs for im and mpim channels only."""
+    if kind not in ("im", "mpim"):
+        return []
+
+    try:
+        members = []
+        for member in client.paginate("conversations.members", "members", channel=channel["id"]):
+            members.append(member)
+        return members
+    except Exception:
+        return []
 
 
 def tier_for(channel_row, has_posted: bool) -> int:
@@ -102,4 +176,4 @@ class Resolver:
 
     def channel(self, channel_id: str) -> tuple[str, str]:
         name, kind = self._channels.get(channel_id, (channel_id, "public"))
-        return (self.user_name(name), kind) if kind == "im" else (name, kind)
+        return (name, kind)
