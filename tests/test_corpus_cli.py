@@ -672,12 +672,16 @@ def test_messages_committed_by_an_aborted_run_are_chunked_by_the_next_one(
     assert conn.execute("SELECT count(*) FROM chunks WHERE embedded = 1").fetchone()[0] == 1
 
 
-def test_a_first_backfill_is_not_reported_as_a_healthy_corpus(workspace, tmp_path, capsys):
+def test_a_first_backfill_is_visible_without_being_an_error(workspace, tmp_path, capsys):
     """During the first cold backfill -- days, and exactly when the corpus is
     least complete -- nothing said so: staleness, unembedded chunks and failed
-    channels were all clean, so `status` exited 0 and `search` printed no
+    channels were all clean, so `status` was silent and `search` printed no
     warning. An agent asking "did I miss anything?" got a confident partial
-    answer."""
+    answer.
+
+    It warns, but it does not exit non-zero: a backfill in progress is not
+    something the caller can fix, and exit 2 means "change something and
+    retry". Days of that trains everyone to ignore the signal."""
     import time
 
     config, _ = workspace
@@ -701,6 +705,56 @@ def test_a_first_backfill_is_not_reported_as_a_healthy_corpus(workspace, tmp_pat
     with pytest.raises(SystemExit) as caught:
         corpus_tool.main(["status", "--config", str(config), "--json"])
     payload = json.loads(capsys.readouterr().out)
-    assert caught.value.code == 2
+    assert caught.value.code == 0
     assert any("backfill" in line for line in payload["warnings"])
     assert any("thread" in line for line in payload["warnings"])
+    assert payload["workspaces"][0]["backfilling"] == 1
+    assert payload["workspaces"][0]["unswept_threads"] == 1
+
+
+def test_a_failed_channel_during_a_backfill_still_exits_non_zero(workspace, capsys):
+    """The faults that do have remedies keep their teeth."""
+    import time
+
+    config, _ = workspace
+    conn = open_db(config.parent / "c.db")
+    conn.execute(
+        "INSERT INTO sync_state (workspace, channel_id, status, updated_at)"
+        " VALUES ('gravitate', 'D1', 'failed', ?)",
+        (time.time(),),
+    )
+    conn.execute(
+        "INSERT INTO backfill_state (workspace, channel_id, complete) VALUES ('gravitate', 'D1', 0)"
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(["status", "--config", str(config), "--json"])
+    capsys.readouterr()
+    assert caught.value.code == 2
+
+
+def test_search_still_warns_while_a_backfill_is_running(workspace, capsys, monkeypatch):
+    """The confident-incompleteness guard on the read path is unchanged: a
+    query answered from a corpus still reading its own history must say so."""
+    import time
+
+    config, _ = workspace
+    conn = open_db(config.parent / "c.db")
+    conn.execute(
+        "INSERT INTO sync_state (workspace, channel_id, status, updated_at)"
+        " VALUES ('gravitate', 'D1', 'ok', ?)",
+        (time.time(),),
+    )
+    conn.execute(
+        "INSERT INTO backfill_state (workspace, channel_id, complete) VALUES ('gravitate', 'D1', 0)"
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(corpus_tool, "make_embedder", lambda vault=None: FakeEmbedder())
+    with pytest.raises(SystemExit):
+        corpus_tool.main(["search", "schema", "--config", str(config), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert any("backfill" in line for line in payload["warnings"])

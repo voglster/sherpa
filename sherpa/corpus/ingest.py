@@ -563,7 +563,7 @@ def _store(conn, resolver: Resolver, workspace: str, channel, raw: dict) -> int:
         " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         " ON CONFLICT (id) DO UPDATE SET text = excluded.text, meta = excluded.meta,"
         " ts_raw = excluded.ts_raw, thread_ts_raw = excluded.thread_ts_raw,"
-        " thread_ts = excluded.thread_ts",
+        " thread_ts = excluded.thread_ts, permalink = excluded.permalink",
         (
             identifier,
             workspace,
@@ -578,7 +578,7 @@ def _store(conn, resolver: Resolver, workspace: str, channel, raw: dict) -> int:
             resolver.user_name(author_id),
             1 if author_id == resolver.me_id else 0,
             text,
-            _permalink(workspace, channel["id"], raw["ts"]),
+            _permalink(resolver.team_host, channel["id"], raw["ts"]),
             json.dumps(meta),
         ),
     )
@@ -586,8 +586,8 @@ def _store(conn, resolver: Resolver, workspace: str, channel, raw: dict) -> int:
     return 1
 
 
-def _permalink(workspace: str, channel_id: str, ts: str) -> str:
-    return f"https://{workspace}.slack.com/archives/{channel_id}/p{ts.replace('.', '')}"
+def _permalink(host: str, channel_id: str, ts: str) -> str:
+    return f"https://{host}/archives/{channel_id}/p{ts.replace('.', '')}"
 
 
 def _mark(conn, workspace: str, channel_id: str, status: str, detail: str) -> None:

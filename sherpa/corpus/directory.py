@@ -33,8 +33,53 @@ def _render_link(match: re.Match) -> str:
 
 
 
+def team_host(conn: sqlite3.Connection, workspace: str) -> str:
+    """The workspace's real Slack host, or the config name as a last resort.
+
+    The fallback is the old behavior: wrong for a renamed workspace, but a
+    well-formed URL, which is better than emitting something malformed for a
+    row written before the host was known.
+    """
+    row = conn.execute(
+        "SELECT team_host FROM workspaces WHERE name = ?", (workspace,)
+    ).fetchone()
+    return (row["team_host"] if row and row["team_host"] else f"{workspace}.slack.com")
+
+
+def _host_of(url: str | None) -> str:
+    """`https://capspire.slack.com/` -> `capspire.slack.com`."""
+    if not url:
+        return ""
+    return url.split("://", 1)[-1].strip("/").split("/", 1)[0]
+
+
+def _learn_team_host(conn: sqlite3.Connection, workspace: str, url: str | None) -> None:
+    host = _host_of(url)
+    if not host:
+        return
+    previous = team_host(conn, workspace)
+    conn.execute(
+        "INSERT INTO workspaces (name, team_host) VALUES (?, ?)"
+        " ON CONFLICT (name) DO UPDATE SET team_host = excluded.team_host",
+        (workspace, host),
+    )
+    if previous != host:
+        # Everything already stored points at the old host. Permalinks live only
+        # on `messages` (chunks hydrate through them), so this is the whole repair.
+        conn.execute(
+            "UPDATE messages SET permalink = replace(permalink, ?, ?) WHERE workspace = ?",
+            (previous, host, workspace),
+        )
+
+
 def sync_directory(conn: sqlite3.Connection, client: SlackClient, workspace: str, me: str | None) -> str:
-    me_id = me or client.call("auth.test")["user_id"]
+    # Called even when `me` is configured: it is the only source of the team's
+    # real host, and one request per workspace per run is nothing next to the
+    # thousands ingest makes -- while skipping it would pin the host at whatever
+    # it was the day the corpus was created, through any later rename.
+    identity = client.call("auth.test")
+    me_id = me or identity["user_id"]
+    _learn_team_host(conn, workspace, identity.get("url"))
 
     for member in client.paginate("users.list", "members"):
         profile = member.get("profile", {})
@@ -240,6 +285,7 @@ class Resolver:
             "SELECT id FROM users WHERE workspace = ? AND is_me = 1", (workspace,)
         ).fetchone()
         self.me_id = me["id"] if me else ""
+        self.team_host = team_host(conn, workspace)
 
     def user_name(self, user_id: str) -> str:
         return self._users.get(user_id, user_id)

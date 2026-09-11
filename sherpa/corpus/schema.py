@@ -148,6 +148,16 @@ MIGRATIONS: list[str] = [
     INSERT INTO chunks_fts (rowid, chunk_id, header, text, participants)
         SELECT id, id, header, text, participants FROM chunks;
     """,
+    # A workspace's Slack host is not its configured name. Companies rename and
+    # the subdomain does not follow, so "gravitate" can live at
+    # capspire.slack.com -- and a permalink built from the config name is a dead
+    # link for every message in the corpus. auth.test knows the real one.
+    """
+    CREATE TABLE IF NOT EXISTS workspaces (
+        name      TEXT PRIMARY KEY,
+        team_host TEXT NOT NULL DEFAULT ''
+    );
+    """,
 ]
 
 # Indexes over added columns. Applied after COLUMN_ADDITIONS on every open, for

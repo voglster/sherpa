@@ -65,13 +65,19 @@ def check(conn: sqlite3.Connection, config: Config, *, now=time.time) -> list[He
 
 
 def is_healthy(reports: list[Health]) -> bool:
+    """Whether anything here is a fault the caller could act on.
+
+    A backfill in progress and an unswept thread backlog are deliberately not
+    faults: per docs/SHERPA_STANDARDS.md a non-zero exit says the caller must
+    change flags or environment before retrying is worth attempting, and
+    neither of those is something anyone can fix -- the system is working as
+    designed and needs time. Exiting non-zero for the days a first backfill
+    takes would train the caller to ignore the signal, which is precisely how
+    the corpus ends up silently incomplete. They stay loud in `warnings()`,
+    where "incomplete" is exactly the right thing to say.
+    """
     return all(
-        not r.stale
-        and r.unembedded == 0
-        and r.failed_channels == 0
-        and r.backfilling == 0
-        and r.unswept_threads == 0
-        for r in reports
+        not r.stale and r.unembedded == 0 and r.failed_channels == 0 for r in reports
     )
 
 

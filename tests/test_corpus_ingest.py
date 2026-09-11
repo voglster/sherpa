@@ -827,3 +827,70 @@ def test_a_deleted_thread_parent_takes_its_replies_with_it(tmp_path):
     ingest_workspace(conn, client, "gravitate", me=None, now=lambda: float(REPLY_TS))
 
     assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 0
+
+
+# --- The team's real Slack host ---------------------------------------------
+#
+# Found against the user's actual workspace: the company renamed but the Slack
+# subdomain did not, so a workspace configured as "gravitate" lives at
+# capspire.slack.com. Building the permalink from the config name produces a
+# dead link for every message in the corpus, and permalinks are how an agent's
+# answer leads back to the real conversation. No fixture could catch this on
+# its own, because a fixture invents both halves.
+
+RENAMED_DIRECTORY = {
+    "auth.test": [{"ok": True, "user_id": "U07JIMVOG", "team": "Gravitate",
+                   "url": "https://capspire.slack.com/"}],
+    "users.list": DIRECTORY["users.list"],
+    "conversations.list": DIRECTORY["conversations.list"],
+}
+
+
+def _renamed_client(history):
+    pages = dict(RENAMED_DIRECTORY)
+    pages["conversations.history"] = history
+    pages["conversations.replies"] = [{"ok": True, "messages": []}]
+    return FakeSlack(pages)
+
+
+def test_permalinks_use_the_teams_real_host_not_the_config_name(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = _renamed_client([{"ok": True, "messages": [
+        {"ts": "1757606400.000100", "user": "U03K2ABCD", "text": "hi"},
+    ]}])
+    ingest_workspace(conn, client, "gravitate", me="U07JIMVOG")
+
+    permalink = conn.execute("SELECT permalink FROM messages").fetchone()[0]
+    assert permalink == (
+        "https://capspire.slack.com/archives/D1/p1757606400000100"
+    )
+
+
+def test_a_learned_host_repairs_permalinks_already_stored(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    history = [{"ok": True, "messages": [
+        {"ts": "1757606400.000100", "user": "U03K2ABCD", "text": "hi"},
+    ]}]
+    ingest_workspace(conn, client_with(history), "gravitate", me="U07JIMVOG")
+    assert "gravitate.slack.com" in conn.execute(
+        "SELECT permalink FROM messages"
+    ).fetchone()[0]
+
+    ingest_workspace(conn, _renamed_client(history), "gravitate", me="U07JIMVOG")
+    assert "capspire.slack.com" in conn.execute(
+        "SELECT permalink FROM messages"
+    ).fetchone()[0]
+
+
+def test_a_workspace_with_no_known_host_still_gets_a_permalink(tmp_path):
+    """An older row, or a run before the host was learned, falls back to the
+    previous behavior rather than emitting something malformed."""
+    conn = open_db(tmp_path / "c.db")
+    client = client_with([{"ok": True, "messages": [
+        {"ts": "1757606400.000100", "user": "U03K2ABCD", "text": "hi"},
+    ]}])
+    ingest_workspace(conn, client, "gravitate", me="U07JIMVOG")
+
+    assert conn.execute("SELECT permalink FROM messages").fetchone()[0] == (
+        "https://gravitate.slack.com/archives/D1/p1757606400000100"
+    )
