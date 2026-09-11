@@ -21,6 +21,18 @@ from sherpa.corpus.embed import Embedder
 RRF_K = 60
 CANDIDATES = 50
 
+# sqlite-vec's `MATCH ... k = ?` always returns the k nearest rows present in
+# the table, however distant -- an unfiltered KNN literally cannot express "no
+# match." Left alone, that means a query about something the corpus has never
+# discussed still comes back with confident-looking transcripts, and a
+# downstream agent reading them can confabulate a commitment that was never
+# made. So a KNN-only hit (one BM25 did not also surface) only counts if its
+# distance clears this floor; an exact-token BM25 hit is never subject to it.
+# This is an L2 distance against `chunks_vec` (vec0's default metric). Tuned
+# for now against untested assumptions about real nomic-embed-text vectors --
+# see the Task 9 report for the reasoning and why it may need retuning.
+KNN_DISTANCE_FLOOR = 1.2
+
 
 @dataclass
 class Filters:
@@ -100,6 +112,10 @@ def _knn_ranked(conn, query: str, embedder: Embedder, filters: Filters) -> list[
     in Python. This also sidesteps the brief's noted ~10k-placeholder SQLite
     variable limit on the inlined id list, since that list never becomes SQL
     parameters here.
+
+    Rows beyond KNN_DISTANCE_FLOOR are dropped: a chunk BM25 also found still
+    enters the fused results through the BM25 ranking regardless of distance,
+    but a chunk only vector search surfaces must actually be close.
     """
     clause, params = _where(filters)
     allowed = {row[0] for row in conn.execute(f"SELECT c.id FROM chunks c WHERE {clause}", params).fetchall()}
@@ -109,10 +125,12 @@ def _knn_ranked(conn, query: str, embedder: Embedder, filters: Filters) -> list[
     vector = embedder.embed([query])[0]
     widened_k = max(CANDIDATES, len(allowed))
     rows = conn.execute(
-        "SELECT chunk_id FROM chunks_vec WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+        "SELECT chunk_id, distance FROM chunks_vec WHERE embedding MATCH ? AND k = ? ORDER BY distance",
         [struct.pack(f"{len(vector)}f", *vector), widened_k],
     ).fetchall()
-    return [row[0] for row in rows if row[0] in allowed][:CANDIDATES]
+    return [
+        row[0] for row in rows if row[0] in allowed and row[1] <= KNN_DISTANCE_FLOOR
+    ][:CANDIDATES]
 
 
 def _fuse(*rankings: list[int]) -> list[tuple[int, float]]:

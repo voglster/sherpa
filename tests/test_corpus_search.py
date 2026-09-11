@@ -12,16 +12,42 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sherpa.corpus.chunk import build_chunks
-from sherpa.corpus.db import open_db
+from sherpa.corpus.db import EMBED_DIM, open_db
 from sherpa.corpus.embed import FakeEmbedder, embed_pending
 from sherpa.corpus.search import (
     Filters,
+    KNN_DISTANCE_FLOOR,
     RRF_K,
     conversation_with,
     search,
     sent_to,
     thread_at,
 )
+
+
+class ScriptedEmbedder:
+    """Vectors at chosen, exact distances -- unlike FakeEmbedder's hash-derived
+    vectors, which are noise uncorrelated with meaning and can't exercise a
+    distance floor at all. Maps exact input strings to explicit vectors, with
+    everything else (chunk text, by default) landing at `default`.
+    """
+
+    def __init__(self, vectors: dict[str, list[float]], default: list[float]):
+        self._vectors = vectors
+        self._default = default
+
+    def embed(self, texts):
+        return [self._vectors.get(t, self._default) for t in texts]
+
+
+def _vector_at_distance(distance: float) -> list[float]:
+    """A vector whose L2 distance from an all-zero vector is exactly `distance`."""
+    return [float(distance)] + [0.0] * (EMBED_DIM - 1)
+
+
+FLOOR_ORIGIN = [0.0] * EMBED_DIM
+FLOOR_FAR = _vector_at_distance(KNN_DISTANCE_FLOOR + 5.0)
+FLOOR_NEAR = _vector_at_distance(KNN_DISTANCE_FLOOR / 2)
 
 
 def insert(conn, ts, author, text, *, is_me=0, channel="D1", kind="im", name="Hunter Reeves"):
@@ -137,6 +163,37 @@ def test_thread_at_resolves_a_permalink_to_its_conversation(corpus):
 
 def test_empty_query_result_is_an_empty_list_not_an_error(corpus):
     assert search(corpus, "zzzznonexistent", FakeEmbedder(), filters=Filters(), k=5) == []
+
+
+@pytest.fixture
+def floor_corpus(tmp_path):
+    conn = open_db(tmp_path / "floor.db")
+    insert(conn, 1000.0, "Hunter Reeves", "completely unrelated gardening chatter", channel="DF")
+    insert(conn, 1060.0, "Jim Vogel", "yep the KB-77777 patch is in review", is_me=1, channel="DF")
+    conn.commit()
+    build_chunks(conn, "gravitate", "DF")
+    embed_pending(conn, ScriptedEmbedder({}, FLOOR_ORIGIN))
+    return conn
+
+
+def test_knn_only_hit_beyond_the_floor_is_dropped(floor_corpus):
+    """No BM25 match, and the only vector candidate is well past the floor: []."""
+    embedder = ScriptedEmbedder({"nothing_like_this_corpus": FLOOR_FAR}, FLOOR_ORIGIN)
+    assert search(floor_corpus, "nothing_like_this_corpus", embedder, filters=Filters(), k=5) == []
+
+
+def test_knn_only_hit_within_the_floor_is_returned(floor_corpus):
+    """No BM25 match, but the vector candidate clears the floor: it counts."""
+    embedder = ScriptedEmbedder({"nothing_like_this_corpus": FLOOR_NEAR}, FLOOR_ORIGIN)
+    hits = search(floor_corpus, "nothing_like_this_corpus", embedder, filters=Filters(), k=5)
+    assert hits
+
+
+def test_bm25_hit_survives_the_floor_regardless_of_distance(floor_corpus):
+    """An exact-token hit (a Jira key) must never be suppressed by the vector floor."""
+    embedder = ScriptedEmbedder({"KB-77777": FLOOR_FAR}, FLOOR_ORIGIN)
+    hits = search(floor_corpus, "KB-77777", embedder, filters=Filters(), k=5)
+    assert any("KB-77777" in hit.transcript for hit in hits)
 
 
 def test_rrf_k_is_the_standard_constant():
