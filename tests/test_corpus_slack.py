@@ -86,3 +86,70 @@ def test_fake_slack_paginates_its_queued_pages():
         {"ok": True, "messages": [{"ts": "2.0"}]},
     ]})
     assert [m["ts"] for m in fake.paginate("conversations.history", "messages", channel="C1")] == ["1.0", "2.0"]
+
+
+def test_repeated_cursor_raises_instead_of_hanging():
+    """Malformed pagination (same cursor twice) raises rather than looping forever."""
+    transport = StubTransport([
+        StubResponse({
+            "ok": True,
+            "messages": [{"ts": "1.0"}],
+            "response_metadata": {"next_cursor": "stuck"},
+        }),
+        StubResponse({
+            "ok": True,
+            "messages": [{"ts": "2.0"}],
+            "response_metadata": {"next_cursor": "stuck"},  # Same cursor repeats
+        }),
+    ])
+    client = HttpSlackClient("xoxp-x", transport=transport)
+    with pytest.raises(SlackError) as caught:
+        list(client.paginate("conversations.history", "messages", channel="C1"))
+    assert caught.value.code == "pagination_cursor_repeat"
+
+
+def test_non_numeric_retry_after_falls_back_to_default():
+    """Invalid Retry-After header is ignored; uses default delay."""
+    transport = StubTransport([
+        StubResponse(
+            {"ok": False, "error": "ratelimited"},
+            status_code=429,
+            headers={"Retry-After": "not-a-number"}
+        ),
+        StubResponse({"ok": True, "messages": []}),
+    ])
+    slept = []
+    client = HttpSlackClient("xoxp-x", transport=transport, sleep=slept.append)
+    client.call("conversations.history", channel="C1")
+    assert slept == [1.0]  # Falls back to default
+
+
+def test_5xx_response_retries_then_raises_retryable():
+    """Non-2xx HTTP status (other than 429) retries and raises with retryable=True."""
+    transport = StubTransport([
+        StubResponse({"error": "internal_error"}, status_code=500),
+        StubResponse({"error": "service_unavailable"}, status_code=503),
+        StubResponse({"error": "bad_gateway"}, status_code=502),
+        StubResponse({"error": "too_many_requests"}, status_code=503),
+        StubResponse({"error": "something_bad"}, status_code=500),
+    ])
+    client = HttpSlackClient("xoxp-x", transport=transport)
+    with pytest.raises(SlackError) as caught:
+        client.call("conversations.history", channel="C1")
+    assert caught.value.retryable is True
+    assert caught.value.code == "ratelimited"
+    # Verify all 5 attempts were made
+    assert len(transport.requests) == 5
+
+
+def test_fake_slack_paginate_includes_limit_200():
+    """FakeSlack.paginate calls with limit=200 matching HttpSlackClient."""
+    fake = FakeSlack({"conversations.history": [
+        {"ok": True, "messages": [{"ts": "1.0"}], "response_metadata": {"next_cursor": ""}},
+    ]})
+    list(fake.paginate("conversations.history", "messages", channel="C1"))
+    # Verify the call included limit=200
+    assert len(fake.calls) == 1
+    method, params = fake.calls[0]
+    assert params.get("limit") == 200
+    assert params.get("channel") == "C1"
