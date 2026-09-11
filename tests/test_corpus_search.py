@@ -18,6 +18,7 @@ from sherpa.corpus.embed import FakeEmbedder, embed_pending
 from sherpa.corpus.search import (
     Filters,
     _hydrate,
+    _where,
     KNN_DISTANCE_FLOOR,
     RRF_K,
     conversation_with,
@@ -470,3 +471,38 @@ def test_a_query_of_nothing_but_function_words_answers_empty(corpus):
     """No term in it can discriminate, so there is no honest answer to give --
     and "here are five conversations" would be a dishonest one."""
     assert search(corpus, "what about the thing I said", FakeEmbedder(), k=5) == []
+
+
+def test_mine_does_not_count_a_message_from_the_channel_around_a_thread(corpus):
+    """Same root cause as hydration: `is_me` inside a ts range catches Jim
+    talking in the channel while someone else's thread ran, and `owed` would
+    then hand back a thread he never spoke in as something he said."""
+    base = 1757700000.000100
+    insert(corpus, base, "Hunter Reeves", "thread parent nobody answered",
+           channel="DMINE", kind="public", name="gravi-cli")
+    corpus.execute(
+        "UPDATE messages SET thread_ts = ?, thread_ts_raw = ? WHERE id = ?",
+        (base, f"{base}", f"gravitate:DMINE:{base}"),
+    )
+    insert(corpus, base + 20, "Hunter Reeves", "and a follow-up in the thread",
+           channel="DMINE", kind="public", name="gravi-cli")
+    corpus.execute(
+        "UPDATE messages SET thread_ts = ?, thread_ts_raw = ? WHERE id = ?",
+        (base, f"{base}", f"gravitate:DMINE:{base + 20}"),
+    )
+    insert(corpus, base + 10, "Jim Vogel", "unrelated channel remark", is_me=1,
+           channel="DMINE", kind="public", name="gravi-cli")
+    corpus.commit()
+    build_chunks(corpus, "gravitate", "DMINE")
+    embed_pending(corpus, FakeEmbedder())
+
+    thread_chunk = corpus.execute(
+        "SELECT id FROM chunks WHERE channel_id = 'DMINE' AND thread_ts IS NOT NULL"
+    ).fetchone()[0]
+    mine = {
+        row[0]
+        for row in corpus.execute(
+            "SELECT c.id FROM chunks c WHERE " + _where(Filters(mine=True))[0]
+        )
+    }
+    assert thread_chunk not in mine

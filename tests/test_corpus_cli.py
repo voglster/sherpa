@@ -590,3 +590,28 @@ def test_sync_rechunks_only_the_channels_that_received_messages(workspace, monke
     conn = open_db(config.parent / "c.db")
     chunked = {row[0] for row in conn.execute("SELECT DISTINCT channel_id FROM chunks")}
     assert chunked == {"D1"}
+
+
+def test_sync_reports_failed_threads_and_exits_1(workspace, monkeypatch, capsys):
+    """A thread that cannot be read is not fatal to its channel, but it is
+    still a hole in the corpus and must not pass unnoticed."""
+    config, vault = workspace
+    monkeypatch.setattr(corpus_tool, "notify", lambda *a, **k: None)
+    monkeypatch.setattr(corpus_tool, "HttpSlackClient", lambda token: object())
+    monkeypatch.setattr(corpus_tool, "make_embedder", lambda vault=None: FakeEmbedder())
+    monkeypatch.setattr(
+        corpus_tool,
+        "ingest_workspace",
+        lambda *a, **k: IngestReport(
+            workspace="gravitate",
+            messages=1,
+            channels_done=1,
+            threads_failed=[("C1", "1757606400.000100", "ratelimited")],
+        ),
+    )
+
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(["sync", "--config", str(config), "--vault", str(vault), "--json"])
+    assert caught.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["synced"][0]["threads_failed"] == 1

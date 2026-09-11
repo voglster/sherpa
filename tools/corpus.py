@@ -400,11 +400,12 @@ def cmd_sync(args, config) -> int:
                 "messages": report.messages,
                 "channels": report.channels_done,
                 "failed": len(report.channels_failed),
+                "threads_failed": len(report.threads_failed),
                 "embedded": embedded,
             }
         )
 
-    failed = [r for r in results if r["failed"]]
+    failed = [r for r in results if r["failed"] or r["threads_failed"]]
     payload = {"synced": results, "count": len(results)}
     if failed:
         payload["help"] = ["sherpa corpus status"]

@@ -28,6 +28,14 @@ CANDIDATES = 50
 PERSON_CLAUSE = "({prefix}people LIKE ? OR {prefix}participants LIKE ?)"
 
 
+# A thread and the channel around it overlap in time, so "Jim spoke inside this
+# chunk's ts range" catches him talking in the channel while someone else's
+# thread ran -- and `owed` would hand that thread back as something he said.
+SAME_CONVERSATION = (
+    "((c.thread_ts IS NULL AND m.thread_ts IS NULL) OR m.thread_ts = c.thread_ts)"
+)
+
+
 def person_params(person: str) -> list[str]:
     return [f"%{person}%", f"%{person}%"]
 
@@ -128,7 +136,7 @@ def _where(filters: Filters) -> tuple[str, list]:
         clauses.append(
             "EXISTS (SELECT 1 FROM messages m WHERE m.workspace = c.workspace"
             " AND m.channel_id = c.channel_id AND m.ts BETWEEN c.start_ts AND c.end_ts"
-            " AND m.is_me = 1)"
+            f" AND {SAME_CONVERSATION} AND m.is_me = 1)"
         )
     return " AND ".join(clauses), params
 
@@ -415,7 +423,7 @@ def sent_to(conn: sqlite3.Connection, person: str, *, limit: int = 50) -> Page:
         PERSON_CLAUSE.replace("{prefix}", "c.")
         + " AND EXISTS (SELECT 1 FROM messages m WHERE m.workspace = c.workspace"
         " AND m.channel_id = c.channel_id AND m.ts BETWEEN c.start_ts AND c.end_ts"
-        " AND m.is_me = 1)"
+        f" AND {SAME_CONVERSATION} AND m.is_me = 1)"
     )
     total = conn.execute(
         f"SELECT count(*) FROM chunks c WHERE {clause}", person_params(person)
