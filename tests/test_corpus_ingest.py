@@ -184,6 +184,62 @@ def test_thread_sweep_does_not_duplicate_already_stored_replies(tmp_path):
     assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 2
 
 
+def test_thread_sweep_uses_latest_reply_not_parent_age_for_the_window(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = client_with(
+        history=[{"ok": True, "messages": [
+            {"ts": "0.0", "user": "U_H", "text": "parent", "thread_ts": "0.0", "reply_count": 1},
+        ]}],
+        replies=[{"ok": True, "messages": [
+            {"ts": "0.0", "user": "U_H", "text": "parent", "thread_ts": "0.0"},
+            {"ts": f"{THREAD_SWEEP_WINDOW_SECONDS - 100.0}", "user": "U_ME",
+             "text": "still going", "thread_ts": "0.0"},
+        ]}],
+    )
+    ingest_workspace(conn, client, "gravitate", me=None, now=lambda: 0.0)
+
+    client._pages["conversations.history"] = [{"ok": True, "messages": []}]
+    client._pages["conversations.replies"] = [{"ok": True, "messages": [
+        {"ts": "0.0", "user": "U_H", "text": "parent", "thread_ts": "0.0"},
+        {"ts": f"{THREAD_SWEEP_WINDOW_SECONDS - 100.0}", "user": "U_ME",
+         "text": "still going", "thread_ts": "0.0"},
+        {"ts": f"{THREAD_SWEEP_WINDOW_SECONDS + 40.0}", "user": "U_H",
+         "text": "one more thing", "thread_ts": "0.0"},
+    ]}]
+    later_now = THREAD_SWEEP_WINDOW_SECONDS + 50.0
+    ingest_workspace(conn, client, "gravitate", me=None, now=lambda: later_now)
+
+    texts = {row[0] for row in conn.execute("SELECT text FROM messages")}
+    assert "one more thing" in texts
+
+
+def test_thread_sweep_skips_threads_dead_for_the_entire_window(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = client_with(
+        history=[{"ok": True, "messages": [
+            {"ts": "0.0", "user": "U_H", "text": "parent", "thread_ts": "0.0", "reply_count": 1},
+        ]}],
+        replies=[{"ok": True, "messages": [
+            {"ts": "0.0", "user": "U_H", "text": "parent", "thread_ts": "0.0"},
+            {"ts": "50.0", "user": "U_ME", "text": "last word", "thread_ts": "0.0"},
+        ]}],
+    )
+    ingest_workspace(conn, client, "gravitate", me=None, now=lambda: 0.0)
+
+    client._pages["conversations.history"] = [{"ok": True, "messages": []}]
+    client._pages["conversations.replies"] = [{"ok": True, "messages": [
+        {"ts": "0.0", "user": "U_H", "text": "parent", "thread_ts": "0.0"},
+        {"ts": "50.0", "user": "U_ME", "text": "last word", "thread_ts": "0.0"},
+        {"ts": f"{THREAD_SWEEP_WINDOW_SECONDS + 5000.0}", "user": "U_H",
+         "text": "should never arrive", "thread_ts": "0.0"},
+    ]}]
+    long_after_now = THREAD_SWEEP_WINDOW_SECONDS + 10000.0
+    ingest_workspace(conn, client, "gravitate", me=None, now=lambda: long_after_now)
+
+    texts = {row[0] for row in conn.execute("SELECT text FROM messages")}
+    assert "should never arrive" not in texts
+
+
 def test_auth_error_propagates_rather_than_being_swallowed(tmp_path):
     conn = open_db(tmp_path / "c.db")
     pages = dict(DIRECTORY)

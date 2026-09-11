@@ -133,12 +133,18 @@ def _recently_active_thread_parents(
     conn: sqlite3.Connection, workspace: str, channel_id: str, window_start: float
 ) -> set[str]:
     """Thread parents already in the corpus, so a reply landing on a thread the
-    cursor has already passed still gets swept on the next run."""
+    cursor has already passed still gets swept on the next run.
+
+    Windows on each thread's most recent known message, not the parent's own
+    timestamp — a thread started outside the window can still be very much
+    alive, and a thread that started inside it can already be dead.
+    """
     return {
         str(row[0])
         for row in conn.execute(
-            "SELECT DISTINCT thread_ts FROM messages"
-            " WHERE workspace = ? AND channel_id = ? AND thread_ts IS NOT NULL AND thread_ts >= ?",
+            "SELECT thread_ts FROM messages"
+            " WHERE workspace = ? AND channel_id = ? AND thread_ts IS NOT NULL"
+            " GROUP BY thread_ts HAVING MAX(ts) >= ?",
             (workspace, channel_id, window_start),
         )
     }
