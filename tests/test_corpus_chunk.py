@@ -224,3 +224,49 @@ def test_delete_stale_is_scoped_to_its_own_workspace_and_channel(conn):
     assert conn.execute(
         "SELECT count(*) FROM chunks_vec WHERE chunk_id = ?", (other_ws_id,)
     ).fetchone()[0] == 1
+
+
+# --- Who the conversation is with, not who happened to speak ----------------
+#
+# An outstanding promise is one-sided by construction: Jim spoke and the other
+# person has not answered yet. Sourcing participants from the speakers in the
+# window makes exactly that chunk invisible to `owed hunter` and strips the
+# other party out of its header, which is the one line Contextual Retrieval
+# embeds and indexes.
+
+def _dm_channel(conn, channel="D9", name="Hunter Reeves"):
+    conn.execute(
+        "INSERT INTO users (workspace, id, name, is_me) VALUES ('w', 'U_ME', 'Jim Vogel', 1)"
+    )
+    conn.execute("INSERT INTO users (workspace, id, name) VALUES ('w', 'U_H', ?)", (name,))
+    conn.execute(
+        "INSERT INTO channels (workspace, id, name, kind, is_member, member_ids)"
+        " VALUES ('w', ?, ?, 'im', 1, '[\"U_ME\", \"U_H\"]')",
+        (channel, name),
+    )
+
+
+def test_a_one_sided_dm_chunk_still_names_the_other_party(conn):
+    _dm_channel(conn)
+    insert(conn, 1757606400.000100, "Jim Vogel", "I'll get you the schema thursday",
+           channel="D9", kind="im", name="Hunter Reeves")
+    conn.commit()
+    build_chunks(conn, "w", "D9")
+
+    row = conn.execute("SELECT header, people FROM chunks").fetchone()
+    assert "Hunter Reeves" in row["people"]
+    assert "Jim Vogel" in row["people"]
+    assert "Hunter Reeves" in row["header"]
+    assert row["header"].startswith("DM between Jim Vogel and Hunter Reeves")
+
+
+def test_channel_membership_reaches_the_fts_index_too(conn):
+    _dm_channel(conn)
+    insert(conn, 1757606400.000100, "Jim Vogel", "I'll get you the schema thursday",
+           channel="D9", kind="im", name="Hunter Reeves")
+    conn.commit()
+    build_chunks(conn, "w", "D9")
+
+    assert conn.execute(
+        "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH '\"Hunter\"'"
+    ).fetchone()[0] == 1

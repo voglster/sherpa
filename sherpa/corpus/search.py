@@ -21,6 +21,16 @@ from sherpa.corpus.embed import Embedder
 RRF_K = 60
 CANDIDATES = 50
 
+# A person is in a conversation whether or not they spoke in the window this
+# chunk covers. `people` is the conversation's roster plus everyone the window
+# names; `participants` is only who spoke, and is still matched so that chunks
+# written before `people` existed keep answering until they are rebuilt.
+PERSON_CLAUSE = "({prefix}people LIKE ? OR {prefix}participants LIKE ?)"
+
+
+def person_params(person: str) -> list[str]:
+    return [f"%{person}%", f"%{person}%"]
+
 # Conservative bound for how many chunk ids we inline as `?` placeholders in a
 # single statement. SQLite's actual limit varies by build (999 historically,
 # 32766 by default since 3.32.0); this stays well under either, leaving
@@ -94,8 +104,8 @@ def _where(filters: Filters) -> tuple[str, list]:
         clauses.append("c.start_ts <= ?")
         params.append(filters.until)
     if filters.person:
-        clauses.append("c.participants LIKE ?")
-        params.append(f"%{filters.person}%")
+        clauses.append(PERSON_CLAUSE.replace("{prefix}", "c."))
+        params.extend(person_params(filters.person))
     if filters.mine:
         clauses.append(
             "EXISTS (SELECT 1 FROM messages m WHERE m.workspace = c.workspace"
@@ -328,8 +338,8 @@ def _hydrate(conn, chunk_id: int, score: float, context: int) -> Hit | None:
 def conversation_with(
     conn: sqlite3.Connection, person: str, *, since: float | None = None, limit: int = 50
 ) -> Page:
-    params = [f"%{person}%"]
-    clause = "participants LIKE ?"
+    params = person_params(person)
+    clause = PERSON_CLAUSE.replace("{prefix}", "")
     if since is not None:
         clause += " AND end_ts >= ?"
         params.append(since)
@@ -345,17 +355,17 @@ def conversation_with(
 def sent_to(conn: sqlite3.Connection, person: str, *, limit: int = 50) -> Page:
     """Chunks where Jim spoke, in a conversation involving this person."""
     clause = (
-        "c.participants LIKE ?"
-        " AND EXISTS (SELECT 1 FROM messages m WHERE m.workspace = c.workspace"
+        PERSON_CLAUSE.replace("{prefix}", "c.")
+        + " AND EXISTS (SELECT 1 FROM messages m WHERE m.workspace = c.workspace"
         " AND m.channel_id = c.channel_id AND m.ts BETWEEN c.start_ts AND c.end_ts"
         " AND m.is_me = 1)"
     )
     total = conn.execute(
-        f"SELECT count(*) FROM chunks c WHERE {clause}", (f"%{person}%",)
+        f"SELECT count(*) FROM chunks c WHERE {clause}", person_params(person)
     ).fetchone()[0]
     rows = conn.execute(
         f"SELECT c.id FROM chunks c WHERE {clause} ORDER BY c.start_ts DESC LIMIT ?",
-        (f"%{person}%", limit),
+        [*person_params(person), limit],
     ).fetchall()
     hits = [h for h in (_hydrate(conn, row[0], 0.0, 0) for row in rows) if h]
     return Page(hits=hits, total=total)

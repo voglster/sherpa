@@ -344,3 +344,46 @@ def test_filtered_search_uses_the_allowed_lookup_not_native_knn(corpus):
 
 def test_rrf_k_is_the_standard_constant():
     assert RRF_K == 60
+
+
+def _one_sided_dm(conn, channel="D9", person="Hunter Reeves"):
+    """A promise nobody has answered yet: Jim spoke, the other party did not.
+
+    This is the shape `owed` exists to find, and the shape a speaker-derived
+    participant list cannot see.
+    """
+    conn.execute(
+        "INSERT INTO users (workspace, id, name, is_me) VALUES ('gravitate', 'U_ME', 'Jim Vogel', 1)"
+    )
+    conn.execute(
+        "INSERT INTO users (workspace, id, name) VALUES ('gravitate', 'U_P', ?)", (person,)
+    )
+    conn.execute(
+        "INSERT INTO channels (workspace, id, name, kind, is_member, member_ids)"
+        " VALUES ('gravitate', ?, ?, 'im', 1, '[\"U_ME\", \"U_P\"]')",
+        (channel, person),
+    )
+    insert(conn, 1757606400.000100, "Jim Vogel", "I owe you the schema by thursday",
+           is_me=1, channel=channel, name=person)
+    conn.commit()
+    build_chunks(conn, "gravitate", channel)
+    embed_pending(conn, FakeEmbedder())
+
+
+def test_owed_finds_a_promise_the_other_person_has_not_answered(corpus):
+    _one_sided_dm(corpus, channel="DQUIET", person="Quiet Person")
+    page = sent_to(corpus, "Quiet Person")
+    assert page.total == 1
+    assert "I owe you the schema by thursday" in page.hits[0].transcript
+
+
+def test_conversation_with_finds_a_one_sided_thread(corpus):
+    _one_sided_dm(corpus, channel="DQUIET", person="Quiet Person")
+    page = conversation_with(corpus, "Quiet Person")
+    assert page.hits
+
+
+def test_person_filter_reaches_a_chunk_the_person_never_spoke_in(corpus):
+    _one_sided_dm(corpus, channel="DQUIET", person="Quiet Person")
+    hits = search(corpus, "schema", FakeEmbedder(), filters=Filters(person="Quiet Person"), k=5)
+    assert any("I owe you the schema by thursday" in hit.transcript for hit in hits)

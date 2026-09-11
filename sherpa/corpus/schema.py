@@ -172,6 +172,11 @@ COLUMN_ADDITIONS: list[tuple[str, str, str, str | None]] = [
      "UPDATE thread_sweeps SET thread_ts_raw = CAST(thread_ts AS TEXT)"),
     ("thread_sweeps", "swept", "INTEGER NOT NULL DEFAULT 0",
      "UPDATE thread_sweeps SET swept = 1"),
+    # Everyone the conversation is with, not only whoever spoke in this window:
+    # an outstanding promise is one-sided by construction, and `participants`
+    # (window speakers) cannot see the other party at all.
+    ("chunks", "people", "TEXT NOT NULL DEFAULT ''",
+     "UPDATE chunks SET people = participants"),
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)

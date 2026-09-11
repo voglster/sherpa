@@ -10,6 +10,7 @@ deterministic context header.
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from datetime import datetime, timezone
 
@@ -23,14 +24,52 @@ def format_script(messages) -> str:
     return "\n".join(f"{m['author_name']}: {m['text']}" for m in messages)
 
 
+def _join_names(names: list[str]) -> str:
+    if len(names) < 2:
+        return "".join(names)
+    return ", ".join(names[:-1]) + " and " + names[-1]
+
+
 def build_header(channel_name: str, kind: str, participants: list[str], start_ts: float) -> str:
     when = datetime.fromtimestamp(start_ts, tz=timezone.utc).strftime("%Y-%m-%d")
-    people = ", ".join(participants)
     if kind == "im":
-        return f"DM between {people}, {when}"
+        return f"DM between {_join_names(participants)}, {when}"
     if kind == "mpim":
-        return f"Group DM between {people}, {when}"
-    return f"#{channel_name}, {when}, participants: {people}"
+        return f"Group DM between {_join_names(participants)}, {when}"
+    return f"#{channel_name}, {when}, participants: {', '.join(participants)}"
+
+
+def roster(conn: sqlite3.Connection, workspace: str, channel_id: str) -> list[str]:
+    """Everyone in the conversation, from channel membership rather than speech.
+
+    A DM or group DM is *with* people whether or not they have answered yet, and
+    the unanswered case is precisely the one `owed` exists to surface. Named
+    channels are left out on purpose: their membership runs to thousands and is
+    not what "a conversation with Hunter" means -- there, presence comes from
+    speaking or being mentioned in the window itself.
+    """
+    channel = conn.execute(
+        "SELECT name, kind, member_ids FROM channels WHERE workspace = ? AND id = ?",
+        (workspace, channel_id),
+    ).fetchone()
+    if channel is None or channel["kind"] not in ("im", "mpim"):
+        return []
+
+    names = {part.strip() for part in channel["name"].split(",") if part.strip()}
+    try:
+        member_ids = json.loads(channel["member_ids"])
+    except (TypeError, ValueError):
+        member_ids = []
+    if member_ids:
+        placeholders = ",".join("?" * len(member_ids))
+        names.update(
+            row[0]
+            for row in conn.execute(
+                f"SELECT name FROM users WHERE workspace = ? AND id IN ({placeholders})",
+                (workspace, *member_ids),
+            )
+        )
+    return sorted(names)
 
 
 def rechunk_all(conn: sqlite3.Connection, workspace: str) -> int:
@@ -71,11 +110,14 @@ def build_chunks(conn: sqlite3.Connection, workspace: str, channel_id: str) -> i
     for thread_messages in threads.values():
         windows.extend(_split_oversized(thread_messages))
 
+    members = roster(conn, workspace, channel_id)
+    me = _me_name(conn, workspace)
+
     current_keys = set()
     for window in windows:
         if window:
             current_keys.add((window[0]["id"], window[-1]["id"]))
-            _write(conn, workspace, channel_id, window)
+            _write(conn, workspace, channel_id, window, members, me)
 
     _delete_stale(conn, workspace, channel_id, current_keys)
     conn.commit()
@@ -133,13 +175,31 @@ def _split_oversized(messages: list) -> list[list]:
     return windows
 
 
-def _write(conn: sqlite3.Connection, workspace: str, channel_id: str, window: list) -> int:
+def _me_name(conn: sqlite3.Connection, workspace: str) -> str:
+    row = conn.execute(
+        "SELECT name FROM users WHERE workspace = ? AND is_me = 1", (workspace,)
+    ).fetchone()
+    return row["name"] if row else ""
+
+
+def _write(
+    conn: sqlite3.Connection,
+    workspace: str,
+    channel_id: str,
+    window: list,
+    members: list[str],
+    me: str,
+) -> int:
     text = format_script(window)
-    participants = sorted({m["author_name"] for m in window})
+    speakers = sorted({m["author_name"] for m in window})
+    everyone = sorted(set(speakers) | set(members))
+    if me in everyone:
+        everyone = [me] + [name for name in everyone if name != me]
+    people = ", ".join(everyone)
     header = build_header(
-        window[0]["channel_name"], window[0]["channel_kind"], participants, window[0]["ts"]
+        window[0]["channel_name"], window[0]["channel_kind"], everyone, window[0]["ts"]
     )
-    content_hash = hashlib.sha256(f"{header}\n{text}".encode()).hexdigest()
+    content_hash = hashlib.sha256(f"{header}\n{people}\n{text}".encode()).hexdigest()
 
     existing = conn.execute(
         "SELECT id, content_hash FROM chunks"
@@ -157,15 +217,16 @@ def _write(conn: sqlite3.Connection, workspace: str, channel_id: str, window: li
 
     cursor = conn.execute(
         "INSERT INTO chunks (workspace, channel_id, start_ts, end_ts, thread_ts, participants,"
-        " msg_first_id, msg_last_id, header, text, content_hash, embedded)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+        " people, msg_first_id, msg_last_id, header, text, content_hash, embedded)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
         (
             workspace,
             channel_id,
             window[0]["ts"],
             window[-1]["ts"],
             window[0]["thread_ts"],
-            ", ".join(participants),
+            ", ".join(speakers),
+            people,
             window[0]["id"],
             window[-1]["id"],
             header,
@@ -175,6 +236,6 @@ def _write(conn: sqlite3.Connection, workspace: str, channel_id: str, window: li
     )
     conn.execute(
         "INSERT INTO chunks_fts (chunk_id, header, text, participants) VALUES (?, ?, ?, ?)",
-        (cursor.lastrowid, header, text, ", ".join(participants)),
+        (cursor.lastrowid, header, text, people),
     )
     return 1
