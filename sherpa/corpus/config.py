@@ -54,7 +54,13 @@ def load_config(path: Path | None = None) -> Config:
             help="sherpa corpus status  (after creating ~/.sherpa/corpus.toml)",
         )
 
-    raw = tomllib.loads(path.read_text())
+    try:
+        raw = tomllib.loads(path.read_text())
+    except tomllib.TOMLDecodeError as e:
+        raise ConfigError(
+            f"malformed TOML in {path}: {e}",
+            help=f"fix {path}",
+        ) from e
     workspaces = []
     for name, entry in raw.get("workspace", {}).items():
         token_key = entry.get("token_key")
@@ -80,7 +86,24 @@ def load_config(path: Path | None = None) -> Config:
 
 def resolve_token(workspace: WorkspaceConfig, vault_path: Path | None = None) -> str:
     path = Path(vault_path or DEFAULT_VAULT_PATH).expanduser()
-    vault = json.loads(path.read_text()) if path.exists() else {}
+
+    if not path.exists():
+        raise MissingSecret(workspace.token_key)
+
+    try:
+        vault_text = path.read_text()
+        if not vault_text.strip():
+            raise MissingSecret(workspace.token_key)
+        vault = json.loads(vault_text)
+    except json.JSONDecodeError as e:
+        raise MissingSecret(workspace.token_key) from e
+
+    if not isinstance(vault, dict):
+        raise ConfigError(
+            f"vault {path} contains non-object JSON",
+            help=f"replace {path} with valid JSON object (e.g., {{}})",
+        )
+
     token = vault.get(workspace.token_key)
     if not token:
         raise MissingSecret(workspace.token_key)

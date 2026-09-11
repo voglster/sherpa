@@ -26,6 +26,18 @@ me = "U03ABC"
 token_key = "SLACK_USER_TOKEN_SIDE"
 """
 
+CONFIG_CUSTOM_DB = """
+db = "~/somewhere-else/corpus.db"
+stale_after_hours = 24
+
+[workspace.gravitate]
+token_key = "SLACK_USER_TOKEN_GRAVITATE"
+me = "U03ABC"
+
+[workspace.side]
+token_key = "SLACK_USER_TOKEN_SIDE"
+"""
+
 
 def test_load_config_reads_workspaces_in_order(tmp_path):
     path = tmp_path / "corpus.toml"
@@ -40,8 +52,10 @@ def test_load_config_reads_workspaces_in_order(tmp_path):
 
 def test_load_config_expands_db_path(tmp_path):
     path = tmp_path / "corpus.toml"
-    path.write_text(CONFIG)
-    assert load_config(path).db == Path.home() / ".sherpa" / "corpus.db"
+    path.write_text(CONFIG_CUSTOM_DB)
+    assert load_config(path).db == Path.home() / "somewhere-else" / "corpus.db"
+    # Also verify ~ is expanded
+    assert "~" not in str(load_config(path).db)
 
 
 def test_missing_config_raises_with_actionable_help(tmp_path):
@@ -76,3 +90,37 @@ def test_resolve_token_raises_missing_secret_naming_the_key(tmp_path):
     with pytest.raises(MissingSecret) as caught:
         resolve_token(workspace, vault)
     assert caught.value.key == "SLACK_USER_TOKEN_GRAVITATE"
+
+
+def test_load_config_malformed_toml_raises_config_error(tmp_path):
+    path = tmp_path / "corpus.toml"
+    path.write_text("this is not = = toml [[[")
+    with pytest.raises(ConfigError) as caught:
+        load_config(path)
+    assert caught.value.message
+    assert caught.value.help
+    assert "malformed" in caught.value.message.lower() or "error" in caught.value.message.lower()
+
+
+def test_resolve_token_empty_vault_raises_missing_secret(tmp_path):
+    from sherpa.corpus.config import WorkspaceConfig
+
+    vault = tmp_path / "vault.json"
+    vault.write_text("")
+    workspace = WorkspaceConfig(name="gravitate", token_key="SLACK_USER_TOKEN_GRAVITATE", me=None)
+    with pytest.raises(MissingSecret) as caught:
+        resolve_token(workspace, vault)
+    assert caught.value.key == "SLACK_USER_TOKEN_GRAVITATE"
+
+
+def test_resolve_token_non_object_vault_raises_config_error(tmp_path):
+    from sherpa.corpus.config import WorkspaceConfig
+
+    vault = tmp_path / "vault.json"
+    vault.write_text("[]")
+    workspace = WorkspaceConfig(name="gravitate", token_key="SLACK_USER_TOKEN_GRAVITATE", me=None)
+    with pytest.raises(ConfigError) as caught:
+        resolve_token(workspace, vault)
+    assert caught.value.message
+    assert caught.value.help
+    assert "non-object" in caught.value.message.lower() or "json" in caught.value.message.lower()
