@@ -3,6 +3,12 @@
 Slack's channel cursor does not advance when a reply lands on an old thread
 parent, so replies need their own sweep or they are lost forever — the single
 most likely way for this corpus to go quietly incomplete.
+
+The history pagination, the thread sweep, and the tier scheduler all respect
+the same wall-clock budget, and none of them may let one channel or one tier
+monopolize it: a channel with years of backlog or hundreds of live threads
+must degrade to slower, incremental progress rather than starve the rest of
+the workspace out of ever backfilling at all.
 """
 
 from __future__ import annotations
@@ -19,6 +25,17 @@ SKIP_SUBTYPES = {"tombstone", "channel_join", "channel_leave", "message_deleted"
 
 # Bounded so a large corpus does not re-fetch every thread it has ever seen on every run.
 THREAD_SWEEP_WINDOW_SECONDS = 30 * 24 * 60 * 60
+
+# Bounded so a channel with a large backlog of live threads sweeps a little more
+# of it every run instead of trying to re-verify all of it in one run and, in a
+# busy workspace, never finishing before the budget runs out.
+THREAD_SWEEP_PER_CHANNEL_CAP = 25
+
+# DMs get the largest guaranteed share since that's where the highest-value
+# content lives, but every tier gets *some* guaranteed time regardless of how
+# much backlog a higher tier has — a single busy tier-1 channel must not be
+# able to consume the whole run and leave lower tiers permanently unbackfilled.
+TIER_BUDGET_SHARE = {1: 0.5, 2: 0.3, 3: 0.2}
 
 
 @dataclass
@@ -45,26 +62,32 @@ def ingest_workspace(
     sync_directory(conn, client, workspace, me)
     resolver = Resolver(conn, workspace)
     report = IngestReport(workspace=workspace)
-    deadline = now() + budget_seconds
+    overall_deadline = now() + budget_seconds
 
-    for channel in _channels_in_tier_order(conn, workspace):
-        if now() >= deadline:
-            break
-        try:
-            report.messages += _ingest_channel(conn, client, resolver, workspace, channel, now, deadline)
-            report.channels_done += 1
-            _mark(conn, workspace, channel["id"], "ok", "")
-        except AuthError:
-            raise
-        except SlackError as error:
-            report.channels_failed.append((channel["id"], error.code))
-            _mark(conn, workspace, channel["id"], "failed", error.code)
+    for tier, channels in _channels_by_tier(conn, workspace).items():
+        share = TIER_BUDGET_SHARE.get(tier, 0.0)
+        tier_deadline = min(overall_deadline, now() + budget_seconds * share)
+
+        for channel in channels:
+            if now() >= tier_deadline:
+                break
+            try:
+                report.messages += _ingest_channel(
+                    conn, client, resolver, workspace, channel, now, tier_deadline
+                )
+                report.channels_done += 1
+                _mark(conn, workspace, channel["id"], "ok", "")
+            except AuthError:
+                raise
+            except SlackError as error:
+                report.channels_failed.append((channel["id"], error.code))
+                _mark(conn, workspace, channel["id"], "failed", error.code)
 
     conn.commit()
     return report
 
 
-def _channels_in_tier_order(conn: sqlite3.Connection, workspace: str) -> list[sqlite3.Row]:
+def _channels_by_tier(conn: sqlite3.Connection, workspace: str) -> dict[int, list[sqlite3.Row]]:
     posted_in = {
         row[0]
         for row in conn.execute(
@@ -75,14 +98,19 @@ def _channels_in_tier_order(conn: sqlite3.Connection, workspace: str) -> list[sq
     channels = conn.execute(
         "SELECT * FROM channels WHERE workspace = ? AND is_member = 1", (workspace,)
     ).fetchall()
+
+    grouped: dict[int, list[sqlite3.Row]] = {}
     for channel in channels:
+        tier = tier_for(channel, channel["id"] in posted_in)
         conn.execute(
             "INSERT INTO sync_state (workspace, channel_id, tier) VALUES (?, ?, ?)"
             " ON CONFLICT (workspace, channel_id) DO UPDATE SET tier = excluded.tier",
-            (workspace, channel["id"], tier_for(channel, channel["id"] in posted_in)),
+            (workspace, channel["id"], tier),
         )
+        grouped.setdefault(tier, []).append(channel)
     conn.commit()
-    return sorted(channels, key=lambda c: tier_for(c, c["id"] in posted_in))
+
+    return dict(sorted(grouped.items()))
 
 
 def _ingest_channel(conn, client, resolver, workspace: str, channel, now, deadline) -> int:
@@ -95,7 +123,7 @@ def _ingest_channel(conn, client, resolver, workspace: str, channel, now, deadli
 
     stored = 0
     newest = oldest
-    thread_parents: set[str] = set()
+    fresh_thread_parents: set[str] = set()
 
     for raw in client.paginate(
         "conversations.history",
@@ -104,22 +132,28 @@ def _ingest_channel(conn, client, resolver, workspace: str, channel, now, deadli
         oldest=f"{oldest}" if oldest else None,
         inclusive=False,
     ):
-        newest = max(newest, float(raw["ts"]))
-        if raw.get("reply_count"):
-            thread_parents.add(raw.get("thread_ts", raw["ts"]))
-        stored += _store(conn, resolver, workspace, channel, raw)
-
-    window_start = now() - THREAD_SWEEP_WINDOW_SECONDS
-    thread_parents |= _recently_active_thread_parents(conn, workspace, channel_id, window_start)
-
-    for parent_ts in sorted(thread_parents):
         if now() >= deadline:
             break
-        for raw in client.paginate(
-            "conversations.replies", "messages", channel=channel_id, ts=parent_ts
-        ):
-            newest = max(newest, float(raw["ts"]))
-            stored += _store(conn, resolver, workspace, channel, raw)
+        newest = max(newest, float(raw["ts"]))
+        if raw.get("reply_count"):
+            fresh_thread_parents.add(raw.get("thread_ts", raw["ts"]))
+        stored += _store(conn, resolver, workspace, channel, raw)
+
+    if now() < deadline:
+        window_start = now() - THREAD_SWEEP_WINDOW_SECONDS
+        due_thread_parents = _thread_parents_due_for_sweep(
+            conn, workspace, channel_id, window_start, exclude=fresh_thread_parents
+        )
+
+        for parent_ts in sorted(fresh_thread_parents | due_thread_parents):
+            if now() >= deadline:
+                break
+            for raw in client.paginate(
+                "conversations.replies", "messages", channel=channel_id, ts=parent_ts
+            ):
+                newest = max(newest, float(raw["ts"]))
+                stored += _store(conn, resolver, workspace, channel, raw)
+            _mark_thread_swept(conn, workspace, channel_id, parent_ts, now())
 
     conn.execute(
         "UPDATE sync_state SET last_ts = ?, updated_at = ? WHERE workspace = ? AND channel_id = ?",
@@ -129,25 +163,47 @@ def _ingest_channel(conn, client, resolver, workspace: str, channel, now, deadli
     return stored
 
 
-def _recently_active_thread_parents(
-    conn: sqlite3.Connection, workspace: str, channel_id: str, window_start: float
+def _thread_parents_due_for_sweep(
+    conn: sqlite3.Connection,
+    workspace: str,
+    channel_id: str,
+    window_start: float,
+    *,
+    exclude: set[str],
 ) -> set[str]:
     """Thread parents already in the corpus, so a reply landing on a thread the
-    cursor has already passed still gets swept on the next run.
+    cursor has already passed still gets swept eventually.
 
     Windows on each thread's most recent known message, not the parent's own
     timestamp — a thread started outside the window can still be very much
-    alive, and a thread that started inside it can already be dead.
+    alive, and a thread that started inside it can already be dead. Capped and
+    ordered least-recently-swept first so a channel with more live threads
+    than the cap allows covers its backlog gradually across runs instead of
+    either skipping most of it or blowing the run's budget on one channel.
     """
-    return {
-        str(row[0])
-        for row in conn.execute(
-            "SELECT thread_ts FROM messages"
-            " WHERE workspace = ? AND channel_id = ? AND thread_ts IS NOT NULL"
-            " GROUP BY thread_ts HAVING MAX(ts) >= ?",
-            (workspace, channel_id, window_start),
-        )
-    }
+    rows = conn.execute(
+        "SELECT active.thread_ts AS thread_ts"
+        " FROM ("
+        "   SELECT thread_ts, MAX(ts) AS latest FROM messages"
+        "   WHERE workspace = ? AND channel_id = ? AND thread_ts IS NOT NULL"
+        "   GROUP BY thread_ts HAVING MAX(ts) >= ?"
+        " ) AS active"
+        " LEFT JOIN thread_sweeps AS swept"
+        "   ON swept.workspace = ? AND swept.channel_id = ? AND swept.thread_ts = active.thread_ts"
+        " ORDER BY COALESCE(swept.last_swept, 0) ASC"
+        " LIMIT ?",
+        (workspace, channel_id, window_start, workspace, channel_id, THREAD_SWEEP_PER_CHANNEL_CAP),
+    ).fetchall()
+    return {str(row["thread_ts"]) for row in rows} - exclude
+
+
+def _mark_thread_swept(conn: sqlite3.Connection, workspace: str, channel_id: str, thread_ts: str, swept_at: float) -> None:
+    conn.execute(
+        "INSERT INTO thread_sweeps (workspace, channel_id, thread_ts, last_swept)"
+        " VALUES (?, ?, ?, ?)"
+        " ON CONFLICT (workspace, channel_id, thread_ts) DO UPDATE SET last_swept = excluded.last_swept",
+        (workspace, channel_id, float(thread_ts), swept_at),
+    )
 
 
 def _store(conn, resolver: Resolver, workspace: str, channel, raw: dict) -> int:

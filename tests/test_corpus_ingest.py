@@ -12,7 +12,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sherpa.corpus.db import open_db
-from sherpa.corpus.ingest import THREAD_SWEEP_WINDOW_SECONDS, ingest_workspace, message_id
+from sherpa.corpus.ingest import (
+    THREAD_SWEEP_PER_CHANNEL_CAP,
+    THREAD_SWEEP_WINDOW_SECONDS,
+    ingest_workspace,
+    message_id,
+)
 from sherpa.corpus.slack import AuthError, FakeSlack, SlackError
 
 DIRECTORY = {
@@ -32,6 +37,20 @@ def client_with(history, replies=None):
     pages["conversations.history"] = history
     pages["conversations.replies"] = replies or [{"ok": True, "messages": []}]
     return FakeSlack(pages)
+
+
+class TickingClock:
+    """A fake wall clock that advances by one second per call, so budget math
+    in the ingester is exercised deterministically instead of racing the real
+    clock. Shared across successive `ingest_workspace` calls in a test so time
+    keeps moving forward across runs, the way it would in production."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.t = start
+
+    def __call__(self) -> float:
+        self.t += 1.0
+        return self.t
 
 
 def test_ingest_stores_messages_with_resolved_names_and_is_me(tmp_path):
@@ -238,6 +257,101 @@ def test_thread_sweep_skips_threads_dead_for_the_entire_window(tmp_path):
 
     texts = {row[0] for row in conn.execute("SELECT text FROM messages")}
     assert "should never arrive" not in texts
+
+
+def test_history_pagination_stops_at_the_budget_and_resumes_without_loss(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = client_with([{"ok": True, "messages": [
+        {"ts": f"{i}.0", "user": "U_H", "text": f"m{i}"} for i in range(1, 61)
+    ]}])
+    clock = TickingClock()
+    report = ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=100.0, now=clock)
+
+    stored = conn.execute("SELECT count(*) FROM messages").fetchone()[0]
+    assert 0 < stored < 60
+    assert report.messages == stored
+    last_ts = conn.execute(
+        "SELECT last_ts FROM sync_state WHERE channel_id='D1'"
+    ).fetchone()[0]
+    assert last_ts == stored  # the newest message actually stored, not the newest fetched
+
+    remaining = [
+        {"ts": f"{i}.0", "user": "U_H", "text": f"m{i}"} for i in range(1, 61) if float(f"{i}.0") > last_ts
+    ]
+    client._pages["conversations.history"] = [{"ok": True, "messages": remaining}]
+    ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=100.0, now=clock)
+
+    total_stored = conn.execute("SELECT count(*) FROM messages").fetchone()[0]
+    distinct_texts = conn.execute("SELECT count(DISTINCT text) FROM messages").fetchone()[0]
+    assert total_stored == 60
+    assert distinct_texts == 60
+
+
+def test_sweep_caps_parents_per_run_and_covers_the_backlog_over_successive_runs(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    thread_count = THREAD_SWEEP_PER_CHANNEL_CAP + 5
+    parents = [
+        {"ts": f"{i}.0", "user": "U_H", "text": f"parent{i}", "thread_ts": f"{i}.0", "reply_count": 1}
+        for i in range(1, thread_count + 1)
+    ]
+    client = client_with(
+        history=[{"ok": True, "messages": parents}],
+        replies=[{"ok": True, "messages": [
+            {"ts": "1.0", "user": "U_H", "text": "reply-echo", "thread_ts": "1.0"},
+        ]}],
+    )
+    clock = TickingClock()
+    ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=100000.0, now=clock)
+
+    def swept_thread_ids() -> set[str]:
+        return {params["ts"] for method, params in client.calls if method == "conversations.replies"}
+
+    client.calls.clear()
+    client._pages["conversations.history"] = [{"ok": True, "messages": []}]
+    ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=100000.0, now=clock)
+    run2_swept = swept_thread_ids()
+    assert len(run2_swept) <= THREAD_SWEEP_PER_CHANNEL_CAP
+
+    client.calls.clear()
+    ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=100000.0, now=clock)
+    run3_swept = swept_thread_ids()
+    assert len(run3_swept) <= THREAD_SWEEP_PER_CHANNEL_CAP
+
+    all_thread_ids = {f"{i}.0" for i in range(1, thread_count + 1)}
+    assert run2_swept | run3_swept == all_thread_ids
+
+
+def test_a_busy_tier_one_channel_does_not_starve_tier_three(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    pages = dict(DIRECTORY)
+    pages["conversations.list"] = [{"ok": True, "channels": [
+        {"id": "D1", "is_im": True, "user": "U_H"},
+        {"id": "C3", "name": "other", "is_channel": True, "is_member": True},
+    ]}]
+
+    huge_backlog = [{"ts": f"{i}.0", "user": "U_H", "text": f"m{i}"} for i in range(1, 2000)]
+    small_backlog = [{"ts": "5.0", "user": "U_H", "text": "hi from C3"}]
+
+    def history(method, **params):
+        messages = huge_backlog if params.get("channel") == "D1" else small_backlog
+        return {"ok": True, "messages": messages}
+
+    pages["conversations.history"] = [{"ok": True, "messages": []}]
+    pages["conversations.replies"] = [{"ok": True, "messages": []}]
+    client = FakeSlack(pages)
+    original_call = client.call
+    client.call = lambda method, **params: (
+        history(method, **params) if method == "conversations.history" else original_call(method, **params)
+    )
+
+    clock = TickingClock()
+    report = ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=100.0, now=clock)
+
+    d1_stored = conn.execute("SELECT count(*) FROM messages WHERE channel_id = 'D1'").fetchone()[0]
+    c3_stored = conn.execute("SELECT count(*) FROM messages WHERE channel_id = 'C3'").fetchone()[0]
+    assert d1_stored < len(huge_backlog)
+    assert c3_stored > 0
+    assert "C3" not in [c for c, _ in report.channels_failed]
 
 
 def test_auth_error_propagates_rather_than_being_swallowed(tmp_path):

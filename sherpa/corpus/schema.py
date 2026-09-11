@@ -117,6 +117,17 @@ MIGRATIONS: list[str] = [
         detail     TEXT NOT NULL DEFAULT ''
     );
     """,
+    """
+    CREATE TABLE IF NOT EXISTS thread_sweeps (
+        workspace  TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        thread_ts  REAL NOT NULL,
+        last_swept REAL NOT NULL DEFAULT 0,
+        PRIMARY KEY (workspace, channel_id, thread_ts)
+    );
+
+    CREATE INDEX IF NOT EXISTS thread_sweeps_order ON thread_sweeps (workspace, channel_id, last_swept);
+    """,
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)
