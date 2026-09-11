@@ -383,6 +383,58 @@ def test_a_completed_backfill_stops_asking_for_older_pages(tmp_path):
     assert history_params(client, only_with="latest") == []
 
 
+def test_a_channel_empty_at_first_ingest_still_ingests_later_messages(tmp_path):
+    """A brand-new DM is empty the moment it first appears in conversations.list,
+    so this is the first conversation with a new colleague, not a curiosity."""
+    conn = open_db(tmp_path / "c.db")
+    history = SlackHistory([])
+    client = client_serving({"D1": history})
+
+    ingest_workspace(conn, client, "gravitate", me=None)
+    assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 0
+
+    history.add({"ts": "100.0", "user": "U_H", "text": "hey, welcome aboard"})
+    ingest_workspace(conn, client, "gravitate", me=None)
+
+    texts = {row[0] for row in conn.execute("SELECT text FROM messages")}
+    assert texts == {"hey, welcome aboard"}
+    assert conn.execute(
+        "SELECT last_ts FROM sync_state WHERE channel_id='D1'"
+    ).fetchone()[0] == 100.0
+
+
+def test_a_channel_that_stays_empty_is_not_paged_backwards_again(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = client_serving({"D1": SlackHistory([])})
+
+    ingest_workspace(conn, client, "gravitate", me=None)
+    client.calls.clear()
+    report = ingest_workspace(conn, client, "gravitate", me=None)
+
+    assert report.messages == 0
+    assert report.channels_failed == []
+    assert history_params(client, only_with="latest") == []
+    # one forward look and nothing else: a finished backfill is not re-attempted
+    # just because the channel never had anything below the cursor.
+    assert len(history_params(client)) == 1
+
+
+def test_a_completed_backfill_still_catches_up_on_new_messages(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    history = SlackHistory([{"ts": f"{i}.0", "user": "U_H", "text": f"m{i}"} for i in range(1, 301)])
+    client = client_serving({"D1": history})
+
+    ingest_workspace(conn, client, "gravitate", me=None)
+    assert _backfill_complete(conn)
+
+    history.add({"ts": "900.0", "user": "U_H", "text": "posted after the backfill finished"})
+    ingest_workspace(conn, client, "gravitate", me=None)
+
+    texts = {row[0] for row in conn.execute("SELECT text FROM messages")}
+    assert "posted after the backfill finished" in texts
+    assert len(texts) == 301
+
+
 def test_a_swept_reply_does_not_advance_the_history_cursor(tmp_path):
     """A reply can be newer than main-channel messages the run has not reached
     yet; letting it raise the history cursor steps straight over them."""

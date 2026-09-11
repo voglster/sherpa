@@ -128,13 +128,18 @@ def _ingest_channel(conn, client, resolver, workspace: str, channel, now, deadli
     `sync_state.last_ts` is the top of that window and `backfill_state.oldest_ts`
     the bottom. Forward catch-up raises the top, backward backfill lowers the
     bottom, and everything between them is known to be stored.
+
+    The two ends move independently. A finished backfill says only that there is
+    nothing older left to fetch; catch-up keeps running for the life of the
+    channel, including for a channel that was empty when first seen and has a
+    bottom cursor of nothing at all.
     """
     channel_id = channel["id"]
-    covered_from, backfill_complete = _backfill_state(conn, workspace, channel_id)
+    visited, covered_from, backfill_complete = _backfill_state(conn, workspace, channel_id)
     thread_parents: set[str] = set()
     stored = 0
 
-    if covered_from is not None:
+    if visited:
         stored += _catch_up(
             conn, client, resolver, workspace, channel, thread_parents, now, deadline
         )
@@ -166,6 +171,7 @@ def _catch_up(conn, client, resolver, workspace: str, channel, thread_parents, n
 
     stored = 0
     newest = last_ts
+    oldest_seen = None
     completed = True
 
     for raw in client.paginate(
@@ -179,6 +185,7 @@ def _catch_up(conn, client, resolver, workspace: str, channel, thread_parents, n
             completed = False
             break
         newest = max(newest, float(raw["ts"]))
+        oldest_seen = min(oldest_seen or float(raw["ts"]), float(raw["ts"]))
         if raw.get("reply_count"):
             thread_parents.add(raw.get("thread_ts", raw["ts"]))
         stored += _store(conn, resolver, workspace, channel, raw)
@@ -189,6 +196,14 @@ def _catch_up(conn, client, resolver, workspace: str, channel, thread_parents, n
             " WHERE workspace = ? AND channel_id = ?",
             (newest, time.time(), workspace, channel_id),
         )
+        if not last_ts and oldest_seen is not None:
+            # This pass carried no lower bound, so it read the channel to its
+            # start: the floor is whatever it found there.
+            conn.execute(
+                "UPDATE backfill_state SET oldest_ts = COALESCE(oldest_ts, ?), updated_at = ?"
+                " WHERE workspace = ? AND channel_id = ?",
+                (oldest_seen, time.time(), workspace, channel_id),
+            )
     conn.commit()
     return stored
 
@@ -280,14 +295,23 @@ def _sweep_threads(
     return stored
 
 
-def _backfill_state(conn, workspace: str, channel_id: str) -> tuple[float | None, bool]:
+def _backfill_state(conn, workspace: str, channel_id: str) -> tuple[bool, float | None, bool]:
+    """Whether the channel has been visited, its coverage floor, and whether
+    backward paging is finished.
+
+    Visited and floor are separate answers: a channel that was empty the first
+    time it was read has been visited and has no floor, and reading the missing
+    floor as "never visited" is what would strand it — a brand-new DM is empty
+    at the moment it first appears, so that is the first conversation with a new
+    colleague, not a curiosity.
+    """
     row = conn.execute(
         "SELECT oldest_ts, complete FROM backfill_state WHERE workspace = ? AND channel_id = ?",
         (workspace, channel_id),
     ).fetchone()
     if row is None:
-        return None, False
-    return row["oldest_ts"], bool(row["complete"])
+        return False, None, False
+    return True, row["oldest_ts"], bool(row["complete"])
 
 
 def _finish_backfill(conn, workspace: str, channel_id: str) -> None:
