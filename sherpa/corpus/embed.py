@@ -7,6 +7,7 @@ every question, just worse, and nothing about the answer says so.
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import struct
 from typing import Any, Protocol
@@ -61,7 +62,14 @@ class GatewayEmbedder:
         if response.status_code != 200:
             raise EmbeddingError(f"embedding gateway returned HTTP {response.status_code}")
 
-        vectors = [item["embedding"] for item in response.json().get("data", [])]
+        try:
+            body = response.json()
+            vectors = [item["embedding"] for item in body.get("data", [])]
+        except Exception as error:
+            raise EmbeddingError(
+                f"embedding gateway returned an unparseable body: {error}"
+            ) from error
+
         if len(vectors) != len(texts):
             raise EmbeddingError(
                 f"embedding gateway returned {len(vectors)} vectors for {len(texts)} inputs"
@@ -74,8 +82,18 @@ class GatewayEmbedder:
         return vectors
 
 
+def _stable_hash(text: str) -> int:
+    return int.from_bytes(hashlib.sha256(text.encode("utf-8")).digest(), "big")
+
+
 class FakeEmbedder:
-    """Deterministic vectors for tests; records what it was asked to embed."""
+    """Deterministic vectors for tests; records what it was asked to embed.
+
+    Uses a SHA-256-derived hash rather than Python's ``hash()``, which is
+    salted per process -- a vector compared across process invocations (as
+    Task 9's fixtures may do) needs to be reproducible, not merely stable
+    within one run.
+    """
 
     def __init__(self, dim: int = EMBED_DIM) -> None:
         self.dim = dim
@@ -85,7 +103,9 @@ class FakeEmbedder:
     def embed(self, texts: list[str]) -> list[list[float]]:
         self.seen.extend(texts)
         self.batches.append(list(texts))
-        return [[float((hash(t) >> i) % 7) / 7.0 for i in range(self.dim)] for t in texts]
+        return [
+            [float((_stable_hash(t) >> i) % 7) / 7.0 for i in range(self.dim)] for t in texts
+        ]
 
 
 def _pack(vector: list[float]) -> bytes:
@@ -102,13 +122,22 @@ def embed_pending(conn: sqlite3.Connection, embedder: Embedder, *, batch: int = 
         window = pending[start : start + batch]
         texts = [f"{row['header']}\n{row['text']}" for row in window]
         vectors = embedder.embed(texts)
-        for row, vector in zip(window, vectors):
-            conn.execute("DELETE FROM chunks_vec WHERE chunk_id = ?", (row["id"],))
-            conn.execute(
-                "INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, ?)",
-                (row["id"], _pack(vector)),
+        if len(vectors) != len(window):
+            raise EmbeddingError(
+                f"embedder returned {len(vectors)} vectors for {len(window)} inputs"
             )
-            conn.execute("UPDATE chunks SET embedded = 1 WHERE id = ?", (row["id"],))
+
+        try:
+            for row, vector in zip(window, vectors):
+                conn.execute("DELETE FROM chunks_vec WHERE chunk_id = ?", (row["id"],))
+                conn.execute(
+                    "INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, ?)",
+                    (row["id"], _pack(vector)),
+                )
+                conn.execute("UPDATE chunks SET embedded = 1 WHERE id = ?", (row["id"],))
+        except Exception:
+            conn.rollback()
+            raise
         conn.commit()
         done += len(window)
 
