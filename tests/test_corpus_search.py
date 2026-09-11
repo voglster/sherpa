@@ -5,6 +5,7 @@ Run: uv run --with pytest --with sqlite-vec pytest tests/test_corpus_search.py -
 
 from __future__ import annotations
 
+import struct
 import sys
 from pathlib import Path
 
@@ -133,10 +134,84 @@ def test_context_widens_the_hydrated_range(corpus):
     assert len(wide[0].transcript) >= len(narrow[0].transcript)
 
 
-def test_overlapping_hits_are_merged_not_returned_twice(corpus):
-    hits = search(corpus, "I'll", FakeEmbedder(), filters=Filters(), k=10)
-    starts = [hit.start_ts for hit in hits]
-    assert len(starts) == len(set(starts))
+def test_overlapping_hits_are_merged_not_returned_twice(tmp_path):
+    """Chunk windows overlap by design: a channel long enough to split
+    (chunk.MAX_MESSAGES) carries chunk.OVERLAP messages into the next window,
+    so two chunks can share messages while starting at different ones. A bare
+    `start_ts` equality check misses this -- it only catches two hits that
+    happen to start at the identical message, not two that genuinely overlap.
+    This fixture forces a real overlap: 42 closely-spaced messages in one
+    channel split into two windows sharing messages 38-39, both matching the
+    query, so a correct implementation must recognize the overlap and return
+    only one hit. Do not shrink this fixture -- a handful of messages can't
+    trigger the MAX_MESSAGES split this test depends on.
+    """
+    conn = open_db(tmp_path / "overlap.db")
+    for i in range(42):
+        text = "shared_marker filler" if i in (38, 39) else f"filler message {i}"
+        insert(conn, 3000.0 + i * 10, "Hunter Reeves", text, channel="DOVERLAP")
+    conn.commit()
+    build_chunks(conn, "gravitate", "DOVERLAP")
+    embed_pending(conn, FakeEmbedder())
+
+    hits = search(conn, "shared_marker", FakeEmbedder(), filters=Filters(channel="DOVERLAP"), k=10)
+    assert len(hits) == 1
+
+
+def test_hard_filter_finds_true_nearest_within_filter_not_global_topn(tmp_path):
+    """A global-KNN-then-intersect implementation looks correct on a tiny
+    fixture only because the whole corpus fits inside the global top-k. At
+    real scale it silently fails: the true nearest neighbours *within* a
+    filtered conversation routinely rank outside the global top-k, so a
+    `--from hunter` query with a real semantic match inside Hunter's
+    conversation returns nothing, because that match never reaches the
+    global candidate window that gets intersected with the filter afterward.
+
+    This fixture makes the two behaviors diverge on purpose: thousands of
+    background chunks are deliberately placed CLOSER to the query vector than
+    the one real, filtered-in chunk. A global top-CANDIDATES KNN never reaches
+    the real chunk; a genuinely pre-filtered KNN (searching only within the
+    allowed set) finds it immediately, since it is the only candidate.
+    BACKGROUND_CHUNK_COUNT must stay large enough that CANDIDATES (50) cannot
+    cover it -- do not shrink this fixture "to make it faster"; a small one
+    cannot express this bug at all.
+    """
+    BACKGROUND_CHUNK_COUNT = 6000
+    conn = open_db(tmp_path / "scale.db")
+    dim = EMBED_DIM
+
+    query_vector = [0.0] * dim
+    background_vector = struct.pack(f"{dim}f", *_vector_at_distance(0.05))
+
+    conn.executemany(
+        "INSERT INTO chunks (id, workspace, channel_id, start_ts, end_ts, participants,"
+        " msg_first_id, msg_last_id, header, text, content_hash, embedded)"
+        " VALUES (?, 'gravitate', 'noise', 0, 0, 'Nobody', ?, ?, 'h', 't', ?, 1)",
+        [(i, f"x{i}a", f"x{i}b", f"hash{i}") for i in range(1, BACKGROUND_CHUNK_COUNT + 1)],
+    )
+    conn.executemany(
+        "INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, ?)",
+        [(i, background_vector) for i in range(1, BACKGROUND_CHUNK_COUNT + 1)],
+    )
+
+    insert(conn, 1000.0, "Hunter Reeves", "the real answer is monday", channel="DHUNTER")
+    insert(conn, 1010.0, "Jim Vogel", "great, thanks", is_me=1, channel="DHUNTER")
+    conn.commit()
+    build_chunks(conn, "gravitate", "DHUNTER")
+    allowed_chunk_id = conn.execute(
+        "SELECT id FROM chunks WHERE channel_id = 'DHUNTER'"
+    ).fetchone()[0]
+    conn.execute(
+        "INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, ?)",
+        (allowed_chunk_id, struct.pack(f"{dim}f", *_vector_at_distance(0.5))),
+    )
+    conn.execute("UPDATE chunks SET embedded = 1 WHERE id = ?", (allowed_chunk_id,))
+    conn.commit()
+
+    query = "distinctive_query_term_not_in_corpus"
+    embedder = ScriptedEmbedder({query: query_vector}, _vector_at_distance(0.05))
+    hits = search(conn, query, embedder, filters=Filters(person="Hunter Reeves"), k=5)
+    assert any("the real answer is monday" in hit.transcript for hit in hits)
 
 
 def test_conversation_with_returns_both_directions_newest_first(corpus):

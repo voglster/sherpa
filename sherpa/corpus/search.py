@@ -21,6 +21,13 @@ from sherpa.corpus.embed import Embedder
 RRF_K = 60
 CANDIDATES = 50
 
+# Conservative bound for how many chunk ids we inline as `?` placeholders in a
+# single statement. SQLite's actual limit varies by build (999 historically,
+# 32766 by default since 3.32.0); this stays well under either, leaving
+# headroom for the other bound parameters (the query vector, k) in the same
+# statement.
+IN_CLAUSE_LIMIT = 900
+
 # sqlite-vec's `MATCH ... k = ?` always returns the k nearest rows present in
 # the table, however distant -- an unfiltered KNN literally cannot express "no
 # match." Left alone, that means a query about something the corpus has never
@@ -54,6 +61,7 @@ class Hit:
     channel: str
     workspace: str
     start_ts: float
+    end_ts: float
 
 
 def _where(filters: Filters) -> tuple[str, list]:
@@ -103,34 +111,77 @@ def _fts_query(query: str) -> str:
 
 
 def _knn_ranked(conn, query: str, embedder: Embedder, filters: Filters) -> list[int]:
-    """KNN restricted to the filtered chunk set.
+    """KNN restricted to the filtered chunk set -- genuinely pre-filtered, never
+    a global top-N intersected with the filter afterward.
 
-    The brief's single-statement form (`embedding MATCH ? AND k = ? AND chunk_id
-    IN (...)`) errors under sqlite-vec: a KNN MATCH cannot be combined with an
-    auxiliary `IN` predicate in the same query (sqlite3.OperationalError). So the
-    KNN runs unfiltered with a widened k, and the filtered id set is intersected
-    in Python. This also sidesteps the brief's noted ~10k-placeholder SQLite
-    variable limit on the inlined id list, since that list never becomes SQL
-    parameters here.
+    A global-KNN-then-intersect approach looks equivalent in a small corpus,
+    but is not: at real scale, the true nearest neighbours *within* a filtered
+    set (e.g. one person's whole conversation) routinely rank outside the
+    global top `k`, so post-filtering finds nothing even when strong matches
+    exist inside the filter. `--from hunter` must search hunter's conversation,
+    not the global top 50 filtered down to hunter's conversation.
+
+    This was going to issue `embedding MATCH ? AND k = ? AND chunk_id IN (...)`
+    directly, on the assumption that sqlite-vec applies the `IN` predicate as a
+    genuine pre-filter. Verified directly against this repo's sqlite-vec build
+    (v0.1.9) that it does not: `MATCH ... k = ? AND chunk_id IN (...)` computes
+    the global top-`k` nearest neighbours FIRST, over the whole `chunks_vec`
+    table, and only then filters those k rows by the `IN` list. An allowed row
+    that ranks outside the global top `k` is dropped even though the `IN`
+    clause names it explicitly -- the exact same failure as intersecting a
+    global ranking in Python, just moved inside the SQL statement. Confirmed
+    with a minimal repro (0.1.9): 100 background vectors closer than one
+    `IN`-listed target reliably drop that target at k=50 and k=100, and only
+    return it once k exceeds the number of closer background rows.
+
+    So there is no KNN form of MATCH that can be trusted to pre-filter here.
+    Instead this fetches the stored embeddings for exactly the allowed chunk
+    ids -- by primary-key `IN (...)` lookup with no MATCH clause, which *is* an
+    exact, unranked filter -- and computes L2 distance against them directly in
+    Python, batched to respect IN_CLAUSE_LIMIT. Slower than a native ANN
+    lookup, but the only form verified correct at any corpus size: it always
+    ranks strictly within the filtered set, never the global corpus.
 
     Rows beyond KNN_DISTANCE_FLOOR are dropped: a chunk BM25 also found still
     enters the fused results through the BM25 ranking regardless of distance,
     but a chunk only vector search surfaces must actually be close.
     """
     clause, params = _where(filters)
-    allowed = {row[0] for row in conn.execute(f"SELECT c.id FROM chunks c WHERE {clause}", params).fetchall()}
+    allowed = [row[0] for row in conn.execute(f"SELECT c.id FROM chunks c WHERE {clause}", params).fetchall()]
     if not allowed:
         return []
 
     vector = embedder.embed([query])[0]
-    widened_k = max(CANDIDATES, len(allowed))
-    rows = conn.execute(
-        "SELECT chunk_id, distance FROM chunks_vec WHERE embedding MATCH ? AND k = ? ORDER BY distance",
-        [struct.pack(f"{len(vector)}f", *vector), widened_k],
-    ).fetchall()
-    return [
-        row[0] for row in rows if row[0] in allowed and row[1] <= KNN_DISTANCE_FLOOR
-    ][:CANDIDATES]
+    rows = _knn_within_allowed(conn, vector, allowed)
+    return [row[0] for row in rows if row[1] <= KNN_DISTANCE_FLOOR][:CANDIDATES]
+
+
+def _knn_within_allowed(conn, vector: list[float], allowed: list[int]) -> list[tuple[int, float]]:
+    """Rank exactly the allowed chunks by distance -- a real pre-filtered search.
+
+    Fetches only the allowed embeddings (by primary-key `IN (...)`, batched to
+    respect IN_CLAUSE_LIMIT -- a plain lookup, not a MATCH/KNN query, so it is
+    an exact filter unaffected by any top-k ranking) and computes L2 distance
+    in Python. See _knn_ranked's docstring for why sqlite-vec's own MATCH + IN
+    form cannot be used for this instead.
+    """
+    embeddings: dict[int, bytes] = {}
+    for start in range(0, len(allowed), IN_CLAUSE_LIMIT):
+        batch = allowed[start : start + IN_CLAUSE_LIMIT]
+        placeholders = ",".join("?" * len(batch))
+        for chunk_id, blob in conn.execute(
+            f"SELECT chunk_id, embedding FROM chunks_vec WHERE chunk_id IN ({placeholders})", batch
+        ):
+            embeddings[chunk_id] = blob
+
+    dim = len(vector)
+    scored = []
+    for chunk_id, blob in embeddings.items():
+        candidate = struct.unpack(f"{dim}f", blob)
+        distance = sum((a - b) ** 2 for a, b in zip(vector, candidate)) ** 0.5
+        scored.append((chunk_id, distance))
+    scored.sort(key=lambda pair: pair[1])
+    return scored[:CANDIDATES]
 
 
 def _fuse(*rankings: list[int]) -> list[tuple[int, float]]:
@@ -171,7 +222,20 @@ def search(
 
 
 def _overlaps(a: Hit, b: Hit) -> bool:
-    return a.channel == b.channel and a.workspace == b.workspace and a.start_ts == b.start_ts
+    """True interval overlap, not equal start times.
+
+    Chunks overlap by design (OVERLAP messages carried into the next window),
+    and `context` widening extends a hydrated range further into its
+    neighbours. Two hits covering the same conversation routinely start at
+    different messages, so a bare `start_ts` equality check misses the
+    duplicate-transcript case this function exists to catch.
+    """
+    return (
+        a.channel == b.channel
+        and a.workspace == b.workspace
+        and a.start_ts <= b.end_ts
+        and b.start_ts <= a.end_ts
+    )
 
 
 def _hydrate(conn, chunk_id: int, score: float, context: int) -> Hit | None:
@@ -210,6 +274,7 @@ def _hydrate(conn, chunk_id: int, score: float, context: int) -> Hit | None:
         channel=chunk["channel_id"],
         workspace=chunk["workspace"],
         start_ts=messages[0]["ts"],
+        end_ts=messages[-1]["ts"],
     )
 
 
