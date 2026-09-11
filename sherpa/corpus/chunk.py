@@ -73,13 +73,26 @@ def roster(conn: sqlite3.Connection, workspace: str, channel_id: str) -> list[st
 
 
 def rechunk_all(conn: sqlite3.Connection, workspace: str) -> int:
+    """Rebuild every channel. A whole-workspace pass -- for a one-off repair,
+    not for the cron path, which rebuilds only what changed."""
     channels = [
         row[0]
         for row in conn.execute(
             "SELECT DISTINCT channel_id FROM messages WHERE workspace = ?", (workspace,)
         )
     ]
-    return sum(build_chunks(conn, workspace, channel_id) for channel_id in channels)
+    return rechunk_channels(conn, workspace, channels)
+
+
+def rechunk_channels(conn: sqlite3.Connection, workspace: str, channel_ids) -> int:
+    """Rebuild exactly the named channels.
+
+    Re-windowing the whole workspace on every cron run fully materializes every
+    message in it -- 500k at the design's sizing -- to rediscover that almost
+    nothing moved, which is the work `content_hash` exists to avoid. A channel
+    that took no messages this run cannot have produced a different windowing.
+    """
+    return sum(build_chunks(conn, workspace, channel_id) for channel_id in sorted(channel_ids))
 
 
 def build_chunks(conn: sqlite3.Connection, workspace: str, channel_id: str) -> int:
@@ -137,7 +150,7 @@ def _delete_stale(
     ]
     for chunk_id in stale:
         conn.execute("DELETE FROM chunks WHERE id = ?", (chunk_id,))
-        conn.execute("DELETE FROM chunks_fts WHERE chunk_id = ?", (chunk_id,))
+        conn.execute("DELETE FROM chunks_fts WHERE rowid = ?", (chunk_id,))
         conn.execute("DELETE FROM chunks_vec WHERE chunk_id = ?", (chunk_id,))
 
 
@@ -212,7 +225,7 @@ def _write(
 
     if existing:
         conn.execute("DELETE FROM chunks WHERE id = ?", (existing["id"],))
-        conn.execute("DELETE FROM chunks_fts WHERE chunk_id = ?", (existing["id"],))
+        conn.execute("DELETE FROM chunks_fts WHERE rowid = ?", (existing["id"],))
         conn.execute("DELETE FROM chunks_vec WHERE chunk_id = ?", (existing["id"],))
 
     cursor = conn.execute(
@@ -235,7 +248,8 @@ def _write(
         ),
     )
     conn.execute(
-        "INSERT INTO chunks_fts (chunk_id, header, text, participants) VALUES (?, ?, ?, ?)",
-        (cursor.lastrowid, header, text, people),
+        "INSERT INTO chunks_fts (rowid, chunk_id, header, text, participants)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (cursor.lastrowid, cursor.lastrowid, header, text, people),
     )
     return 1

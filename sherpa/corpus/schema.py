@@ -138,6 +138,16 @@ MIGRATIONS: list[str] = [
         PRIMARY KEY (workspace, channel_id)
     );
     """,
+    # chunks_fts rows are keyed by the chunk's own id as the fts rowid, so a
+    # rebuild deletes by rowid instead of scanning an UNINDEXED column, which at
+    # 50k chunks is a full index scan per changed window. Rows written before
+    # that took an autoincremented rowid; rebuild them from `chunks`, which is
+    # their only source of truth anyway.
+    """
+    DELETE FROM chunks_fts;
+    INSERT INTO chunks_fts (rowid, chunk_id, header, text, participants)
+        SELECT id, id, header, text, participants FROM chunks;
+    """,
 ]
 
 # Indexes over added columns. Applied after COLUMN_ADDITIONS on every open, for

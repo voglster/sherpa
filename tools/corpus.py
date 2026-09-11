@@ -70,7 +70,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sherpa.render import bin_line, emit, fail, parse_strict, truncate
 
-from sherpa.corpus.chunk import rechunk_all
+from sherpa.corpus.chunk import rechunk_channels
 from sherpa.corpus.config import ConfigError, MissingSecret, load_config, resolve_token
 from sherpa.corpus.db import open_db
 from sherpa.corpus.embed import DEFAULT_BASE_URL, DEFAULT_MODEL, EmbeddingError, GatewayEmbedder, embed_pending
@@ -384,7 +384,7 @@ def cmd_sync(args, config) -> int:
                 help="sherpa corpus sync",
             )
 
-        rechunk_all(conn, workspace.name)
+        rechunk_channels(conn, workspace.name, report.channels_touched)
         try:
             embedded = embed_pending(conn, make_embedder(args.vault))
         except EmbeddingError as error:

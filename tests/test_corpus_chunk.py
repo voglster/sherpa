@@ -270,3 +270,52 @@ def test_channel_membership_reaches_the_fts_index_too(conn):
     assert conn.execute(
         "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH '\"Hunter\"'"
     ).fetchone()[0] == 1
+
+
+def test_the_fts_row_is_addressable_by_rowid_not_a_full_scan(conn):
+    """`chunks_fts.chunk_id` is UNINDEXED, so deleting by it scans the whole
+    index -- once per changed window, over 50k chunks, inside a cron run's
+    wall-clock budget. Keying the fts row by the chunk's own id makes it a
+    lookup instead."""
+    insert(conn, 1757606400.000100, "Jim Vogel", "hello")
+    insert(conn, 1757610000.000100, "Jim Vogel", "much later")
+    conn.commit()
+    build_chunks(conn, "w", "C1")
+
+    for chunk_id in [row[0] for row in conn.execute("SELECT id FROM chunks")]:
+        assert conn.execute(
+            "SELECT chunk_id FROM chunks_fts WHERE rowid = ?", (chunk_id,)
+        ).fetchone()[0] == chunk_id
+
+
+def test_an_older_database_has_its_fts_rowids_repaired_on_open(tmp_path):
+    """Rows written before the rowid keying took an autoincremented rowid of
+    their own, so a delete by rowid would miss them and leave the index holding
+    a chunk that no longer exists."""
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    conn = open_db(path)
+    conn.execute(
+        "INSERT INTO chunks (id, workspace, channel_id, start_ts, end_ts, participants,"
+        " msg_first_id, msg_last_id, header, text, content_hash)"
+        " VALUES (5, 'w', 'C1', 1.0, 2.0, 'Jim Vogel', 'a', 'b', 'hdr', 'body', 'h')"
+    )
+    conn.execute("DELETE FROM chunks_fts")
+    conn.execute(
+        "INSERT INTO chunks_fts (rowid, chunk_id, header, text, participants)"
+        " VALUES (100, 5, 'hdr', 'body', 'Jim Vogel')"
+    )
+    conn.commit()
+    conn.close()
+
+    raw = sqlite3.connect(path)
+    raw.execute("PRAGMA user_version = 3")
+    raw.commit()
+    raw.close()
+
+    conn = open_db(path)
+    assert conn.execute(
+        "SELECT chunk_id FROM chunks_fts WHERE rowid = 5"
+    ).fetchone()[0] == 5
+    assert conn.execute("SELECT count(*) FROM chunks_fts").fetchone()[0] == 1

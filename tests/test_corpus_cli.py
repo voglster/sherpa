@@ -463,7 +463,10 @@ def test_sync_also_chunks_and_embeds(workspace, monkeypatch, capsys):
         _insert_message(conn, 1000.0, "Hunter Reeves", "can you take the flag work?")
         _insert_message(conn, 1060.0, "Jim Vogel", "yeah I'll have it thursday", is_me=1)
         conn.commit()
-        return IngestReport(workspace=name, messages=2, channels_done=1, channels_failed=[])
+        return IngestReport(
+            workspace=name, messages=2, channels_done=1, channels_failed=[],
+            channels_touched={"D1"},
+        )
 
     monkeypatch.setattr(corpus_tool, "ingest_workspace", _fake_ingest)
 
@@ -551,3 +554,39 @@ def test_operations_declares_every_subcommand():
     assert {"search", "with", "owed", "thread", "sync", "status"} == declared
     assert meta["operations"]["sync"]["tier"] == "write"
     assert meta["operations"]["search"]["tier"] == "read"
+
+
+def test_sync_rechunks_only_the_channels_that_received_messages(workspace, monkeypatch, capsys):
+    """Re-windowing every channel on every cron run fully materializes the whole
+    workspace -- 500k messages at the design's sizing -- and reissues a delete
+    against chunks_fts for each changed window, all inside the wall-clock budget
+    the tiered ingest exists to respect. Only channels that actually took
+    messages this run need rebuilding."""
+    config, vault = workspace
+    monkeypatch.setattr(corpus_tool, "notify", lambda *a, **k: None)
+    monkeypatch.setattr(corpus_tool, "HttpSlackClient", lambda token: object())
+    monkeypatch.setattr(corpus_tool, "make_embedder", lambda vault=None: FakeEmbedder())
+
+    conn = open_db(config.parent / "c.db")
+    _insert_message(conn, 1757606400.000100, "Hunter Reeves", "untouched channel",
+                    channel="DOLD", name="Hunter Reeves")
+    conn.commit()
+    conn.close()
+
+    def _fake_ingest(conn, client, name, me, budget_seconds):
+        _insert_message(conn, 1757606500.000100, "Hunter Reeves", "can you take the flag work?")
+        _insert_message(conn, 1757606560.000100, "Jim Vogel", "yeah I'll have it thursday", is_me=1)
+        conn.commit()
+        return IngestReport(
+            workspace=name, messages=2, channels_done=1, channels_touched={"D1"}
+        )
+
+    monkeypatch.setattr(corpus_tool, "ingest_workspace", _fake_ingest)
+
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(["sync", "--config", str(config), "--vault", str(vault), "--json"])
+    assert caught.value.code == 0
+
+    conn = open_db(config.parent / "c.db")
+    chunked = {row[0] for row in conn.execute("SELECT DISTINCT channel_id FROM chunks")}
+    assert chunked == {"D1"}

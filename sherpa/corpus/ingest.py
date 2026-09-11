@@ -60,6 +60,7 @@ class IngestReport:
     channels_done: int = 0
     channels_failed: list[tuple[str, str]] = field(default_factory=list)
     threads_failed: list[tuple[str, str, str]] = field(default_factory=list)
+    channels_touched: set[str] = field(default_factory=set)
 
 
 def message_id(workspace: str, channel_id: str, ts: str) -> str:
@@ -88,9 +89,12 @@ def ingest_workspace(
             if now() >= tier_deadline:
                 break
             try:
-                report.messages += _ingest_channel(
+                stored = _ingest_channel(
                     conn, client, resolver, workspace, channel, now, tier_deadline, report
                 )
+                report.messages += stored
+                if stored:
+                    report.channels_touched.add(channel["id"])
                 report.channels_done += 1
                 _mark(conn, workspace, channel["id"], "ok", "")
             except AuthError:
@@ -336,13 +340,15 @@ def _sweep_threads(
                 # The parent is gone from Slack, so the thread is gone here too.
                 # This is the one deletion the API actually lets us observe.
                 _forget_thread(conn, workspace, channel_id, parent_ts)
+                report.channels_touched.add(channel_id)
                 continue
             # One unreachable thread must not mark the whole channel failed —
             # that would fail every run, for every channel holding it. It is
             # still reported, and the run still exits non-zero.
             report.threads_failed.append((channel_id, parent_ts, error.code))
             continue
-        _reconcile_thread(conn, workspace, channel_id, parent_ts, seen)
+        if _reconcile_thread(conn, workspace, channel_id, parent_ts, seen):
+            report.channels_touched.add(channel_id)
         _mark_thread_swept(conn, workspace, channel_id, parent_ts, now())
     conn.commit()
     return stored
@@ -380,18 +386,19 @@ def _forget_thread(conn, workspace: str, channel_id: str, parent_ts: str) -> Non
     )
 
 
-def _reconcile_thread(conn, workspace: str, channel_id: str, parent_ts: str, seen: list[str]) -> None:
+def _reconcile_thread(conn, workspace: str, channel_id: str, parent_ts: str, seen: list[str]) -> int:
     """Drop stored replies Slack no longer serves for this thread.
 
     `conversations.replies` returns the thread as it stands now, so a reply
     missing from a complete re-read was deleted. This is the only place the
     corpus can observe a deletion at all — see the note in the design report.
     """
+    removed = 0
     if parent_ts not in seen:
         # conversations.replies always leads with the parent. A read that does
         # not contain it is not a trustworthy picture of the thread, and
         # deleting against it would throw away messages that still exist.
-        return
+        return removed
     stored = {
         row[0]
         for row in conn.execute(
@@ -404,6 +411,8 @@ def _reconcile_thread(conn, workspace: str, channel_id: str, parent_ts: str, see
             "DELETE FROM messages WHERE id = ?",
             (message_id(workspace, channel_id, ts_raw),),
         )
+        removed += 1
+    return removed
 
 
 def _backfill_state(conn, workspace: str, channel_id: str) -> tuple[bool, tuple[float | None, str], bool]:
