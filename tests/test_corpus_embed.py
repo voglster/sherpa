@@ -197,6 +197,50 @@ def test_mid_batch_write_failure_rolls_back_leaving_vector_and_flag_in_sync(tmp_
         )
 
 
+def test_a_later_batch_failure_does_not_undo_earlier_committed_batches(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    for i in range(8):
+        add_chunk(conn, i + 1)
+    conn.commit()
+
+    class FailAfterNBatches:
+        """Succeeds for the first `ok_batches` calls, then raises EmbeddingError."""
+
+        def __init__(self, ok_batches):
+            self._ok_batches = ok_batches
+            self.calls = 0
+
+        def embed(self, texts):
+            self.calls += 1
+            if self.calls > self._ok_batches:
+                raise EmbeddingError("simulated gateway failure")
+            return [[0.0] * EMBED_DIM for _ in texts]
+
+    with pytest.raises(EmbeddingError):
+        embed_pending(conn, FailAfterNBatches(ok_batches=2), batch=2)
+
+    def state(chunk_id):
+        embedded = conn.execute(
+            "SELECT embedded FROM chunks WHERE id = ?", (chunk_id,)
+        ).fetchone()[0]
+        has_vector = (
+            conn.execute(
+                "SELECT count(*) FROM chunks_vec WHERE chunk_id = ?", (chunk_id,)
+            ).fetchone()[0]
+            > 0
+        )
+        return embedded, has_vector
+
+    for chunk_id in (1, 2, 3, 4):  # batches 1-2: committed before the failure
+        assert state(chunk_id) == (1, True), f"chunk {chunk_id} should stay committed"
+
+    for chunk_id in (5, 6):  # batch 3: the one that failed
+        assert state(chunk_id) == (0, False), f"chunk {chunk_id} should be rolled back"
+
+    for chunk_id in (7, 8):  # batch 4: never reached
+        assert state(chunk_id) == (0, False), f"chunk {chunk_id} should be untouched"
+
+
 def test_fake_embedder_vectors_are_stable_across_process_restarts():
     script = (
         "import sys; sys.path.insert(0, %r)\n"
