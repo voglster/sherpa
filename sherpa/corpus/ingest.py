@@ -17,6 +17,9 @@ from sherpa.corpus.slack import AuthError, SlackClient, SlackError
 
 SKIP_SUBTYPES = {"tombstone", "channel_join", "channel_leave", "message_deleted"}
 
+# Bounded so a large corpus does not re-fetch every thread it has ever seen on every run.
+THREAD_SWEEP_WINDOW_SECONDS = 30 * 24 * 60 * 60
+
 
 @dataclass
 class IngestReport:
@@ -48,7 +51,7 @@ def ingest_workspace(
         if now() >= deadline:
             break
         try:
-            report.messages += _ingest_channel(conn, client, resolver, workspace, channel)
+            report.messages += _ingest_channel(conn, client, resolver, workspace, channel, now, deadline)
             report.channels_done += 1
             _mark(conn, workspace, channel["id"], "ok", "")
         except AuthError:
@@ -82,7 +85,7 @@ def _channels_in_tier_order(conn: sqlite3.Connection, workspace: str) -> list[sq
     return sorted(channels, key=lambda c: tier_for(c, c["id"] in posted_in))
 
 
-def _ingest_channel(conn, client, resolver, workspace: str, channel) -> int:
+def _ingest_channel(conn, client, resolver, workspace: str, channel, now, deadline) -> int:
     channel_id = channel["id"]
     state = conn.execute(
         "SELECT last_ts FROM sync_state WHERE workspace = ? AND channel_id = ?",
@@ -92,7 +95,7 @@ def _ingest_channel(conn, client, resolver, workspace: str, channel) -> int:
 
     stored = 0
     newest = oldest
-    thread_parents: list[str] = []
+    thread_parents: set[str] = set()
 
     for raw in client.paginate(
         "conversations.history",
@@ -103,10 +106,15 @@ def _ingest_channel(conn, client, resolver, workspace: str, channel) -> int:
     ):
         newest = max(newest, float(raw["ts"]))
         if raw.get("reply_count"):
-            thread_parents.append(raw.get("thread_ts", raw["ts"]))
+            thread_parents.add(raw.get("thread_ts", raw["ts"]))
         stored += _store(conn, resolver, workspace, channel, raw)
 
-    for parent_ts in thread_parents:
+    window_start = now() - THREAD_SWEEP_WINDOW_SECONDS
+    thread_parents |= _recently_active_thread_parents(conn, workspace, channel_id, window_start)
+
+    for parent_ts in sorted(thread_parents):
+        if now() >= deadline:
+            break
         for raw in client.paginate(
             "conversations.replies", "messages", channel=channel_id, ts=parent_ts
         ):
@@ -119,6 +127,21 @@ def _ingest_channel(conn, client, resolver, workspace: str, channel) -> int:
     )
     conn.commit()
     return stored
+
+
+def _recently_active_thread_parents(
+    conn: sqlite3.Connection, workspace: str, channel_id: str, window_start: float
+) -> set[str]:
+    """Thread parents already in the corpus, so a reply landing on a thread the
+    cursor has already passed still gets swept on the next run."""
+    return {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT DISTINCT thread_ts FROM messages"
+            " WHERE workspace = ? AND channel_id = ? AND thread_ts IS NOT NULL AND thread_ts >= ?",
+            (workspace, channel_id, window_start),
+        )
+    }
 
 
 def _store(conn, resolver: Resolver, workspace: str, channel, raw: dict) -> int:

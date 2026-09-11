@@ -12,7 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sherpa.corpus.db import open_db
-from sherpa.corpus.ingest import ingest_workspace, message_id
+from sherpa.corpus.ingest import THREAD_SWEEP_WINDOW_SECONDS, ingest_workspace, message_id
 from sherpa.corpus.slack import AuthError, FakeSlack, SlackError
 
 DIRECTORY = {
@@ -116,6 +116,72 @@ def test_thread_sweep_pulls_replies_for_parents_with_reply_count(tmp_path):
     ingest_workspace(conn, client, "gravitate", me=None)
     texts = {row[0] for row in conn.execute("SELECT text FROM messages")}
     assert texts == {"parent", "on it"}
+
+
+def test_thread_sweep_finds_new_replies_on_old_threads_across_runs(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = client_with(
+        history=[{"ok": True, "messages": [
+            {"ts": "100.0", "user": "U_H", "text": "parent", "thread_ts": "100.0", "reply_count": 1},
+        ]}],
+        replies=[{"ok": True, "messages": [
+            {"ts": "100.0", "user": "U_H", "text": "parent", "thread_ts": "100.0"},
+        ]}],
+    )
+    ingest_workspace(conn, client, "gravitate", me=None, now=lambda: 100.0)
+
+    client._pages["conversations.history"] = [{"ok": True, "messages": []}]
+    client._pages["conversations.replies"] = [{"ok": True, "messages": [
+        {"ts": "100.0", "user": "U_H", "text": "parent", "thread_ts": "100.0"},
+        {"ts": "100.5", "user": "U_ME", "text": "late reply", "thread_ts": "100.0"},
+    ]}]
+    ingest_workspace(conn, client, "gravitate", me=None, now=lambda: 100.0)
+
+    texts = {row[0] for row in conn.execute("SELECT text FROM messages")}
+    assert "late reply" in texts
+
+
+def test_thread_sweep_skips_parents_older_than_the_recency_window(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = client_with(
+        history=[{"ok": True, "messages": [
+            {"ts": "100.0", "user": "U_H", "text": "parent", "thread_ts": "100.0", "reply_count": 1},
+        ]}],
+        replies=[{"ok": True, "messages": [
+            {"ts": "100.0", "user": "U_H", "text": "parent", "thread_ts": "100.0"},
+        ]}],
+    )
+    ingest_workspace(conn, client, "gravitate", me=None, now=lambda: 100.0)
+
+    client._pages["conversations.history"] = [{"ok": True, "messages": []}]
+    client._pages["conversations.replies"] = [{"ok": True, "messages": [
+        {"ts": "100.0", "user": "U_H", "text": "parent", "thread_ts": "100.0"},
+        {"ts": "100.5", "user": "U_ME", "text": "late reply", "thread_ts": "100.0"},
+    ]}]
+    stale_now = 100.0 + THREAD_SWEEP_WINDOW_SECONDS + 1000.0
+    ingest_workspace(conn, client, "gravitate", me=None, now=lambda: stale_now)
+
+    texts = {row[0] for row in conn.execute("SELECT text FROM messages")}
+    assert "late reply" not in texts
+
+
+def test_thread_sweep_does_not_duplicate_already_stored_replies(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = client_with(
+        history=[{"ok": True, "messages": [
+            {"ts": "100.0", "user": "U_H", "text": "parent", "thread_ts": "100.0", "reply_count": 1},
+        ]}],
+        replies=[{"ok": True, "messages": [
+            {"ts": "100.0", "user": "U_H", "text": "parent", "thread_ts": "100.0"},
+            {"ts": "100.5", "user": "U_ME", "text": "on it", "thread_ts": "100.0"},
+        ]}],
+    )
+    ingest_workspace(conn, client, "gravitate", me=None, now=lambda: 100.0)
+
+    client._pages["conversations.history"] = [{"ok": True, "messages": []}]
+    ingest_workspace(conn, client, "gravitate", me=None, now=lambda: 100.0)
+
+    assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 2
 
 
 def test_auth_error_propagates_rather_than_being_swallowed(tmp_path):
