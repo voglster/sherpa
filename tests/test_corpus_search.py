@@ -215,16 +215,53 @@ def test_hard_filter_finds_true_nearest_within_filter_not_global_topn(tmp_path):
 
 
 def test_conversation_with_returns_both_directions_newest_first(corpus):
-    hits = conversation_with(corpus, "Hunter Reeves")
-    assert hits
-    assert "Hunter Reeves:" in hits[0].transcript
-    assert "Jim Vogel:" in hits[0].transcript
+    page = conversation_with(corpus, "Hunter Reeves")
+    assert page.hits
+    assert "Hunter Reeves:" in page.hits[0].transcript
+    assert "Jim Vogel:" in page.hits[0].transcript
+    assert page.total == len(page.hits)
 
 
 def test_sent_to_returns_only_chunks_containing_jims_messages(corpus):
-    hits = sent_to(corpus, "Hunter Reeves")
-    assert hits
-    assert all("Jim Vogel:" in hit.transcript for hit in hits)
+    page = sent_to(corpus, "Hunter Reeves")
+    assert page.hits
+    assert all("Jim Vogel:" in hit.transcript for hit in page.hits)
+    assert page.total == len(page.hits)
+
+
+def _add_far_apart_chunks(conn, count: int) -> None:
+    """Insert `count` message pairs on D1, each separated by more than
+    chunk.GAP_SECONDS, so each pair becomes its own chunk rather than merging
+    into one continuous window."""
+    for i in range(count):
+        base = 10_000.0 + i * 5_000.0
+        insert(conn, base, "Hunter Reeves", f"extra message {i}")
+        insert(conn, base + 60.0, "Jim Vogel", f"extra reply {i}", is_me=1)
+    conn.commit()
+    build_chunks(conn, "gravitate", "D1")
+    embed_pending(conn, FakeEmbedder())
+
+
+def test_conversation_with_reports_the_true_total_beyond_the_page_limit(corpus):
+    _add_far_apart_chunks(corpus, 5)
+
+    total_page = conversation_with(corpus, "Hunter Reeves", limit=1000)
+    capped_page = conversation_with(corpus, "Hunter Reeves", limit=2)
+
+    assert capped_page.total == total_page.total
+    assert len(capped_page.hits) == 2
+    assert capped_page.total > len(capped_page.hits)
+
+
+def test_sent_to_reports_the_true_total_beyond_the_page_limit(corpus):
+    _add_far_apart_chunks(corpus, 5)
+
+    total_page = sent_to(corpus, "Hunter Reeves", limit=1000)
+    capped_page = sent_to(corpus, "Hunter Reeves", limit=2)
+
+    assert capped_page.total == total_page.total
+    assert len(capped_page.hits) == 2
+    assert capped_page.total > len(capped_page.hits)
 
 
 def test_thread_at_resolves_a_permalink_to_its_conversation(corpus):

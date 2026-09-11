@@ -10,9 +10,9 @@ categories: [slack, search, memory, knowledge]
 axi: true
 secrets: [SLACK_USER_TOKEN_GRAVITATE, LITELLM_KEY_CORPUS]
 usage: |
-  search <QUERY> [--from NAME] [--mine] [--since 30d] [--k 5] [--context 3]
-  with <NAME> [--since 30d]
-  owed <NAME>
+  search <QUERY> [--from NAME] [--mine] [--since 30d] [--channel ID] [--k 5] [--context 3]
+  with <NAME> [--since 30d] [--limit 50]
+  owed <NAME> [--limit 50]
   thread <PERMALINK>
   sync [--workspace NAME] [--budget 900]
   status
@@ -25,6 +25,7 @@ operations:
       mine: "--mine"
       since: "--since"
       workspace: "--workspace"
+      channel: "--channel"
       k: "--k"
       context: "--context"
   with:
@@ -32,9 +33,12 @@ operations:
     argv: ["with", "{person}"]
     optional:
       since: "--since"
+      limit: "--limit"
   owed:
     tier: read
     argv: ["owed", "{person}"]
+    optional:
+      limit: "--limit"
   thread:
     tier: read
     argv: ["thread", "{permalink}"]
@@ -125,6 +129,7 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
     with_parser = subparsers.add_parser("with", allow_abbrev=False)
     with_parser.add_argument("person")
     with_parser.add_argument("--since", default=None)
+    with_parser.add_argument("--limit", type=int, default=50)
     with_parser.add_argument("--config", default=None)
     with_parser.add_argument("--vault", default=None)
     with_parser.add_argument("--json", action="store_true")
@@ -133,6 +138,7 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
 
     owed_parser = subparsers.add_parser("owed", allow_abbrev=False)
     owed_parser.add_argument("person")
+    owed_parser.add_argument("--limit", type=int, default=50)
     owed_parser.add_argument("--config", default=None)
     owed_parser.add_argument("--vault", default=None)
     owed_parser.add_argument("--json", action="store_true")
@@ -212,7 +218,10 @@ def with_health(payload: dict, conn, config, stale_ok: bool) -> dict:
         return payload
     if lines := warnings(check(conn, config)):
         payload["warnings"] = lines
-        payload["help"] = ["sherpa corpus sync"]
+        # Additive, not overwriting: cmd_with/cmd_owed may already have set a
+        # pagination `help` hint (see more results with --limit N) before this
+        # runs, and both hints are legitimate at once.
+        payload["help"] = payload.get("help", []) + ["sherpa corpus sync"]
     return payload
 
 
@@ -242,11 +251,31 @@ def cmd_search(args, config) -> int:
     return 0
 
 
+def _paginated(payload: dict, page, invocation: str) -> dict:
+    """Report the true total alongside a possibly-capped page, per
+    docs/SHERPA_STANDARDS.md's "report true totals" rule: `count: N of M total`,
+    not just the page size, plus a `help` hint naming the invocation that would
+    show more when the page was actually capped.
+    """
+    payload["count"] = len(page.hits)
+    payload["total"] = page.total
+    payload["results"] = render(page.hits)
+    if page.total > len(page.hits):
+        payload["help"] = payload.get("help", []) + [invocation]
+    return payload
+
+
 def cmd_with(args, config) -> int:
     conn = open_db(config.db)
-    hits = conversation_with(conn, args.person, since=parse_since(args.since) if args.since else None)
-    payload = {"person": args.person, "count": len(hits), "results": render(hits)}
-    if not hits:
+    page = conversation_with(
+        conn, args.person, since=parse_since(args.since) if args.since else None, limit=args.limit
+    )
+    payload = _paginated(
+        {"person": args.person},
+        page,
+        f'sherpa corpus with "{args.person}" --limit {max(page.total, args.limit)}',
+    )
+    if not page.hits:
         payload["note"] = f"no conversations with {args.person!r} in the corpus"
     emit(with_health(payload, conn, config, args.stale_ok), as_json=args.json)
     return 0
@@ -254,14 +283,16 @@ def cmd_with(args, config) -> int:
 
 def cmd_owed(args, config) -> int:
     conn = open_db(config.db)
-    hits = sent_to(conn, args.person)
-    payload = {
-        "person": args.person,
-        "count": len(hits),
-        "results": render(hits),
-        "note": "Read these and summarize what was promised — this is a filter, not a classifier.",
-    }
-    if not hits:
+    page = sent_to(conn, args.person, limit=args.limit)
+    payload = _paginated(
+        {
+            "person": args.person,
+            "note": "Read these and summarize what was promised — this is a filter, not a classifier.",
+        },
+        page,
+        f'sherpa corpus owed "{args.person}" --limit {max(page.total, args.limit)}',
+    )
+    if not page.hits:
         payload["note"] = f"no messages of mine to {args.person!r} in the corpus"
     emit(with_health(payload, conn, config, args.stale_ok), as_json=args.json)
     return 0

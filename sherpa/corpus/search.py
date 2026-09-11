@@ -52,6 +52,21 @@ class Filters:
 
 
 @dataclass
+class Page:
+    """A page of hits alongside the true count of matching chunks.
+
+    `conversation_with` and `sent_to` cap what they hydrate to `limit` chunks for
+    cost reasons, but the caller must be able to tell "50 of 50 total" from "50 of
+    340 total" -- silently returning a truncated list with no total looks
+    identical to a complete answer, and a downstream agent reading it has no way
+    to know it is missing the other 290.
+    """
+
+    hits: list[Hit]
+    total: int
+
+
+@dataclass
 class Hit:
     chunk_id: int
     score: float
@@ -312,30 +327,38 @@ def _hydrate(conn, chunk_id: int, score: float, context: int) -> Hit | None:
 
 def conversation_with(
     conn: sqlite3.Connection, person: str, *, since: float | None = None, limit: int = 50
-) -> list[Hit]:
+) -> Page:
     params = [f"%{person}%"]
     clause = "participants LIKE ?"
     if since is not None:
         clause += " AND end_ts >= ?"
         params.append(since)
+    total = conn.execute(f"SELECT count(*) FROM chunks WHERE {clause}", params).fetchone()[0]
     rows = conn.execute(
         f"SELECT id FROM chunks WHERE {clause} ORDER BY start_ts DESC LIMIT ?",
         [*params, limit],
     ).fetchall()
-    return [h for h in (_hydrate(conn, row[0], 0.0, 0) for row in rows) if h]
+    hits = [h for h in (_hydrate(conn, row[0], 0.0, 0) for row in rows) if h]
+    return Page(hits=hits, total=total)
 
 
-def sent_to(conn: sqlite3.Connection, person: str, *, limit: int = 50) -> list[Hit]:
+def sent_to(conn: sqlite3.Connection, person: str, *, limit: int = 50) -> Page:
     """Chunks where Jim spoke, in a conversation involving this person."""
-    rows = conn.execute(
-        "SELECT c.id FROM chunks c WHERE c.participants LIKE ?"
+    clause = (
+        "c.participants LIKE ?"
         " AND EXISTS (SELECT 1 FROM messages m WHERE m.workspace = c.workspace"
         " AND m.channel_id = c.channel_id AND m.ts BETWEEN c.start_ts AND c.end_ts"
         " AND m.is_me = 1)"
-        " ORDER BY c.start_ts DESC LIMIT ?",
+    )
+    total = conn.execute(
+        f"SELECT count(*) FROM chunks c WHERE {clause}", (f"%{person}%",)
+    ).fetchone()[0]
+    rows = conn.execute(
+        f"SELECT c.id FROM chunks c WHERE {clause} ORDER BY c.start_ts DESC LIMIT ?",
         (f"%{person}%", limit),
     ).fetchall()
-    return [h for h in (_hydrate(conn, row[0], 0.0, 0) for row in rows) if h]
+    hits = [h for h in (_hydrate(conn, row[0], 0.0, 0) for row in rows) if h]
+    return Page(hits=hits, total=total)
 
 
 def thread_at(conn: sqlite3.Connection, permalink_or_id: str) -> Hit | None:

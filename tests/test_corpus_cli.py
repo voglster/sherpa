@@ -108,6 +108,24 @@ def _seeded_db(path):
     return conn
 
 
+def _seeded_db_with_many_chunks(path, count):
+    """Several conversation chunks with Hunter Reeves, far enough apart (beyond
+    chunk.GAP_SECONDS) that each pair of messages becomes its own chunk -- needed
+    to exercise pagination, since a single continuous conversation collapses into
+    one chunk regardless of how many messages it contains."""
+    conn = open_db(path)
+    for i in range(count):
+        base = 10_000.0 + i * 5_000.0
+        _insert_message(conn, base, "Hunter Reeves", f"message {i}")
+        _insert_message(conn, base + 60.0, "Jim Vogel", f"reply {i}", is_me=1)
+    conn.commit()
+    build_chunks(conn, "gravitate", "D1")
+    from sherpa.corpus.embed import embed_pending
+
+    embed_pending(conn, FakeEmbedder())
+    return conn
+
+
 def test_parse_since_accepts_relative_and_iso_forms():
     import time
 
@@ -248,12 +266,14 @@ def test_with_returns_conversation_and_owed_filters_to_my_messages(workspace, ca
     assert caught.value.code == 0
     with_payload = json.loads(capsys.readouterr().out)
     assert with_payload["count"] >= 1
+    assert with_payload["total"] == with_payload["count"]
 
     with pytest.raises(SystemExit) as caught:
         corpus_tool.main(["owed", "Hunter Reeves", "--config", str(config), "--stale-ok", "--json"])
     assert caught.value.code == 0
     owed_payload = json.loads(capsys.readouterr().out)
     assert owed_payload["count"] >= 1
+    assert owed_payload["total"] == owed_payload["count"]
     assert "filter" in owed_payload["note"].lower() or "summarize" in owed_payload["note"].lower()
     assert all("Jim Vogel" in r["conversation"] for r in owed_payload["results"])
 
@@ -266,7 +286,56 @@ def test_owed_with_no_conversation_reports_a_definitive_empty_state(workspace, c
     assert caught.value.code == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["count"] == 0
+    assert payload["total"] == 0
     assert "Nobody Ever" in payload["note"]
+
+
+def test_owed_reports_the_true_total_when_capped_and_limit_expands_it(workspace, capsys):
+    config, _ = workspace
+    _seeded_db_with_many_chunks(config.parent / "c.db", 5).close()
+
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(
+            ["owed", "Hunter Reeves", "--limit", "2", "--config", str(config), "--stale-ok", "--json"]
+        )
+    assert caught.value.code == 0
+    capped = json.loads(capsys.readouterr().out)
+    assert capped["count"] == 2
+    assert capped["total"] == 5
+    assert capped["help"] == ['sherpa corpus owed "Hunter Reeves" --limit 5']
+
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(
+            ["owed", "Hunter Reeves", "--limit", "5", "--config", str(config), "--stale-ok", "--json"]
+        )
+    assert caught.value.code == 0
+    full = json.loads(capsys.readouterr().out)
+    assert full["count"] == 5
+    assert full["total"] == 5
+    assert "help" not in full
+
+
+def test_with_reports_the_true_total_when_capped_and_limit_expands_it(workspace, capsys):
+    config, _ = workspace
+    _seeded_db_with_many_chunks(config.parent / "c.db", 5).close()
+
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(
+            ["with", "Hunter Reeves", "--limit", "2", "--config", str(config), "--stale-ok", "--json"]
+        )
+    assert caught.value.code == 0
+    capped = json.loads(capsys.readouterr().out)
+    assert capped["count"] == 2
+    assert capped["total"] == 5
+
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(
+            ["with", "Hunter Reeves", "--limit", "5", "--config", str(config), "--stale-ok", "--json"]
+        )
+    assert caught.value.code == 0
+    full = json.loads(capsys.readouterr().out)
+    assert full["count"] == 5
+    assert full["total"] == 5
 
 
 def test_thread_at_known_permalink_returns_a_result(workspace, capsys):
