@@ -271,5 +271,39 @@ def test_bm25_hit_survives_the_floor_regardless_of_distance(floor_corpus):
     assert any("KB-77777" in hit.transcript for hit in hits)
 
 
+def test_unfiltered_search_uses_native_knn_not_the_allowed_lookup(corpus):
+    """No hard filter means nothing to pre-filter against, so the vector
+    channel should use vec0's own ANN index (`MATCH`) rather than fetching
+    every chunk's embedding by primary key and ranking in Python -- the
+    latter is fine over one conversation's chunks but not over a whole corpus.
+    """
+    statements = []
+    corpus.set_trace_callback(statements.append)
+    search(corpus, "schema", FakeEmbedder(), filters=Filters(), k=5)
+    corpus.set_trace_callback(None)
+
+    vector_statements = [s for s in statements if "chunks_vec" in s]
+    assert vector_statements
+    assert any("MATCH" in s for s in vector_statements)
+    assert all("IN (" not in s for s in vector_statements)
+
+
+def test_filtered_search_uses_the_allowed_lookup_not_native_knn(corpus):
+    """A hard filter means the vector channel must rank only within the
+    filtered set (see test_hard_filter_finds_true_nearest_within_filter_not_
+    global_topn for why a native KNN can't be trusted to do that here) -- so
+    it should fetch exactly the allowed embeddings by primary key rather than
+    issuing a `MATCH` query at all.
+    """
+    statements = []
+    corpus.set_trace_callback(statements.append)
+    search(corpus, "schema", FakeEmbedder(), filters=Filters(channel="D1"), k=5)
+    corpus.set_trace_callback(None)
+
+    vector_statements = [s for s in statements if "chunks_vec" in s]
+    assert vector_statements
+    assert all("MATCH" not in s for s in vector_statements)
+
+
 def test_rrf_k_is_the_standard_constant():
     assert RRF_K == 60

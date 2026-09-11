@@ -110,6 +110,23 @@ def _fts_query(query: str) -> str:
     return " OR ".join(f'"{term}"' for term in terms)
 
 
+def _filters_active(filters: Filters) -> bool:
+    """Whether any hard filter narrows the chunk set at all.
+
+    Used to choose between the two KNN paths below, not to guess at how much a
+    given filter would narrow the corpus -- the choice is "is there a filter",
+    not "is the corpus big".
+    """
+    return bool(
+        filters.person
+        or filters.mine
+        or filters.workspace
+        or filters.channel
+        or filters.since is not None
+        or filters.until is not None
+    )
+
+
 def _knn_ranked(conn, query: str, embedder: Embedder, filters: Filters) -> list[int]:
     """KNN restricted to the filtered chunk set -- genuinely pre-filtered, never
     a global top-N intersected with the filter afterward.
@@ -121,37 +138,52 @@ def _knn_ranked(conn, query: str, embedder: Embedder, filters: Filters) -> list[
     exist inside the filter. `--from hunter` must search hunter's conversation,
     not the global top 50 filtered down to hunter's conversation.
 
-    This was going to issue `embedding MATCH ? AND k = ? AND chunk_id IN (...)`
-    directly, on the assumption that sqlite-vec applies the `IN` predicate as a
-    genuine pre-filter. Verified directly against this repo's sqlite-vec build
-    (v0.1.9) that it does not: `MATCH ... k = ? AND chunk_id IN (...)` computes
-    the global top-`k` nearest neighbours FIRST, over the whole `chunks_vec`
-    table, and only then filters those k rows by the `IN` list. An allowed row
-    that ranks outside the global top `k` is dropped even though the `IN`
-    clause names it explicitly -- the exact same failure as intersecting a
-    global ranking in Python, just moved inside the SQL statement. Confirmed
-    with a minimal repro (0.1.9): 100 background vectors closer than one
-    `IN`-listed target reliably drop that target at k=50 and k=100, and only
-    return it once k exceeds the number of closer background rows.
+    When no filter narrows anything, there is nothing to pre-filter against,
+    so this uses vec0's native `embedding MATCH ? AND k = ?` with no `IN`
+    clause -- vec0's own ANN index, which is what it is actually fast at. This
+    matters at scale: an unfiltered `sherpa corpus search "..."` is the most
+    common interactive query, and the whole corpus (tens of thousands of
+    chunks) is the "allowed set" in that case, so a Python-side scan there
+    would be a real interactive-latency problem (measured below).
 
-    So there is no KNN form of MATCH that can be trusted to pre-filter here.
-    Instead this fetches the stored embeddings for exactly the allowed chunk
-    ids -- by primary-key `IN (...)` lookup with no MATCH clause, which *is* an
-    exact, unranked filter -- and computes L2 distance against them directly in
-    Python, batched to respect IN_CLAUSE_LIMIT. Slower than a native ANN
-    lookup, but the only form verified correct at any corpus size: it always
-    ranks strictly within the filtered set, never the global corpus.
+    When a filter is active, this instead fetches the stored embeddings for
+    exactly the allowed chunk ids -- by primary-key `IN (...)` lookup with no
+    MATCH clause, batched to respect IN_CLAUSE_LIMIT -- and computes L2
+    distance against them directly in Python. This was forced by a direct
+    empirical finding against this repo's sqlite-vec build (v0.1.9): issuing
+    `MATCH ... k = ? AND chunk_id IN (...)` in one statement does not
+    genuinely pre-filter -- it computes the global top-`k` neighbours over the
+    *entire* table first and only then filters those k rows by the `IN` list,
+    so an allowed row ranking outside the global top `k` is dropped even
+    though the `IN` clause names it explicitly (reproduced with 100 background
+    vectors closer than one `IN`-listed target: dropped at k=50 and k=100,
+    only returned once k exceeded the number of closer rows). The
+    primary-key-lookup-then-Python-L2 approach sidesteps that entirely: it is
+    a true within-allowed-set search by construction, independent of whatever
+    vec0's `IN` filtering semantics turn out to be. It is only used when the
+    allowed set is filter-narrowed, so it stays small -- the linear scan cost
+    that would be unacceptable over the whole corpus is fine over one
+    conversation's chunks.
 
     Rows beyond KNN_DISTANCE_FLOOR are dropped: a chunk BM25 also found still
     enters the fused results through the BM25 ranking regardless of distance,
     but a chunk only vector search surfaces must actually be close.
     """
+    vector = embedder.embed([query])[0]
+
+    if not _filters_active(filters):
+        packed = struct.pack(f"{len(vector)}f", *vector)
+        rows = conn.execute(
+            "SELECT chunk_id, distance FROM chunks_vec WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+            [packed, CANDIDATES],
+        ).fetchall()
+        return [row[0] for row in rows if row[1] <= KNN_DISTANCE_FLOOR][:CANDIDATES]
+
     clause, params = _where(filters)
     allowed = [row[0] for row in conn.execute(f"SELECT c.id FROM chunks c WHERE {clause}", params).fetchall()]
     if not allowed:
         return []
 
-    vector = embedder.embed([query])[0]
     rows = _knn_within_allowed(conn, vector, allowed)
     return [row[0] for row in rows if row[1] <= KNN_DISTANCE_FLOOR][:CANDIDATES]
 
