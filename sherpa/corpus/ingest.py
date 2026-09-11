@@ -511,11 +511,16 @@ def _store(conn, resolver: Resolver, workspace: str, channel, raw: dict) -> int:
     author_id = raw.get("user") or raw.get("bot_id", "")
     channel_name, kind = resolver.channel(channel["id"])
     identifier = message_id(workspace, channel["id"], raw["ts"])
+    text, mentions = resolver.render(raw["text"])
     meta = {
         key: raw[key]
         for key in ("reactions", "files", "edited", "subtype", "reply_count")
         if key in raw
     }
+    if mentions:
+        meta["mentions"] = mentions
+    if text != raw["text"]:
+        meta["raw_text"] = raw["text"]
 
     conn.execute(
         "INSERT INTO messages (id, workspace, channel_id, channel_name, channel_kind, ts, ts_raw,"
@@ -537,7 +542,7 @@ def _store(conn, resolver: Resolver, workspace: str, channel, raw: dict) -> int:
             author_id,
             resolver.user_name(author_id),
             1 if author_id == resolver.me_id else 0,
-            raw["text"],
+            text,
             _permalink(workspace, channel["id"], raw["ts"]),
             json.dumps(meta),
         ),

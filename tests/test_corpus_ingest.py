@@ -5,6 +5,7 @@ Run: uv run --with pytest --with sqlite-vec pytest tests/test_corpus_ingest.py -
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -21,13 +22,13 @@ from sherpa.corpus.ingest import (
 from sherpa.corpus.slack import AuthError, FakeSlack, SlackError
 
 DIRECTORY = {
-    "auth.test": [{"ok": True, "user_id": "U_ME"}],
+    "auth.test": [{"ok": True, "user_id": "U07JIMVOG"}],
     "users.list": [{"ok": True, "members": [
-        {"id": "U_ME", "name": "jim", "profile": {"real_name": "Jim Vogel"}},
-        {"id": "U_H", "name": "hunter", "profile": {"real_name": "Hunter Reeves"}},
+        {"id": "U07JIMVOG", "name": "jim", "profile": {"real_name": "Jim Vogel"}},
+        {"id": "U03K2ABCD", "name": "hunter", "profile": {"real_name": "Hunter Reeves"}},
     ]}],
     "conversations.list": [{"ok": True, "channels": [
-        {"id": "D1", "is_im": True, "user": "U_H"},
+        {"id": "D1", "is_im": True, "user": "U03K2ABCD"},
     ]}],
 }
 
@@ -150,8 +151,8 @@ class TickingClock:
 def test_ingest_stores_messages_with_resolved_names_and_is_me(tmp_path):
     conn = open_db(tmp_path / "c.db")
     client = client_with([{"ok": True, "messages": [
-        {"ts": "100.0", "user": "U_ME", "text": "I'll have the schema thursday"},
-        {"ts": "99.0", "user": "U_H", "text": "can you take the cli work?"},
+        {"ts": "100.0", "user": "U07JIMVOG", "text": "I'll have the schema thursday"},
+        {"ts": "99.0", "user": "U03K2ABCD", "text": "can you take the cli work?"},
     ]}])
     report = ingest_workspace(conn, client, "gravitate", me=None)
     assert report.messages == 2
@@ -162,8 +163,8 @@ def test_ingest_stores_messages_with_resolved_names_and_is_me(tmp_path):
 def test_ingest_advances_the_cursor_to_the_newest_ts(tmp_path):
     conn = open_db(tmp_path / "c.db")
     client = client_with([{"ok": True, "messages": [
-        {"ts": "100.0", "user": "U_H", "text": "a"},
-        {"ts": "99.0", "user": "U_H", "text": "b"},
+        {"ts": "100.0", "user": "U03K2ABCD", "text": "a"},
+        {"ts": "99.0", "user": "U03K2ABCD", "text": "b"},
     ]}])
     ingest_workspace(conn, client, "gravitate", me=None)
     assert conn.execute(
@@ -173,7 +174,7 @@ def test_ingest_advances_the_cursor_to_the_newest_ts(tmp_path):
 
 def test_second_run_requests_only_messages_after_the_cursor(tmp_path):
     conn = open_db(tmp_path / "c.db")
-    client = client_with([{"ok": True, "messages": [{"ts": "100.0", "user": "U_H", "text": "a"}]}])
+    client = client_with([{"ok": True, "messages": [{"ts": "100.0", "user": "U03K2ABCD", "text": "a"}]}])
     ingest_workspace(conn, client, "gravitate", me=None)
     client.calls.clear()
     ingest_workspace(conn, client, "gravitate", me=None)
@@ -183,7 +184,7 @@ def test_second_run_requests_only_messages_after_the_cursor(tmp_path):
 
 def test_reingesting_the_same_message_does_not_duplicate_it(tmp_path):
     conn = open_db(tmp_path / "c.db")
-    client = client_with([{"ok": True, "messages": [{"ts": "100.0", "user": "U_H", "text": "a"}]}])
+    client = client_with([{"ok": True, "messages": [{"ts": "100.0", "user": "U03K2ABCD", "text": "a"}]}])
     ingest_workspace(conn, client, "gravitate", me=None)
     conn.execute("UPDATE sync_state SET last_ts = 0")
     ingest_workspace(conn, client, "gravitate", me=None)
@@ -192,11 +193,11 @@ def test_reingesting_the_same_message_does_not_duplicate_it(tmp_path):
 
 def test_edited_message_text_is_updated_in_place(tmp_path):
     conn = open_db(tmp_path / "c.db")
-    client = client_with([{"ok": True, "messages": [{"ts": "100.0", "user": "U_H", "text": "before"}]}])
+    client = client_with([{"ok": True, "messages": [{"ts": "100.0", "user": "U03K2ABCD", "text": "before"}]}])
     ingest_workspace(conn, client, "gravitate", me=None)
     conn.execute("UPDATE sync_state SET last_ts = 0")
     client._pages["conversations.history"] = [
-        {"ok": True, "messages": [{"ts": "100.0", "user": "U_H", "text": "after", "edited": {"ts": "101.0"}}]}
+        {"ok": True, "messages": [{"ts": "100.0", "user": "U03K2ABCD", "text": "after", "edited": {"ts": "101.0"}}]}
     ]
     ingest_workspace(conn, client, "gravitate", me=None)
     assert conn.execute("SELECT text FROM messages").fetchone()[0] == "after"
@@ -208,8 +209,8 @@ def test_edited_message_text_is_updated_in_place(tmp_path):
 def test_tombstone_messages_are_not_stored(tmp_path):
     conn = open_db(tmp_path / "c.db")
     client = client_with([{"ok": True, "messages": [
-        {"ts": "101.0", "user": "U_H", "text": "This message was deleted.", "subtype": "tombstone"},
-        {"ts": "100.0", "user": "U_H", "text": "real"},
+        {"ts": "101.0", "user": "U03K2ABCD", "text": "This message was deleted.", "subtype": "tombstone"},
+        {"ts": "100.0", "user": "U03K2ABCD", "text": "real"},
     ]}])
     ingest_workspace(conn, client, "gravitate", me=None)
     assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 1
@@ -219,11 +220,11 @@ def test_thread_sweep_pulls_replies_for_parents_with_reply_count(tmp_path):
     conn = open_db(tmp_path / "c.db")
     client = client_with(
         history=[{"ok": True, "messages": [
-            {"ts": "100.0", "user": "U_H", "text": "parent", "thread_ts": "100.0", "reply_count": 1},
+            {"ts": "100.0", "user": "U03K2ABCD", "text": "parent", "thread_ts": "100.0", "reply_count": 1},
         ]}],
         replies=[{"ok": True, "messages": [
-            {"ts": "100.0", "user": "U_H", "text": "parent", "thread_ts": "100.0"},
-            {"ts": "100.5", "user": "U_ME", "text": "on it", "thread_ts": "100.0"},
+            {"ts": "100.0", "user": "U03K2ABCD", "text": "parent", "thread_ts": "100.0"},
+            {"ts": "100.5", "user": "U07JIMVOG", "text": "on it", "thread_ts": "100.0"},
         ]}],
     )
     ingest_workspace(conn, client, "gravitate", me=None)
@@ -235,18 +236,18 @@ def test_thread_sweep_finds_new_replies_on_old_threads_across_runs(tmp_path):
     conn = open_db(tmp_path / "c.db")
     client = client_with(
         history=[{"ok": True, "messages": [
-            {"ts": "100.0", "user": "U_H", "text": "parent", "thread_ts": "100.0", "reply_count": 1},
+            {"ts": "100.0", "user": "U03K2ABCD", "text": "parent", "thread_ts": "100.0", "reply_count": 1},
         ]}],
         replies=[{"ok": True, "messages": [
-            {"ts": "100.0", "user": "U_H", "text": "parent", "thread_ts": "100.0"},
+            {"ts": "100.0", "user": "U03K2ABCD", "text": "parent", "thread_ts": "100.0"},
         ]}],
     )
     ingest_workspace(conn, client, "gravitate", me=None, now=lambda: 100.0)
 
     client._pages["conversations.history"] = [{"ok": True, "messages": []}]
     client._pages["conversations.replies"] = [{"ok": True, "messages": [
-        {"ts": "100.0", "user": "U_H", "text": "parent", "thread_ts": "100.0"},
-        {"ts": "100.5", "user": "U_ME", "text": "late reply", "thread_ts": "100.0"},
+        {"ts": "100.0", "user": "U03K2ABCD", "text": "parent", "thread_ts": "100.0"},
+        {"ts": "100.5", "user": "U07JIMVOG", "text": "late reply", "thread_ts": "100.0"},
     ]}]
     ingest_workspace(conn, client, "gravitate", me=None, now=lambda: 100.0)
 
@@ -258,18 +259,18 @@ def test_thread_sweep_skips_parents_older_than_the_recency_window(tmp_path):
     conn = open_db(tmp_path / "c.db")
     client = client_with(
         history=[{"ok": True, "messages": [
-            {"ts": "100.0", "user": "U_H", "text": "parent", "thread_ts": "100.0", "reply_count": 1},
+            {"ts": "100.0", "user": "U03K2ABCD", "text": "parent", "thread_ts": "100.0", "reply_count": 1},
         ]}],
         replies=[{"ok": True, "messages": [
-            {"ts": "100.0", "user": "U_H", "text": "parent", "thread_ts": "100.0"},
+            {"ts": "100.0", "user": "U03K2ABCD", "text": "parent", "thread_ts": "100.0"},
         ]}],
     )
     ingest_workspace(conn, client, "gravitate", me=None, now=lambda: 100.0)
 
     client._pages["conversations.history"] = [{"ok": True, "messages": []}]
     client._pages["conversations.replies"] = [{"ok": True, "messages": [
-        {"ts": "100.0", "user": "U_H", "text": "parent", "thread_ts": "100.0"},
-        {"ts": "100.5", "user": "U_ME", "text": "late reply", "thread_ts": "100.0"},
+        {"ts": "100.0", "user": "U03K2ABCD", "text": "parent", "thread_ts": "100.0"},
+        {"ts": "100.5", "user": "U07JIMVOG", "text": "late reply", "thread_ts": "100.0"},
     ]}]
     stale_now = 100.0 + THREAD_SWEEP_WINDOW_SECONDS + 1000.0
     ingest_workspace(conn, client, "gravitate", me=None, now=lambda: stale_now)
@@ -282,11 +283,11 @@ def test_thread_sweep_does_not_duplicate_already_stored_replies(tmp_path):
     conn = open_db(tmp_path / "c.db")
     client = client_with(
         history=[{"ok": True, "messages": [
-            {"ts": "100.0", "user": "U_H", "text": "parent", "thread_ts": "100.0", "reply_count": 1},
+            {"ts": "100.0", "user": "U03K2ABCD", "text": "parent", "thread_ts": "100.0", "reply_count": 1},
         ]}],
         replies=[{"ok": True, "messages": [
-            {"ts": "100.0", "user": "U_H", "text": "parent", "thread_ts": "100.0"},
-            {"ts": "100.5", "user": "U_ME", "text": "on it", "thread_ts": "100.0"},
+            {"ts": "100.0", "user": "U03K2ABCD", "text": "parent", "thread_ts": "100.0"},
+            {"ts": "100.5", "user": "U07JIMVOG", "text": "on it", "thread_ts": "100.0"},
         ]}],
     )
     ingest_workspace(conn, client, "gravitate", me=None, now=lambda: 100.0)
@@ -301,11 +302,11 @@ def test_thread_sweep_uses_latest_reply_not_parent_age_for_the_window(tmp_path):
     conn = open_db(tmp_path / "c.db")
     client = client_with(
         history=[{"ok": True, "messages": [
-            {"ts": "0.0", "user": "U_H", "text": "parent", "thread_ts": "0.0", "reply_count": 1},
+            {"ts": "0.0", "user": "U03K2ABCD", "text": "parent", "thread_ts": "0.0", "reply_count": 1},
         ]}],
         replies=[{"ok": True, "messages": [
-            {"ts": "0.0", "user": "U_H", "text": "parent", "thread_ts": "0.0"},
-            {"ts": f"{THREAD_SWEEP_WINDOW_SECONDS - 100.0}", "user": "U_ME",
+            {"ts": "0.0", "user": "U03K2ABCD", "text": "parent", "thread_ts": "0.0"},
+            {"ts": f"{THREAD_SWEEP_WINDOW_SECONDS - 100.0}", "user": "U07JIMVOG",
              "text": "still going", "thread_ts": "0.0"},
         ]}],
     )
@@ -313,10 +314,10 @@ def test_thread_sweep_uses_latest_reply_not_parent_age_for_the_window(tmp_path):
 
     client._pages["conversations.history"] = [{"ok": True, "messages": []}]
     client._pages["conversations.replies"] = [{"ok": True, "messages": [
-        {"ts": "0.0", "user": "U_H", "text": "parent", "thread_ts": "0.0"},
-        {"ts": f"{THREAD_SWEEP_WINDOW_SECONDS - 100.0}", "user": "U_ME",
+        {"ts": "0.0", "user": "U03K2ABCD", "text": "parent", "thread_ts": "0.0"},
+        {"ts": f"{THREAD_SWEEP_WINDOW_SECONDS - 100.0}", "user": "U07JIMVOG",
          "text": "still going", "thread_ts": "0.0"},
-        {"ts": f"{THREAD_SWEEP_WINDOW_SECONDS + 40.0}", "user": "U_H",
+        {"ts": f"{THREAD_SWEEP_WINDOW_SECONDS + 40.0}", "user": "U03K2ABCD",
          "text": "one more thing", "thread_ts": "0.0"},
     ]}]
     later_now = THREAD_SWEEP_WINDOW_SECONDS + 50.0
@@ -330,20 +331,20 @@ def test_thread_sweep_skips_threads_dead_for_the_entire_window(tmp_path):
     conn = open_db(tmp_path / "c.db")
     client = client_with(
         history=[{"ok": True, "messages": [
-            {"ts": "0.0", "user": "U_H", "text": "parent", "thread_ts": "0.0", "reply_count": 1},
+            {"ts": "0.0", "user": "U03K2ABCD", "text": "parent", "thread_ts": "0.0", "reply_count": 1},
         ]}],
         replies=[{"ok": True, "messages": [
-            {"ts": "0.0", "user": "U_H", "text": "parent", "thread_ts": "0.0"},
-            {"ts": "50.0", "user": "U_ME", "text": "last word", "thread_ts": "0.0"},
+            {"ts": "0.0", "user": "U03K2ABCD", "text": "parent", "thread_ts": "0.0"},
+            {"ts": "50.0", "user": "U07JIMVOG", "text": "last word", "thread_ts": "0.0"},
         ]}],
     )
     ingest_workspace(conn, client, "gravitate", me=None, now=lambda: 0.0)
 
     client._pages["conversations.history"] = [{"ok": True, "messages": []}]
     client._pages["conversations.replies"] = [{"ok": True, "messages": [
-        {"ts": "0.0", "user": "U_H", "text": "parent", "thread_ts": "0.0"},
-        {"ts": "50.0", "user": "U_ME", "text": "last word", "thread_ts": "0.0"},
-        {"ts": f"{THREAD_SWEEP_WINDOW_SECONDS + 5000.0}", "user": "U_H",
+        {"ts": "0.0", "user": "U03K2ABCD", "text": "parent", "thread_ts": "0.0"},
+        {"ts": "50.0", "user": "U07JIMVOG", "text": "last word", "thread_ts": "0.0"},
+        {"ts": f"{THREAD_SWEEP_WINDOW_SECONDS + 5000.0}", "user": "U03K2ABCD",
          "text": "should never arrive", "thread_ts": "0.0"},
     ]}]
     long_after_now = THREAD_SWEEP_WINDOW_SECONDS + 10000.0
@@ -358,7 +359,7 @@ def test_an_interrupted_pass_over_newest_first_history_loses_nothing(tmp_path):
     a run cut off by the budget has stored only the top of the range. Anything
     that pins a cursor there buries the rest of that page below it forever."""
     conn = open_db(tmp_path / "c.db")
-    history = SlackHistory([{"ts": f"{i}.0", "user": "U_H", "text": f"m{i}"} for i in range(1, 1001)])
+    history = SlackHistory([{"ts": f"{i}.0", "user": "U03K2ABCD", "text": f"m{i}"} for i in range(1, 1001)])
     client = client_serving({"D1": history})
     clock = TickingClock()
 
@@ -374,7 +375,7 @@ def test_an_interrupted_pass_over_newest_first_history_loses_nothing(tmp_path):
 
 def test_a_first_backfill_terminates_instead_of_refetching_the_newest_pages(tmp_path):
     conn = open_db(tmp_path / "c.db")
-    history = SlackHistory([{"ts": f"{i}.0", "user": "U_H", "text": f"m{i}"} for i in range(1, 1001)])
+    history = SlackHistory([{"ts": f"{i}.0", "user": "U03K2ABCD", "text": f"m{i}"} for i in range(1, 1001)])
     client = client_serving({"D1": history})
     clock = TickingClock()
 
@@ -392,7 +393,7 @@ def test_a_first_backfill_terminates_instead_of_refetching_the_newest_pages(tmp_
 
 def test_a_completed_backfill_stops_asking_for_older_pages(tmp_path):
     conn = open_db(tmp_path / "c.db")
-    history = SlackHistory([{"ts": f"{i}.0", "user": "U_H", "text": f"m{i}"} for i in range(1, 301)])
+    history = SlackHistory([{"ts": f"{i}.0", "user": "U03K2ABCD", "text": f"m{i}"} for i in range(1, 301)])
     client = client_serving({"D1": history})
     clock = TickingClock()
 
@@ -415,7 +416,7 @@ def test_a_channel_empty_at_first_ingest_still_ingests_later_messages(tmp_path):
     ingest_workspace(conn, client, "gravitate", me=None)
     assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 0
 
-    history.add({"ts": "100.0", "user": "U_H", "text": "hey, welcome aboard"})
+    history.add({"ts": "100.0", "user": "U03K2ABCD", "text": "hey, welcome aboard"})
     ingest_workspace(conn, client, "gravitate", me=None)
 
     texts = {row[0] for row in conn.execute("SELECT text FROM messages")}
@@ -443,13 +444,13 @@ def test_a_channel_that_stays_empty_is_not_paged_backwards_again(tmp_path):
 
 def test_a_completed_backfill_still_catches_up_on_new_messages(tmp_path):
     conn = open_db(tmp_path / "c.db")
-    history = SlackHistory([{"ts": f"{i}.0", "user": "U_H", "text": f"m{i}"} for i in range(1, 301)])
+    history = SlackHistory([{"ts": f"{i}.0", "user": "U03K2ABCD", "text": f"m{i}"} for i in range(1, 301)])
     client = client_serving({"D1": history})
 
     ingest_workspace(conn, client, "gravitate", me=None)
     assert _backfill_complete(conn)
 
-    history.add({"ts": "900.0", "user": "U_H", "text": "posted after the backfill finished"})
+    history.add({"ts": "900.0", "user": "U03K2ABCD", "text": "posted after the backfill finished"})
     ingest_workspace(conn, client, "gravitate", me=None)
 
     texts = {row[0] for row in conn.execute("SELECT text FROM messages")}
@@ -462,13 +463,13 @@ def test_a_swept_reply_does_not_advance_the_history_cursor(tmp_path):
     yet; letting it raise the history cursor steps straight over them."""
     conn = open_db(tmp_path / "c.db")
     history = SlackHistory([
-        {"ts": "100.0", "user": "U_H", "text": "parent", "thread_ts": "100.0", "reply_count": 1},
+        {"ts": "100.0", "user": "U03K2ABCD", "text": "parent", "thread_ts": "100.0", "reply_count": 1},
     ])
     client = client_serving(
         {"D1": history},
         replies=[{"ok": True, "messages": [
-            {"ts": "100.0", "user": "U_H", "text": "parent", "thread_ts": "100.0"},
-            {"ts": "500.0", "user": "U_ME", "text": "reply from the future", "thread_ts": "100.0"},
+            {"ts": "100.0", "user": "U03K2ABCD", "text": "parent", "thread_ts": "100.0"},
+            {"ts": "500.0", "user": "U07JIMVOG", "text": "reply from the future", "thread_ts": "100.0"},
         ]}],
     )
     ingest_workspace(conn, client, "gravitate", me=None, now=lambda: 500.0)
@@ -478,8 +479,8 @@ def test_a_swept_reply_does_not_advance_the_history_cursor(tmp_path):
     ).fetchone()[0] == 100.0
 
     history.add(
-        {"ts": "200.0", "user": "U_H", "text": "posted while the thread ran"},
-        {"ts": "300.0", "user": "U_H", "text": "and another"},
+        {"ts": "200.0", "user": "U03K2ABCD", "text": "posted while the thread ran"},
+        {"ts": "300.0", "user": "U03K2ABCD", "text": "and another"},
     )
     ingest_workspace(conn, client, "gravitate", me=None, now=lambda: 500.0)
 
@@ -491,14 +492,14 @@ def test_sweep_caps_parents_per_run_and_covers_the_backlog_over_successive_runs(
     conn = open_db(tmp_path / "c.db")
     thread_count = THREAD_SWEEP_PER_CHANNEL_CAP + 5
     parents = [
-        {"ts": f"{i}.0", "user": "U_H", "text": f"parent{i}", "thread_ts": f"{i}.0", "reply_count": 1}
+        {"ts": f"{i}.0", "user": "U03K2ABCD", "text": f"parent{i}", "thread_ts": f"{i}.0", "reply_count": 1}
         for i in range(thread_count, 0, -1)
     ]
     client = client_with(history=[{"ok": True, "messages": parents}])
     serve_threads(client, {
         parent["ts"]: [
-            {"ts": parent["ts"], "user": "U_H", "text": parent["text"], "thread_ts": parent["ts"]},
-            {"ts": f"{float(parent['ts']) + 0.5}", "user": "U_ME", "text": f"reply to {parent['text']}",
+            {"ts": parent["ts"], "user": "U03K2ABCD", "text": parent["text"], "thread_ts": parent["ts"]},
+            {"ts": f"{float(parent['ts']) + 0.5}", "user": "U07JIMVOG", "text": f"reply to {parent['text']}",
              "thread_ts": parent["ts"]},
         ]
         for parent in parents
@@ -526,12 +527,12 @@ def test_sweep_caps_parents_per_run_and_covers_the_backlog_over_successive_runs(
 
 def test_a_busy_tier_one_channel_does_not_starve_tier_three(tmp_path):
     conn = open_db(tmp_path / "c.db")
-    huge_backlog = [{"ts": f"{i}.0", "user": "U_H", "text": f"m{i}"} for i in range(1, 5000)]
-    small_backlog = [{"ts": "5.0", "user": "U_H", "text": "hi from C3"}]
+    huge_backlog = [{"ts": f"{i}.0", "user": "U03K2ABCD", "text": f"m{i}"} for i in range(1, 5000)]
+    small_backlog = [{"ts": "5.0", "user": "U03K2ABCD", "text": "hi from C3"}]
     client = client_serving(
         {"D1": SlackHistory(huge_backlog), "C3": SlackHistory(small_backlog)},
         channels=[
-            {"id": "D1", "is_im": True, "user": "U_H"},
+            {"id": "D1", "is_im": True, "user": "U03K2ABCD"},
             {"id": "C3", "name": "other", "is_channel": True, "is_member": True},
         ],
     )
@@ -558,7 +559,7 @@ def test_one_failing_channel_is_recorded_and_others_continue(tmp_path):
     conn = open_db(tmp_path / "c.db")
     pages = dict(DIRECTORY)
     pages["conversations.list"] = [{"ok": True, "channels": [
-        {"id": "D1", "is_im": True, "user": "U_H"},
+        {"id": "D1", "is_im": True, "user": "U03K2ABCD"},
         {"id": "C2", "name": "other", "is_channel": True, "is_member": True},
     ]}]
     calls = {"n": 0}
@@ -569,7 +570,7 @@ def test_one_failing_channel_is_recorded_and_others_continue(tmp_path):
         if method == "conversations.history" and params.get("channel") == "D1":
             raise SlackError("channel_not_found")
         if method == "conversations.history":
-            return {"ok": True, "messages": [{"ts": "5.0", "user": "U_H", "text": "hi"}]}
+            return {"ok": True, "messages": [{"ts": "5.0", "user": "U03K2ABCD", "text": "hi"}]}
         return original(method, **params)
 
     client.call = flaky
@@ -597,12 +598,12 @@ REPLY_TS = "1757606460.000200"
 def _threaded_client(*, replies=None):
     return client_with(
         history=[{"ok": True, "messages": [
-            {"ts": PARENT_TS, "user": "U_H", "text": "parent",
+            {"ts": PARENT_TS, "user": "U03K2ABCD", "text": "parent",
              "thread_ts": PARENT_TS, "reply_count": 1},
         ]}],
         replies=replies or [{"ok": True, "messages": [
-            {"ts": PARENT_TS, "user": "U_H", "text": "parent", "thread_ts": PARENT_TS},
-            {"ts": REPLY_TS, "user": "U_ME", "text": "on it", "thread_ts": PARENT_TS},
+            {"ts": PARENT_TS, "user": "U03K2ABCD", "text": "parent", "thread_ts": PARENT_TS},
+            {"ts": REPLY_TS, "user": "U07JIMVOG", "text": "on it", "thread_ts": PARENT_TS},
         ]}],
     )
 
@@ -630,9 +631,9 @@ def test_one_broken_thread_does_not_fail_the_whole_channel(tmp_path):
     other_parent = "1757606500.000300"
     client = client_with(
         history=[{"ok": True, "messages": [
-            {"ts": PARENT_TS, "user": "U_H", "text": "parent",
+            {"ts": PARENT_TS, "user": "U03K2ABCD", "text": "parent",
              "thread_ts": PARENT_TS, "reply_count": 1},
-            {"ts": other_parent, "user": "U_H", "text": "other parent",
+            {"ts": other_parent, "user": "U03K2ABCD", "text": "other parent",
              "thread_ts": other_parent, "reply_count": 1},
         ]}],
     )
@@ -643,9 +644,9 @@ def test_one_broken_thread_does_not_fail_the_whole_channel(tmp_path):
             raise SlackError("ratelimited")
         if method == "conversations.replies":
             return {"ok": True, "messages": [
-                {"ts": other_parent, "user": "U_H", "text": "other parent",
+                {"ts": other_parent, "user": "U03K2ABCD", "text": "other parent",
                  "thread_ts": other_parent},
-                {"ts": "1757606560.000400", "user": "U_ME", "text": "survived",
+                {"ts": "1757606560.000400", "user": "U07JIMVOG", "text": "survived",
                  "thread_ts": other_parent},
             ]}
         return original(method, **params)
@@ -678,16 +679,16 @@ OLD_REPLY_TS = "1700049100.000200"
 def test_a_thread_found_during_a_budget_exhausted_backfill_is_still_swept(tmp_path):
     conn = open_db(tmp_path / "c.db")
     backlog = [
-        {"ts": f"{1700000000 + i}.000500", "user": "U_H", "text": f"m{i}"}
+        {"ts": f"{1700000000 + i}.000500", "user": "U03K2ABCD", "text": f"m{i}"}
         for i in range(1, 40000)
     ]
-    parent = {"ts": OLD_PARENT_TS, "user": "U_H", "text": "old parent",
+    parent = {"ts": OLD_PARENT_TS, "user": "U03K2ABCD", "text": "old parent",
               "thread_ts": OLD_PARENT_TS, "reply_count": 1}
     history = SlackHistory([*backlog, parent])
     client = client_serving({"D1": history})
     serve_threads(client, {OLD_PARENT_TS: [
         parent,
-        {"ts": OLD_REPLY_TS, "user": "U_ME", "text": "the promise in the thread",
+        {"ts": OLD_REPLY_TS, "user": "U07JIMVOG", "text": "the promise in the thread",
          "thread_ts": OLD_PARENT_TS},
     ]})
 
@@ -707,3 +708,65 @@ def test_a_thread_parent_is_recorded_the_moment_it_is_seen(tmp_path):
     assert conn.execute(
         "SELECT thread_ts_raw FROM thread_sweeps WHERE channel_id = 'D1'"
     ).fetchone()[0] == PARENT_TS
+
+
+# --- Mentions, channel refs and links ---------------------------------------
+#
+# Slack stores a mention as `<@U03K2ABCD>`, never as a name. In a channel,
+# mentioning someone is the primary way their name appears at all, so leaving
+# the raw form in the text means neither the FTS index nor the embedding can
+# find it -- exactly the "what did I promise Hunter" case.
+
+def test_a_mention_is_stored_as_the_persons_name(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = client_with([{"ok": True, "messages": [
+        {"ts": "1757606400.000100", "user": "U07JIMVOG",
+         "text": "<@U03K2ABCD> I'll get you the schema"},
+    ]}])
+    ingest_workspace(conn, client, "gravitate", me=None)
+
+    assert conn.execute("SELECT text FROM messages").fetchone()[0] == (
+        "@Hunter Reeves I'll get you the schema"
+    )
+    assert conn.execute(
+        "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'Hunter'"
+    ).fetchone()[0] == 1
+
+
+def test_channel_refs_links_and_escapes_are_rendered_readable(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = client_with([{"ok": True, "messages": [
+        {"ts": "1757606400.000100", "user": "U03K2ABCD",
+         "text": "see <#C123|gravi-cli> and <https://example.com/x|the writeup>"
+                 " &amp; <!here> &lt;not a tag&gt;"},
+    ]}])
+    ingest_workspace(conn, client, "gravitate", me=None)
+
+    stored = conn.execute("SELECT text FROM messages").fetchone()[0]
+    assert "#gravi-cli" in stored
+    assert "the writeup (https://example.com/x)" in stored
+    assert "@here" in stored
+    assert "&" in stored and "&amp;" not in stored
+    assert "<not a tag>" in stored
+
+
+def test_the_raw_slack_text_stays_recoverable(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = client_with([{"ok": True, "messages": [
+        {"ts": "1757606400.000100", "user": "U07JIMVOG", "text": "<@U03K2ABCD> ping"},
+    ]}])
+    ingest_workspace(conn, client, "gravitate", me=None)
+
+    meta = json.loads(conn.execute("SELECT meta FROM messages").fetchone()[0])
+    assert meta["raw_text"] == "<@U03K2ABCD> ping"
+    assert meta["mentions"] == ["Hunter Reeves"]
+
+
+def test_an_unresolvable_mention_keeps_its_id_rather_than_vanishing(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = client_with([{"ok": True, "messages": [
+        {"ts": "1757606400.000100", "user": "U03K2ABCD", "text": "ask <@U09NOBODY>"},
+    ]}])
+    ingest_workspace(conn, client, "gravitate", me=None)
+
+    assert "U09NOBODY" in conn.execute("SELECT text FROM messages").fetchone()[0]

@@ -163,7 +163,12 @@ def _window(messages: list) -> list[list]:
     for previous, message in zip(messages, messages[1:]):
         too_quiet = message["ts"] - previous["ts"] > GAP_SECONDS
         too_long = len(current) >= MAX_MESSAGES
-        if too_quiet or too_long:
+        # Forty messages of pasted logs is 100k characters. ollama truncates
+        # past the model's context without saying so, the chunk is still marked
+        # embedded, and `status` calls the corpus healthy while the vector
+        # stands for the first few messages only.
+        too_big = len(format_script(current)) >= MAX_CHARS
+        if too_quiet or too_long or too_big:
             windows.append(current)
             current = current[-OVERLAP:] + [message]
         else:
@@ -188,6 +193,23 @@ def _split_oversized(messages: list) -> list[list]:
     return windows
 
 
+def _mentioned(window: list) -> set[str]:
+    """People the window names without speaking.
+
+    In a named channel, being @-mentioned is how someone is present in a
+    conversation at all -- and an unanswered "@Hunter I'll get you the schema"
+    is the exact shape `owed hunter` has to find.
+    """
+    names: set[str] = set()
+    for message in window:
+        try:
+            meta = json.loads(message["meta"])
+        except (TypeError, ValueError, IndexError):
+            continue
+        names.update(meta.get("mentions", []))
+    return names
+
+
 def _me_name(conn: sqlite3.Connection, workspace: str) -> str:
     row = conn.execute(
         "SELECT name FROM users WHERE workspace = ? AND is_me = 1", (workspace,)
@@ -205,7 +227,7 @@ def _write(
 ) -> int:
     text = format_script(window)
     speakers = sorted({m["author_name"] for m in window})
-    everyone = sorted(set(speakers) | set(members))
+    everyone = sorted(set(speakers) | set(members) | _mentioned(window))
     if me in everyone:
         everyone = [me] + [name for name in everyone if name != me]
     people = ", ".join(everyone)

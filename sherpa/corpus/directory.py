@@ -6,10 +6,31 @@ U03K2. An agent searching for a person must not need to know their Slack ID.
 
 from __future__ import annotations
 
+import html
 import json
+import re
 import sqlite3
 
 from sherpa.corpus.slack import SlackClient, SlackError, AuthError
+
+# Slack's message-text markup. Every form carries an ID and an optional display
+# label after a pipe; the label is authoritative when present, since it is what
+# the sender saw.
+_USER_REF = re.compile(r"<@(?P<id>[UWB][A-Z0-9]*)(?:\|[^>]*)?>")
+_CHANNEL_REF = re.compile(r"<#(?P<id>[CGD][A-Z0-9]*)(?:\|(?P<label>[^>]*))?>")
+_SUBTEAM_REF = re.compile(r"<!subteam\^(?P<id>[A-Z0-9]+)(?:\|(?P<label>[^>]*))?>")
+_SPECIAL_REF = re.compile(r"<!(?P<name>here|channel|everyone)(?:\|[^>]*)?>")
+_LINK = re.compile(r"<(?P<url>(?:https?|mailto|tel):[^|>]+)(?:\|(?P<label>[^>]*))?>")
+
+
+def _render_link(match: re.Match) -> str:
+    url, label = match["url"], match["label"]
+    if url.startswith("mailto:"):
+        return label or url[len("mailto:"):]
+    if not label or label == url:
+        return url
+    return f"{label} ({url})"
+
 
 
 def sync_directory(conn: sqlite3.Connection, client: SlackClient, workspace: str, me: str | None) -> str:
@@ -198,3 +219,31 @@ class Resolver:
     def channel(self, channel_id: str) -> tuple[str, str]:
         name, kind = self._channels.get(channel_id, (channel_id, "public"))
         return (name, kind)
+
+    def render(self, text: str) -> tuple[str, list[str]]:
+        """Message text with every ID resolved, plus the people it mentions.
+
+        Slack stores a mention as `<@U03K2ABCD>`, and in a channel that is the
+        primary way a person's name appears at all. Left raw, the name reaches
+        neither the FTS index nor the embedding, so "what did I promise Hunter"
+        cannot find the message that says exactly that. Resolution happens here,
+        at ingest, for the same reason author and channel names do.
+        """
+        mentioned: list[str] = []
+
+        def user(match: re.Match) -> str:
+            name = self.user_name(match["id"])
+            if name not in mentioned:
+                mentioned.append(name)
+            return f"@{name}"
+
+        def channel_ref(match: re.Match) -> str:
+            return f"#{match['label'] or self.channel(match['id'])[0]}"
+
+        rendered = _USER_REF.sub(user, text)
+        rendered = _CHANNEL_REF.sub(channel_ref, rendered)
+        rendered = _SUBTEAM_REF.sub(lambda m: m["label"] or f"@{m['id']}", rendered)
+        rendered = _SPECIAL_REF.sub(lambda m: f"@{m['name']}", rendered)
+        rendered = _LINK.sub(_render_link, rendered)
+        rendered = html.unescape(rendered)
+        return rendered, sorted(mentioned)

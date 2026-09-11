@@ -13,6 +13,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sherpa.corpus.chunk import (
     GAP_SECONDS,
+    MAX_CHARS,
     MAX_MESSAGES,
     build_chunks,
     build_header,
@@ -319,3 +320,31 @@ def test_an_older_database_has_its_fts_rowids_repaired_on_open(tmp_path):
         "SELECT chunk_id FROM chunks_fts WHERE rowid = 5"
     ).fetchone()[0] == 5
     assert conn.execute("SELECT count(*) FROM chunks_fts").fetchone()[0] == 1
+
+
+def test_a_window_of_pasted_logs_is_split_on_length(conn):
+    """No character bound on loose windows means forty messages of pasted logs
+    become one 100k-character chunk. ollama truncates silently at the model's
+    context, the chunk is still marked embedded, and `status` calls the corpus
+    healthy while the vector represents the first few messages only."""
+    for i in range(10):
+        insert(conn, 1757606400.0 + i, "Jim Vogel", f"line{i} " + "x" * 2000)
+    conn.commit()
+    assert build_chunks(conn, "w", "C1") > 1
+
+    longest = max(row[0] for row in conn.execute("SELECT length(text) FROM chunks"))
+    assert longest <= MAX_CHARS * 2
+
+
+def test_a_mentioned_person_counts_as_being_in_the_conversation(conn):
+    conn.execute(
+        "INSERT INTO messages (id, workspace, channel_id, channel_name, channel_kind, ts,"
+        " thread_ts, author_id, author_name, is_me, text, permalink, meta)"
+        " VALUES ('w:C1:1757606400.000100', 'w', 'C1', 'gravi-cli', 'public', 1757606400.0001,"
+        " NULL, 'U', 'Jim Vogel', 1, '@Hunter Reeves I owe you the schema', 'https://x',"
+        " '{\"mentions\": [\"Hunter Reeves\"]}')"
+    )
+    conn.commit()
+    build_chunks(conn, "w", "C1")
+
+    assert "Hunter Reeves" in conn.execute("SELECT people FROM chunks").fetchone()[0]
