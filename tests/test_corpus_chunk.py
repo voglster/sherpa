@@ -162,3 +162,65 @@ def test_rebuild_removes_the_vector_row_of_a_replaced_chunk(conn):
     assert conn.execute(
         "SELECT count(*) FROM chunks_vec WHERE chunk_id = ?", (old_id,)
     ).fetchone()[0] == 0
+
+
+def test_a_no_op_rebuild_returns_the_stored_count_not_zero(conn):
+    for i in range(3):
+        insert(conn, 1000.0 + i * 60, "Jim Vogel", f"m{i}")
+    conn.commit()
+    build_chunks(conn, "w", "C1")
+    assert build_chunks(conn, "w", "C1") == 1
+
+
+def test_delete_stale_is_scoped_to_its_own_workspace_and_channel(conn):
+    for i in range(3):
+        insert(conn, 1000.0 + i * 60, "Jim Vogel", f"m{i}", channel="C1")
+    for i in range(3):
+        insert(conn, 1000.0 + i * 60, "Jim Vogel", f"m{i}", channel="C2")
+    conn.execute(
+        "INSERT INTO messages (id, workspace, channel_id, channel_name, channel_kind, ts,"
+        " thread_ts, author_id, author_name, is_me, text, permalink)"
+        " VALUES ('w2:C1:1000.0', 'w2', 'C1', 'gravi-cli', 'public', 1000.0, NULL, 'U',"
+        " 'Jim Vogel', 0, 'other workspace', 'https://x')"
+    )
+    conn.commit()
+
+    build_chunks(conn, "w", "C1")
+    build_chunks(conn, "w", "C2")
+    build_chunks(conn, "w2", "C1")
+
+    c2_id = conn.execute(
+        "SELECT id FROM chunks WHERE workspace = 'w' AND channel_id = 'C2'"
+    ).fetchone()[0]
+    other_ws_id = conn.execute(
+        "SELECT id FROM chunks WHERE workspace = 'w2' AND channel_id = 'C1'"
+    ).fetchone()[0]
+    for chunk_id in (c2_id, other_ws_id):
+        conn.execute(
+            "INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, ?)",
+            (chunk_id, b"\x00" * (768 * 4)),
+        )
+    conn.commit()
+
+    insert(conn, 1000.0 + 3 * 60, "Jim Vogel", "m3", channel="C1")
+    conn.commit()
+    build_chunks(conn, "w", "C1")
+
+    assert conn.execute(
+        "SELECT count(*) FROM chunks WHERE workspace = 'w' AND channel_id = 'C2'"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT count(*) FROM chunks WHERE workspace = 'w2' AND channel_id = 'C1'"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT count(*) FROM chunks_fts WHERE chunk_id = ?", (c2_id,)
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT count(*) FROM chunks_fts WHERE chunk_id = ?", (other_ws_id,)
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT count(*) FROM chunks_vec WHERE chunk_id = ?", (c2_id,)
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT count(*) FROM chunks_vec WHERE chunk_id = ?", (other_ws_id,)
+    ).fetchone()[0] == 1
