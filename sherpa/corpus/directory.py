@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from sherpa.corpus.slack import SlackClient
+from sherpa.corpus.slack import SlackClient, SlackError, AuthError
 
 
 def sync_directory(conn: sqlite3.Connection, client: SlackClient, workspace: str, me: str | None) -> str:
@@ -40,8 +40,8 @@ def sync_directory(conn: sqlite3.Connection, client: SlackClient, workspace: str
         exclude_archived=True,
     ):
         kind = _kind(channel)
-        name = _resolve_channel_name(channel, kind, resolver)
         member_ids = _fetch_member_ids(channel, kind, client)
+        name = _resolve_channel_name(channel, kind, resolver, member_ids)
 
         conn.execute(
             "INSERT INTO channels (workspace, id, name, kind, is_member, member_ids)"
@@ -108,23 +108,37 @@ class _UserResolver:
                 )
                 self._cache[user_id] = name
                 return name
-        except Exception:
+        except AuthError:
+            raise
+        except SlackError:
             pass
 
-        placeholder = f"<{user_id}>"
+        placeholder = f"Unknown user ({user_id})"
+        self.conn.execute(
+            "INSERT INTO users (workspace, id, name, display_name, is_me)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT (workspace, id) DO UPDATE SET"
+            " name = excluded.name",
+            (
+                self.workspace,
+                user_id,
+                placeholder,
+                "",
+                0,
+            ),
+        )
         self._cache[user_id] = placeholder
         return placeholder
 
 
-def _resolve_channel_name(channel: dict, kind: str, resolver: _UserResolver) -> str:
+def _resolve_channel_name(channel: dict, kind: str, resolver: _UserResolver, member_ids: list) -> str:
     """Resolve channel name at write time, handling DM and group DM naming."""
     if kind == "im":
         user_id = channel.get("user", channel["id"])
         return resolver.resolve(user_id)
     elif kind == "mpim":
-        members = channel.get("members", [])
-        if members:
-            names = [resolver.resolve(uid) for uid in members]
+        if member_ids:
+            names = [resolver.resolve(uid) for uid in member_ids]
             return ", ".join(names)
         return channel.get("name", channel["id"])
     else:
@@ -136,13 +150,15 @@ def _fetch_member_ids(channel: dict, kind: str, client: SlackClient) -> list:
     if kind not in ("im", "mpim"):
         return []
 
+    members = []
     try:
-        members = []
         for member in client.paginate("conversations.members", "members", channel=channel["id"]):
             members.append(member)
-        return members
-    except Exception:
-        return []
+    except SlackError:
+        pass
+    except AuthError:
+        raise
+    return members
 
 
 def tier_for(channel_row, has_posted: bool) -> int:

@@ -13,7 +13,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sherpa.corpus.db import open_db
 from sherpa.corpus.directory import Resolver, sync_directory, tier_for
-from sherpa.corpus.slack import FakeSlack
+from sherpa.corpus.slack import FakeSlack, AuthError
 
 
 def make_basic_client():
@@ -62,7 +62,7 @@ def test_dm_with_unresolvable_counterparty_gets_marked_placeholder(tmp_path):
         "conversations.list": [{"ok": True, "channels": [
             {"id": "D_UNKNOWN", "is_im": True, "user": "U_UNKNOWN"},
         ]}],
-        "users.info": [{"ok": False}],
+        "users.info": [{"ok": False, "error": "user_not_found"}],
         "conversations.members": [{"ok": True, "members": []}],
     })
     conn = open_db(tmp_path / "c.db")
@@ -70,7 +70,9 @@ def test_dm_with_unresolvable_counterparty_gets_marked_placeholder(tmp_path):
     resolver = Resolver(conn, "gravitate")
     name, kind = resolver.channel("D_UNKNOWN")
     assert kind == "im"
-    assert name == "<U_UNKNOWN>"
+    assert "Unknown user" in name
+    assert "U_UNKNOWN" in name
+    assert name != "U_UNKNOWN"  # Not a bare ID
 
 
 def test_dm_resolved_via_users_info(tmp_path):
@@ -107,7 +109,7 @@ def test_resolver_channel_returns_human_names_for_all_kinds(tmp_path):
             {"id": "C_PUBLIC", "name": "public-channel", "is_channel": True, "is_private": False},
             {"id": "C_PRIVATE", "name": "private-channel", "is_channel": True, "is_private": True},
             {"id": "D_DM", "is_im": True, "user": "U_ALICE"},
-            {"id": "G_MPIM", "is_mpim": True, "name": "mpdm-alice--1", "members": ["U_ME", "U_ALICE"]},
+            {"id": "G_MPIM", "is_mpim": True, "name": "mpdm-alice--1"},
         ]}],
         "conversations.members": [{"ok": True, "members": ["U_ME", "U_ALICE"]}],
     })
@@ -131,7 +133,7 @@ def test_mpim_named_from_resolved_participants(tmp_path):
             {"id": "U_BOB", "name": "bob", "profile": {"real_name": "Bob Jones"}},
         ]}],
         "conversations.list": [{"ok": True, "channels": [
-            {"id": "G_GROUP", "is_mpim": True, "name": "mpdm-alice--bob-1", "members": ["U_ME", "U_ALICE", "U_BOB"]},
+            {"id": "G_GROUP", "is_mpim": True, "name": "mpdm-alice--bob-1"},
         ]}],
         "conversations.members": [{"ok": True, "members": ["U_ME", "U_ALICE", "U_BOB"]}],
     })
@@ -155,7 +157,7 @@ def test_member_ids_populated_for_im_and_mpim(tmp_path):
         "conversations.list": [{"ok": True, "channels": [
             {"id": "C_PUBLIC", "name": "public", "is_channel": True, "is_private": False},
             {"id": "D_DM", "is_im": True, "user": "U_ALICE"},
-            {"id": "G_MPIM", "is_mpim": True, "name": "group", "members": ["U_ME", "U_ALICE"]},
+            {"id": "G_MPIM", "is_mpim": True, "name": "group"},
         ]}],
         "conversations.members": [{"ok": True, "members": ["U_ME", "U_ALICE"]}],
     })
@@ -170,6 +172,24 @@ def test_member_ids_populated_for_im_and_mpim(tmp_path):
 
     mpim_members = conn.execute("SELECT member_ids FROM channels WHERE id='G_MPIM'").fetchone()[0]
     assert mpim_members == '["U_ME", "U_ALICE"]'
+
+
+def test_autherror_from_users_info_propagates(tmp_path):
+    """AuthError from users.info must propagate out of sync_directory, not be swallowed."""
+    client = FakeSlack({
+        "auth.test": [{"ok": True, "user_id": "U_ME"}],
+        "users.list": [{"ok": True, "members": [
+            {"id": "U_ME", "name": "jim", "profile": {"real_name": "Jim Vogel"}},
+        ]}],
+        "conversations.list": [{"ok": True, "channels": [
+            {"id": "D_EXTERNAL", "is_im": True, "user": "U_EXTERNAL"},
+        ]}],
+        "users.info": [{"ok": False, "error": "invalid_auth"}],
+        "conversations.members": [{"ok": True, "members": []}],
+    })
+    conn = open_db(tmp_path / "c.db")
+    with pytest.raises(AuthError):
+        sync_directory(conn, client, "gravitate", me=None)
 
 
 def test_tier_for_ranks_dms_then_posted_then_lurked():
