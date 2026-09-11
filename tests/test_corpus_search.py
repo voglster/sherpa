@@ -17,6 +17,7 @@ from sherpa.corpus.db import EMBED_DIM, open_db
 from sherpa.corpus.embed import FakeEmbedder, embed_pending
 from sherpa.corpus.search import (
     Filters,
+    _hydrate,
     KNN_DISTANCE_FLOOR,
     RRF_K,
     conversation_with,
@@ -98,7 +99,7 @@ def test_exact_token_is_found_even_though_embeddings_are_fake(corpus):
 
 
 def test_person_filter_excludes_other_conversations(corpus):
-    hits = search(corpus, "I'll", FakeEmbedder(), filters=Filters(person="Erica Lin"), k=5)
+    hits = search(corpus, "writeup", FakeEmbedder(), filters=Filters(person="Erica Lin"), k=5)
     assert hits
     assert all("Hunter" not in hit.transcript for hit in hits)
 
@@ -118,7 +119,8 @@ def test_mine_filter_requires_a_message_from_jim_in_the_chunk(corpus):
 
 
 def test_since_filter_excludes_older_conversations(corpus):
-    hits = search(corpus, "I'll", FakeEmbedder(), filters=Filters(since=5000.0), k=5)
+    hits = search(corpus, "writeup", FakeEmbedder(), filters=Filters(since=5000.0), k=5)
+    assert hits
     assert all(hit.start_ts >= 5000.0 for hit in hits)
 
 
@@ -387,3 +389,84 @@ def test_person_filter_reaches_a_chunk_the_person_never_spoke_in(corpus):
     _one_sided_dm(corpus, channel="DQUIET", person="Quiet Person")
     hits = search(corpus, "schema", FakeEmbedder(), filters=Filters(person="Quiet Person"), k=5)
     assert any("I owe you the schema by thursday" in hit.transcript for hit in hits)
+
+
+def _thread_and_chatter(conn, channel="DTHREAD"):
+    """A thread running while the channel talks about something else.
+
+    Hydrating by timestamp range alone interleaves the two, and the rendered
+    transcript is what the agent reads and summarizes -- misattributing a
+    commitment from a merged transcript is a direct path to a wrong answer.
+    """
+    base = 1757606400.000100
+    insert(conn, base, "Hunter Reeves", "loose chatter one", channel=channel,
+           kind="public", name="gravi-cli")
+    insert(conn, base + 300, "Erica Lin", "loose chatter two", channel=channel,
+           kind="public", name="gravi-cli")
+    for offset, (author, text) in enumerate([
+        ("Hunter Reeves", "thread parent: can you take the flag work?"),
+        ("Jim Vogel", "thread reply: I'll have it thursday"),
+        ("Hunter Reeves", "thread close: perfect"),
+    ]):
+        insert(conn, base + 100 + offset, author, text, channel=channel,
+               kind="public", name="gravi-cli")
+        conn.execute(
+            "UPDATE messages SET thread_ts = ?, thread_ts_raw = ? WHERE id = ?",
+            (base + 100, f"{base + 100}", f"gravitate:{channel}:{base + 100 + offset}"),
+        )
+    conn.commit()
+    build_chunks(conn, "gravitate", channel)
+    embed_pending(conn, FakeEmbedder())
+
+
+def test_a_thread_chunk_hydrates_to_the_thread_not_the_channel(corpus):
+    _thread_and_chatter(corpus)
+    chunk_id = corpus.execute(
+        "SELECT id FROM chunks WHERE channel_id = 'DTHREAD' AND thread_ts IS NOT NULL"
+    ).fetchone()[0]
+    hit = _hydrate(corpus, chunk_id, 0.0, 3)
+    assert "thread reply" in hit.transcript
+    assert "loose chatter" not in hit.transcript
+
+
+def test_a_loose_chunk_does_not_pull_in_thread_replies(corpus):
+    _thread_and_chatter(corpus)
+    chunk_id = corpus.execute(
+        "SELECT id FROM chunks WHERE channel_id = 'DTHREAD' AND thread_ts IS NULL"
+    ).fetchone()[0]
+    hit = _hydrate(corpus, chunk_id, 0.0, 3)
+    assert "loose chatter" in hit.transcript
+    assert "thread reply" not in hit.transcript
+
+
+def test_thread_at_a_reply_returns_the_whole_thread(corpus):
+    _thread_and_chatter(corpus)
+    permalink = corpus.execute(
+        "SELECT permalink FROM messages WHERE text LIKE 'thread reply%'"
+    ).fetchone()[0]
+    hit = thread_at(corpus, permalink)
+    assert "thread parent" in hit.transcript
+    assert "thread close" in hit.transcript
+    assert "loose chatter" not in hit.transcript
+
+
+def test_a_natural_language_query_does_not_match_every_chunk(floor_corpus):
+    """FTS5 has no default stopword list, so ORing every token makes any
+    question match nearly everything -- BM25 then supplies 50 candidates for
+    any query at all, defeating the distance floor guarding the other half of
+    the pipeline."""
+    embedder = ScriptedEmbedder({}, FLOOR_FAR)
+    hits = search(floor_corpus, "what did I say about the thing", embedder, k=5)
+    assert hits == []
+
+
+def test_a_query_whose_substantive_terms_match_still_answers(floor_corpus):
+    embedder = ScriptedEmbedder({}, FLOOR_FAR)
+    hits = search(floor_corpus, "what did I say about the gardening chatter", embedder, k=5)
+    assert any("gardening" in hit.transcript for hit in hits)
+
+
+def test_a_query_of_nothing_but_function_words_answers_empty(corpus):
+    """No term in it can discriminate, so there is no honest answer to give --
+    and "here are five conversations" would be a dishonest one."""
+    assert search(corpus, "what about the thing I said", FakeEmbedder(), k=5) == []

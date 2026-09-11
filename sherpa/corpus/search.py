@@ -50,6 +50,24 @@ IN_CLAUSE_LIMIT = 900
 # see the Task 9 report for the reasoning and why it may need retuning.
 KNN_DISTANCE_FLOOR = 1.2
 
+# A BM25 hit counts only if the chunk carries at least this many of the query's
+# substantive terms -- or all of them, when the query has fewer. One shared word
+# is what makes an OR query match the whole corpus; requiring two is the cheapest
+# guard that still lets a single deliberate term ("KB-51508") answer on its own.
+MIN_MATCHING_TERMS = 2
+
+# Function words carry no discrimination in a corpus of English chat, and FTS5
+# has no list of its own. Deliberately short: anything domain-specific belongs
+# in the index, not in here.
+STOPWORDS = frozenset("""
+a about all am an and any are as at be been being but by can cant could did do
+does doing dont for from get got had has have he her here hers him his how i id
+if ill im in into is it its ive just like ll me might must my no nor not of off
+on once one only or other our out over own re said same she should so some such
+than that the their them then there these they this those to too up us ve very
+was we were what when where which while who whom why will with would you your
+""".split())
+
 
 @dataclass
 class Filters:
@@ -117,21 +135,45 @@ def _where(filters: Filters) -> tuple[str, list]:
 
 def _bm25_ranked(conn, query: str, filters: Filters) -> list[int]:
     where, params = _where(filters)
-    sanitized = _fts_query(query)
-    if not sanitized:
+    terms = _substantive_terms(query)
+    if not terms:
         return []
+    required = min(MIN_MATCHING_TERMS, len(terms))
     rows = conn.execute(
-        f"SELECT c.id FROM chunks_fts f JOIN chunks c ON c.id = f.chunk_id"
+        f"SELECT c.id, c.header || ' ' || c.text || ' ' || c.participants AS body"
+        f" FROM chunks_fts f JOIN chunks c ON c.id = f.chunk_id"
         f" WHERE chunks_fts MATCH ? AND {where}"
         f" ORDER BY bm25(chunks_fts) LIMIT ?",
-        [sanitized, *params, CANDIDATES],
+        [_fts_query(terms), *params, CANDIDATES],
     ).fetchall()
-    return [row[0] for row in rows]
+    return [
+        row["id"]
+        for row in rows
+        if sum(term.lower() in row["body"].lower() for term in terms) >= required
+    ]
 
 
-def _fts_query(query: str) -> str:
+def _substantive_terms(query: str) -> list[str]:
+    """The words in a query that can actually discriminate between chunks.
+
+    FTS5 ships no stopword list, so ORing every token means "what did I say
+    about the thing" matches any chunk containing "the" -- which is all of
+    them. BM25 then hands fusion 50 candidates for any query whatsoever, and
+    the KNN distance floor guarding the other half of the pipeline is moot,
+    because every confabulated hit arrives through this half instead.
+    """
+    seen, terms = set(), []
+    for token in re.findall(r"[\w\-\.]+", query):
+        lowered = token.lower()
+        if lowered in STOPWORDS or lowered in seen:
+            continue
+        seen.add(lowered)
+        terms.append(token)
+    return terms
+
+
+def _fts_query(terms: list[str]) -> str:
     """FTS5 treats punctuation as syntax; quote each term so KB-51508 is literal."""
-    terms = [t for t in re.findall(r"[\w\-\.]+", query) if t]
     return " OR ".join(f'"{term}"' for term in terms)
 
 
@@ -295,27 +337,42 @@ def _overlaps(a: Hit, b: Hit) -> bool:
     )
 
 
+def _conversation_scope(chunk) -> tuple[str, list]:
+    if chunk["thread_ts"] is None:
+        return "thread_ts IS NULL", []
+    return "thread_ts = ?", [chunk["thread_ts"]]
+
+
 def _hydrate(conn, chunk_id: int, score: float, context: int) -> Hit | None:
     chunk = conn.execute("SELECT * FROM chunks WHERE id = ?", (chunk_id,)).fetchone()
     if chunk is None:
         return None
 
+    # A thread and the channel around it run at the same time, so a range on ts
+    # alone merges two conversations into one transcript -- and the transcript
+    # is what the agent reads and summarizes. A thread chunk hydrates to its
+    # thread; a loose chunk stays out of the threads it deliberately excluded.
+    scope, scope_params = _conversation_scope(chunk)
+
     messages = conn.execute(
         "SELECT * FROM messages WHERE workspace = ? AND channel_id = ?"
-        " AND ts BETWEEN ? AND ? ORDER BY ts",
-        (chunk["workspace"], chunk["channel_id"], chunk["start_ts"], chunk["end_ts"]),
+        f" AND {scope} AND ts BETWEEN ? AND ? ORDER BY ts",
+        (chunk["workspace"], chunk["channel_id"], *scope_params,
+         chunk["start_ts"], chunk["end_ts"]),
     ).fetchall()
 
     if context:
         before = conn.execute(
-            "SELECT * FROM messages WHERE workspace = ? AND channel_id = ? AND ts < ?"
-            " ORDER BY ts DESC LIMIT ?",
-            (chunk["workspace"], chunk["channel_id"], chunk["start_ts"], context),
+            f"SELECT * FROM messages WHERE workspace = ? AND channel_id = ? AND {scope}"
+            " AND ts < ? ORDER BY ts DESC LIMIT ?",
+            (chunk["workspace"], chunk["channel_id"], *scope_params,
+             chunk["start_ts"], context),
         ).fetchall()
         after = conn.execute(
-            "SELECT * FROM messages WHERE workspace = ? AND channel_id = ? AND ts > ?"
-            " ORDER BY ts LIMIT ?",
-            (chunk["workspace"], chunk["channel_id"], chunk["end_ts"], context),
+            f"SELECT * FROM messages WHERE workspace = ? AND channel_id = ? AND {scope}"
+            " AND ts > ? ORDER BY ts LIMIT ?",
+            (chunk["workspace"], chunk["channel_id"], *scope_params,
+             chunk["end_ts"], context),
         ).fetchall()
         messages = list(reversed(before)) + list(messages) + list(after)
 
@@ -372,6 +429,13 @@ def sent_to(conn: sqlite3.Connection, person: str, *, limit: int = 50) -> Page:
 
 
 def thread_at(conn: sqlite3.Connection, permalink_or_id: str) -> Hit | None:
+    """The whole thread around a message, or its conversation window if loose.
+
+    A thread can span several chunks and a chunk can start mid-thread, so
+    answering from the chunk that happens to cover the message returns a
+    time-slice of it -- and, before the hydration scope was fixed, a slice of
+    the channel instead.
+    """
     message = conn.execute(
         "SELECT * FROM messages WHERE permalink = ? OR id = ?",
         (permalink_or_id, permalink_or_id),
@@ -379,9 +443,40 @@ def thread_at(conn: sqlite3.Connection, permalink_or_id: str) -> Hit | None:
     if message is None:
         return None
 
+    if message["thread_ts"] is not None:
+        return _thread_hit(conn, message)
+
     chunk = conn.execute(
         "SELECT id FROM chunks WHERE workspace = ? AND channel_id = ?"
         " AND ? BETWEEN start_ts AND end_ts ORDER BY start_ts LIMIT 1",
         (message["workspace"], message["channel_id"], message["ts"]),
     ).fetchone()
     return _hydrate(conn, chunk[0], 0.0, 3) if chunk else None
+
+
+def _thread_hit(conn: sqlite3.Connection, message) -> Hit | None:
+    messages = conn.execute(
+        "SELECT * FROM messages WHERE workspace = ? AND channel_id = ? AND thread_ts = ?"
+        " ORDER BY ts",
+        (message["workspace"], message["channel_id"], message["thread_ts"]),
+    ).fetchall()
+    if not messages:
+        return None
+
+    header = conn.execute(
+        "SELECT header FROM chunks WHERE workspace = ? AND channel_id = ? AND thread_ts = ?"
+        " ORDER BY start_ts LIMIT 1",
+        (message["workspace"], message["channel_id"], message["thread_ts"]),
+    ).fetchone()
+
+    return Hit(
+        chunk_id=0,
+        score=0.0,
+        header=header["header"] if header else messages[0]["channel_name"],
+        transcript=format_script(messages),
+        permalink=messages[0]["permalink"],
+        channel=message["channel_id"],
+        workspace=message["workspace"],
+        start_ts=messages[0]["ts"],
+        end_ts=messages[-1]["ts"],
+    )
