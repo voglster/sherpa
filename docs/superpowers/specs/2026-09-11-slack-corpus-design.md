@@ -303,15 +303,35 @@ knowingly.
 
 ## Error handling
 
-- A failing workspace or channel marks `sync_state.status` and does not abort
-  the run; other channels continue.
-- Embedding gateway unavailable: messages still ingest and are FTS-searchable;
-  chunks queue as unembedded and are picked up next run. The corpus degrades to
-  keyword-only rather than stalling.
-- Token expiry surfaces as a `sherpa notify` push, since a silently stale corpus
-  is the worst failure mode here.
-- `status` reports unembedded chunk count and last successful sync per
-  workspace, so staleness is visible rather than inferred.
+**Fail loudly, never degrade quietly.** Jim owns every piece of hardware in this
+path and can fix any of it within minutes. The expensive failure is not a broken
+run — it is a corpus that keeps answering while silently missing data, because
+every answer it gives is then untrustworthy in a way nothing surfaces. A sync
+that stops and shouts costs an evening; a sync that half-works costs the
+credibility of every query built on it.
+
+So:
+
+- **Embedding gateway unavailable → abort the run.** No degrading to
+  keyword-only, no queueing chunks as unembedded. Push via `sherpa notify` and
+  exit non-zero so cron mail carries it too. Messages already committed stay
+  committed; the run simply stops advancing.
+- **Token expired or revoked → abort that workspace's run.** Push via
+  `sherpa notify` naming the workspace and the vault key to refresh, and exit
+  non-zero.
+- **A channel erroring** marks `sync_state.status` and lets other channels
+  finish, but the run still exits non-zero with the failed channels named. One
+  bad channel should not block the other 200; it also should not pass unnoticed.
+- **`search` refuses to answer on a stale corpus.** If the last successful sync
+  for any configured workspace is older than a threshold (default 24h), or any
+  chunk is unembedded, retrieval prints a prominent warning above its results
+  naming the affected workspace and the staleness. `--stale-ok` suppresses it
+  for deliberate offline use. An agent reading results must be told when the
+  corpus cannot answer completely — otherwise it will confidently report that
+  Jim promised nobody anything.
+- `status` reports last successful sync per workspace, unembedded chunk count,
+  and any channel in a failed state, and exits non-zero if the corpus is not
+  fully healthy.
 
 ## Testing
 
