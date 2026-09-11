@@ -21,7 +21,7 @@ _SPEC.loader.exec_module(corpus_tool)
 
 from sherpa.corpus.db import open_db
 from sherpa.corpus.ingest import IngestReport
-from sherpa.corpus.slack import AuthError
+from sherpa.corpus.slack import AuthError, SlackError
 
 
 @pytest.fixture
@@ -132,6 +132,34 @@ def test_sync_exits_1_when_some_channels_merely_fail(workspace, monkeypatch, cap
     with pytest.raises(SystemExit) as caught:
         corpus_tool.main(["sync", "--config", str(config), "--vault", str(vault)])
     assert caught.value.code == 1
+
+
+def test_sync_exits_1_with_structured_error_when_slack_error_is_not_auth(workspace, monkeypatch, capsys):
+    """A bare SlackError (e.g. ratelimit exhaustion, cursor repeat) must not become a traceback.
+
+    `ingest_workspace` can raise a plain `SlackError` before it ever reaches its
+    own per-channel try/except (e.g. from `sync_directory`'s `auth.test` or
+    `paginate` calls). That is the world being uncooperative, not a bad token,
+    so it must land as a structured `error:`/`help:` pair on stdout and exit 1
+    — never a bare traceback on stderr, and never exit 2 (only a rejected
+    token is exit 2).
+    """
+    config, vault = workspace
+    monkeypatch.setattr(corpus_tool, "notify", lambda *a, **k: None)
+    monkeypatch.setattr(corpus_tool, "HttpSlackClient", lambda token: object())
+
+    def _raise_slack_error(*args, **kwargs):
+        raise SlackError("ratelimited", retryable=True)
+
+    monkeypatch.setattr(corpus_tool, "ingest_workspace", _raise_slack_error)
+
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(["sync", "--config", str(config), "--vault", str(vault)])
+    assert caught.value.code == 1
+    out = capsys.readouterr().out
+    assert out.startswith("error:")
+    assert "ratelimited" in out
+    assert "help:" in out
 
 
 def test_operations_declares_every_subcommand():

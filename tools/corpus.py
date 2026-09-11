@@ -66,7 +66,7 @@ from sherpa.corpus.config import ConfigError, MissingSecret, load_config, resolv
 from sherpa.corpus.db import open_db
 from sherpa.corpus.health import check, is_healthy, warnings
 from sherpa.corpus.ingest import ingest_workspace
-from sherpa.corpus.slack import AuthError, HttpSlackClient
+from sherpa.corpus.slack import AuthError, HttpSlackClient, SlackError
 
 
 def build_parser() -> tuple[argparse.ArgumentParser, dict]:
@@ -158,6 +158,21 @@ def cmd_sync(args, config) -> int:
                 f"{workspace.name}: slack rejected the token ({error.code})",
                 help=f"sherpa vault_manager set {workspace.token_key} <xoxp-token>",
                 usage=True,
+            )
+        except SlackError as error:
+            # AuthError subclasses SlackError, so this must come after the
+            # `except AuthError` above or the auth branch is unreachable.
+            # Unlike a bad token, this is the world being uncooperative
+            # (rate-limit exhaustion, a repeated pagination cursor, a
+            # transient HTTP error) — retrying the same command later is the
+            # right response, so this is exit 1, not 2.
+            notify(
+                "Slack corpus: sync failed",
+                f"{workspace.name}: {error.code}",
+            )
+            fail(
+                f"{workspace.name}: slack sync failed ({error.code})",
+                help="sherpa corpus sync",
             )
         results.append(
             {
