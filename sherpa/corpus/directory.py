@@ -53,6 +53,7 @@ def sync_directory(conn: sqlite3.Connection, client: SlackClient, workspace: str
         )
 
     resolver = _UserResolver(conn, client, workspace)
+    listed: list[str] = []
 
     for channel in client.paginate(
         "conversations.list",
@@ -78,9 +79,36 @@ def sync_directory(conn: sqlite3.Connection, client: SlackClient, workspace: str
                 json.dumps(member_ids),
             ),
         )
+        listed.append(channel["id"])
 
+    _mark_departures(conn, workspace, listed)
     conn.commit()
     return me_id
+
+
+def _mark_departures(conn: sqlite3.Connection, workspace: str, listed: list[str]) -> None:
+    """Stop scheduling channels the listing no longer contains.
+
+    A channel Jim leaves, or that gets archived, simply stops appearing. Left
+    flagged as a member it is scheduled every run, fails every run, and `status`
+    exits 2 forever -- so within a few weeks of ordinary churn the fail-loud
+    signal is noise and gets ignored, which is how the corpus ends up silently
+    incomplete by a different road. Only reached after the walk completed:
+    a pagination error propagates instead, so a half-read listing never
+    unsubscribes anything.
+    """
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS listed_channels (id TEXT PRIMARY KEY)")
+    conn.execute("DELETE FROM listed_channels")
+    conn.executemany(
+        "INSERT OR IGNORE INTO listed_channels (id) VALUES (?)", [(cid,) for cid in listed]
+    )
+    conn.execute(
+        "UPDATE channels SET is_member = 0"
+        " WHERE workspace = ? AND is_member = 1"
+        " AND id NOT IN (SELECT id FROM listed_channels)",
+        (workspace,),
+    )
+    conn.execute("DELETE FROM listed_channels")
 
 
 def _kind(channel: dict) -> str:

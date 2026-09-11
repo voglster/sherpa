@@ -258,3 +258,14 @@ def test_fake_embedder_vectors_are_stable_across_process_restarts():
     first = run_once("111")
     second = run_once("222")
     assert first == second
+
+
+def test_the_fake_embedder_uses_every_dimension():
+    """`(hash >> i) % 7` is 0 for every i past the hash's bit length, so dims
+    256-767 were identically zero and every distance assertion tuned against
+    this fake -- including the ones justifying KNN_DISTANCE_FLOOR -- ran over a
+    third of the space."""
+    vector = FakeEmbedder().embed(["anything at all"])[0]
+    assert len(vector) == 768
+    assert any(value for value in vector[256:])
+    assert len({value for value in vector[256:]}) > 1

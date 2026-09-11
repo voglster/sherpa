@@ -215,3 +215,41 @@ def test_tier_for_ranks_dms_then_posted_then_lurked():
     assert tier_for({"kind": "mpim"}, has_posted=False) == 1
     assert tier_for({"kind": "public"}, has_posted=True) == 2
     assert tier_for({"kind": "public"}, has_posted=False) == 3
+
+
+def test_a_channel_that_disappears_from_the_listing_stops_being_a_member(tmp_path):
+    """A channel Jim leaves, or that gets archived, simply stops appearing in
+    conversations.list. Left flagged as a member it is scheduled forever, fails
+    forever, and `status` exits 2 permanently -- within weeks of normal churn
+    the fail-loud signal is pure noise, which is how the corpus goes quietly
+    incomplete by another route."""
+    conn = open_db(tmp_path / "c.db")
+    client = make_basic_client()
+    sync_directory(conn, client, "gravitate", me=None)
+    assert conn.execute("SELECT is_member FROM channels WHERE id='C1'").fetchone()[0] == 1
+
+    client._pages["conversations.list"] = [{"ok": True, "channels": [
+        {"id": "D1", "is_im": True, "user": "U_H"},
+    ]}]
+    sync_directory(conn, client, "gravitate", me=None)
+
+    assert conn.execute("SELECT is_member FROM channels WHERE id='C1'").fetchone()[0] == 0
+    assert conn.execute("SELECT is_member FROM channels WHERE id='D1'").fetchone()[0] == 1
+
+
+def test_departure_does_not_touch_another_workspace(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    sync_directory(conn, make_basic_client(), "gravitate", me=None)
+    conn.execute(
+        "INSERT INTO channels (workspace, id, name, kind, is_member)"
+        " VALUES ('other', 'C1', 'gravi-cli', 'public', 1)"
+    )
+    conn.commit()
+
+    client = make_basic_client()
+    client._pages["conversations.list"] = [{"ok": True, "channels": []}]
+    sync_directory(conn, client, "gravitate", me=None)
+
+    assert conn.execute(
+        "SELECT is_member FROM channels WHERE workspace='other' AND id='C1'"
+    ).fetchone()[0] == 1

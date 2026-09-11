@@ -103,8 +103,12 @@ class FakeEmbedder:
     def embed(self, texts: list[str]) -> list[list[float]]:
         self.seen.extend(texts)
         self.batches.append(list(texts))
+        # Per-dimension hashes, not shifts of one: a SHA-256 digest is 256 bits,
+        # so `hash >> i` is 0 for every i past that and the fake would be
+        # identically zero over two thirds of the space it claims to fill.
         return [
-            [float((_stable_hash(t) >> i) % 7) / 7.0 for i in range(self.dim)] for t in texts
+            [float(_stable_hash(f"{t}#{i}") % 7) / 7.0 for i in range(self.dim)]
+            for t in texts
         ]
 
 

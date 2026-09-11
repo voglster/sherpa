@@ -770,3 +770,60 @@ def test_an_unresolvable_mention_keeps_its_id_rather_than_vanishing(tmp_path):
     ingest_workspace(conn, client, "gravitate", me=None)
 
     assert "U09NOBODY" in conn.execute("SELECT text FROM messages").fetchone()[0]
+
+
+def test_a_tombstoned_message_is_removed_from_the_corpus(tmp_path):
+    """Slack replaces a deleted message with a tombstone in the thread it was
+    in. That is one of only two deletions the API lets this corpus observe --
+    conversations.history simply omits deleted messages, so a plain channel
+    message deleted below the cursor cannot be detected at all."""
+    conn = open_db(tmp_path / "c.db")
+    parent = {"ts": PARENT_TS, "user": "U03K2ABCD", "text": "parent",
+              "thread_ts": PARENT_TS, "reply_count": 1}
+    reply = {"ts": REPLY_TS, "user": "U07JIMVOG", "text": "regrettable",
+             "thread_ts": PARENT_TS}
+    client = client_with(history=[{"ok": True, "messages": [parent]}])
+    serve_threads(client, {PARENT_TS: [parent, reply]})
+    ingest_workspace(conn, client, "gravitate", me=None, now=lambda: float(REPLY_TS))
+    assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 2
+
+    serve_threads(client, {PARENT_TS: [
+        parent,
+        {"ts": REPLY_TS, "user": "U07JIMVOG", "text": "This message was deleted.",
+         "subtype": "tombstone", "thread_ts": PARENT_TS},
+    ]})
+    report = ingest_workspace(conn, client, "gravitate", me=None, now=lambda: float(REPLY_TS))
+
+    texts = {row[0] for row in conn.execute("SELECT text FROM messages")}
+    assert texts == {"parent"}
+    assert "D1" in report.channels_touched
+
+
+def test_a_reply_slack_no_longer_serves_is_dropped(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    parent = {"ts": PARENT_TS, "user": "U03K2ABCD", "text": "parent",
+              "thread_ts": PARENT_TS, "reply_count": 1}
+    reply = {"ts": REPLY_TS, "user": "U07JIMVOG", "text": "vanishes",
+             "thread_ts": PARENT_TS}
+    client = client_with(history=[{"ok": True, "messages": [parent]}])
+    serve_threads(client, {PARENT_TS: [parent, reply]})
+    ingest_workspace(conn, client, "gravitate", me=None, now=lambda: float(REPLY_TS))
+
+    serve_threads(client, {PARENT_TS: [parent]})
+    ingest_workspace(conn, client, "gravitate", me=None, now=lambda: float(REPLY_TS))
+
+    texts = {row[0] for row in conn.execute("SELECT text FROM messages")}
+    assert texts == {"parent"}
+
+
+def test_a_deleted_thread_parent_takes_its_replies_with_it(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = _threaded_client()
+    ingest_workspace(conn, client, "gravitate", me=None, now=lambda: float(REPLY_TS))
+    assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 2
+
+    serve_threads(client, {})  # the parent is gone: thread_not_found
+    client._pages["conversations.history"] = [{"ok": True, "messages": []}]
+    ingest_workspace(conn, client, "gravitate", me=None, now=lambda: float(REPLY_TS))
+
+    assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 0
