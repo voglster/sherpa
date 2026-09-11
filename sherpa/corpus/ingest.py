@@ -4,6 +4,12 @@ Slack's channel cursor does not advance when a reply lands on an old thread
 parent, so replies need their own sweep or they are lost forever — the single
 most likely way for this corpus to go quietly incomplete.
 
+History arrives newest-first, so coverage is tracked as a contiguous window with
+a cursor at each end: `sync_state.last_ts` on top, `backfill_state.oldest_ts`
+underneath. Catch-up raises the top only when its pass finished, and backfill
+lowers the bottom one committed page at a time, so an interrupted run leaves
+gaps nowhere and still makes progress everywhere.
+
 The history pagination, the thread sweep, and the tier scheduler all respect
 the same wall-clock budget, and none of them may let one channel or one tier
 monopolize it: a channel with years of backlog or hundreds of live threads
@@ -22,6 +28,9 @@ from sherpa.corpus.directory import Resolver, sync_directory, tier_for
 from sherpa.corpus.slack import AuthError, SlackClient, SlackError
 
 SKIP_SUBTYPES = {"tombstone", "channel_join", "channel_leave", "message_deleted"}
+
+# Slack's own per-page maximum for conversations.history.
+HISTORY_PAGE_LIMIT = 200
 
 # Bounded so a large corpus does not re-fetch every thread it has ever seen on every run.
 THREAD_SWEEP_WINDOW_SECONDS = 30 * 24 * 60 * 60
@@ -114,53 +123,182 @@ def _channels_by_tier(conn: sqlite3.Connection, workspace: str) -> dict[int, lis
 
 
 def _ingest_channel(conn, client, resolver, workspace: str, channel, now, deadline) -> int:
+    """Cover a channel from both ends of its contiguous window.
+
+    `sync_state.last_ts` is the top of that window and `backfill_state.oldest_ts`
+    the bottom. Forward catch-up raises the top, backward backfill lowers the
+    bottom, and everything between them is known to be stored.
+    """
     channel_id = channel["id"]
-    state = conn.execute(
+    covered_from, backfill_complete = _backfill_state(conn, workspace, channel_id)
+    thread_parents: set[str] = set()
+    stored = 0
+
+    if covered_from is not None:
+        stored += _catch_up(
+            conn, client, resolver, workspace, channel, thread_parents, now, deadline
+        )
+    if not backfill_complete:
+        stored += _backfill(
+            conn, client, resolver, workspace, channel, covered_from, thread_parents, now, deadline
+        )
+    stored += _sweep_threads(
+        conn, client, resolver, workspace, channel, thread_parents, now, deadline
+    )
+    conn.commit()
+    return stored
+
+
+def _catch_up(conn, client, resolver, workspace: str, channel, thread_parents, now, deadline) -> int:
+    """Fetch everything newer than the cursor, advancing it only on a clean pass.
+
+    `conversations.history` delivers newest-first, so a pass cut short by the
+    deadline has stored the newest slice of what it asked for, not the oldest.
+    Advancing the cursor there would strand every older message of the same page
+    below it forever, so an interrupted pass leaves the cursor where it was and
+    the next run asks the same question again.
+    """
+    channel_id = channel["id"]
+    last_ts = conn.execute(
         "SELECT last_ts FROM sync_state WHERE workspace = ? AND channel_id = ?",
         (workspace, channel_id),
-    ).fetchone()
-    oldest = state["last_ts"] if state else 0.0
+    ).fetchone()["last_ts"]
 
     stored = 0
-    newest = oldest
-    fresh_thread_parents: set[str] = set()
+    newest = last_ts
+    completed = True
 
     for raw in client.paginate(
         "conversations.history",
         "messages",
         channel=channel_id,
-        oldest=f"{oldest}" if oldest else None,
+        oldest=f"{last_ts}" if last_ts else None,
         inclusive=False,
     ):
         if now() >= deadline:
+            completed = False
             break
         newest = max(newest, float(raw["ts"]))
         if raw.get("reply_count"):
-            fresh_thread_parents.add(raw.get("thread_ts", raw["ts"]))
+            thread_parents.add(raw.get("thread_ts", raw["ts"]))
         stored += _store(conn, resolver, workspace, channel, raw)
 
-    if now() < deadline:
-        window_start = now() - THREAD_SWEEP_WINDOW_SECONDS
-        due_thread_parents = _thread_parents_due_for_sweep(
-            conn, workspace, channel_id, window_start, exclude=fresh_thread_parents
+    if completed:
+        conn.execute(
+            "UPDATE sync_state SET last_ts = ?, updated_at = ?"
+            " WHERE workspace = ? AND channel_id = ?",
+            (newest, time.time(), workspace, channel_id),
         )
-
-        for parent_ts in sorted(fresh_thread_parents | due_thread_parents):
-            if now() >= deadline:
-                break
-            for raw in client.paginate(
-                "conversations.replies", "messages", channel=channel_id, ts=parent_ts
-            ):
-                newest = max(newest, float(raw["ts"]))
-                stored += _store(conn, resolver, workspace, channel, raw)
-            _mark_thread_swept(conn, workspace, channel_id, parent_ts, now())
-
-    conn.execute(
-        "UPDATE sync_state SET last_ts = ?, updated_at = ? WHERE workspace = ? AND channel_id = ?",
-        (newest, time.time(), workspace, channel_id),
-    )
     conn.commit()
     return stored
+
+
+def _backfill(
+    conn, client, resolver, workspace: str, channel, covered_from, thread_parents, now, deadline
+) -> int:
+    """Page backwards through history, committing each completed page.
+
+    Paging by `latest` rather than by Slack's cursor token makes the position
+    durable: a run interrupted after three pages resumes at page four instead of
+    restarting from the newest page, so a first backfill of a long history
+    finishes across however many runs it takes.
+    """
+    channel_id = channel["id"]
+    floor = covered_from
+    stored = 0
+
+    while now() < deadline:
+        body = client.call(
+            "conversations.history",
+            channel=channel_id,
+            latest=f"{floor}" if floor is not None else None,
+            inclusive=False,
+            limit=HISTORY_PAGE_LIMIT,
+        )
+        page = body.get("messages", [])
+        page_oldest = min((float(raw["ts"]) for raw in page), default=None)
+        if page_oldest is None or (floor is not None and page_oldest >= floor):
+            _finish_backfill(conn, workspace, channel_id)
+            return stored
+
+        for raw in page:
+            if raw.get("reply_count"):
+                thread_parents.add(raw.get("thread_ts", raw["ts"]))
+            stored += _store(conn, resolver, workspace, channel, raw)
+
+        if floor is None:
+            conn.execute(
+                "UPDATE sync_state SET last_ts = MAX(last_ts, ?), updated_at = ?"
+                " WHERE workspace = ? AND channel_id = ?",
+                (max(float(raw["ts"]) for raw in page), time.time(), workspace, channel_id),
+            )
+        floor = page_oldest
+        conn.execute(
+            "INSERT INTO backfill_state (workspace, channel_id, oldest_ts, updated_at)"
+            " VALUES (?, ?, ?, ?)"
+            " ON CONFLICT (workspace, channel_id) DO UPDATE SET"
+            " oldest_ts = excluded.oldest_ts, updated_at = excluded.updated_at",
+            (workspace, channel_id, floor, time.time()),
+        )
+        conn.commit()
+
+        if not body.get("has_more", True):
+            _finish_backfill(conn, workspace, channel_id)
+            return stored
+
+    return stored
+
+
+def _sweep_threads(
+    conn, client, resolver, workspace: str, channel, thread_parents, now, deadline
+) -> int:
+    """Re-read threads whose parents the channel cursor has already passed.
+
+    Reply timestamps deliberately never touch `sync_state.last_ts`: a reply can
+    be newer than main-channel messages this run has not fetched yet, and
+    letting it raise the cursor would skip straight over them.
+    """
+    if now() >= deadline:
+        return 0
+
+    channel_id = channel["id"]
+    window_start = now() - THREAD_SWEEP_WINDOW_SECONDS
+    due = _thread_parents_due_for_sweep(
+        conn, workspace, channel_id, window_start, exclude=thread_parents
+    )
+
+    stored = 0
+    for parent_ts in sorted(thread_parents | due):
+        if now() >= deadline:
+            break
+        for raw in client.paginate(
+            "conversations.replies", "messages", channel=channel_id, ts=parent_ts
+        ):
+            stored += _store(conn, resolver, workspace, channel, raw)
+        _mark_thread_swept(conn, workspace, channel_id, parent_ts, now())
+    conn.commit()
+    return stored
+
+
+def _backfill_state(conn, workspace: str, channel_id: str) -> tuple[float | None, bool]:
+    row = conn.execute(
+        "SELECT oldest_ts, complete FROM backfill_state WHERE workspace = ? AND channel_id = ?",
+        (workspace, channel_id),
+    ).fetchone()
+    if row is None:
+        return None, False
+    return row["oldest_ts"], bool(row["complete"])
+
+
+def _finish_backfill(conn, workspace: str, channel_id: str) -> None:
+    conn.execute(
+        "INSERT INTO backfill_state (workspace, channel_id, complete, updated_at)"
+        " VALUES (?, ?, 1, ?)"
+        " ON CONFLICT (workspace, channel_id) DO UPDATE SET"
+        " complete = 1, updated_at = excluded.updated_at",
+        (workspace, channel_id, time.time()),
+    )
+    conn.commit()
 
 
 def _thread_parents_due_for_sweep(

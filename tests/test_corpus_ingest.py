@@ -39,6 +39,78 @@ def client_with(history, replies=None):
     return FakeSlack(pages)
 
 
+class SlackHistory:
+    """`conversations.history` as Slack actually serves it.
+
+    Messages come back NEWEST-FIRST, cut to `limit`, bounded by the exclusive
+    `oldest`/`latest` window, with `has_more` and a `next_cursor` that resumes
+    below the page just returned. A fixture that hands back ascending messages
+    instead is the one ordering under which a broken cursor looks correct, so
+    every history fixture here goes through this server.
+    """
+
+    def __init__(self, messages: list[dict]) -> None:
+        self.messages = sorted(messages, key=lambda m: float(m["ts"]), reverse=True)
+
+    def add(self, *messages: dict) -> None:
+        self.messages = sorted(
+            [*self.messages, *messages], key=lambda m: float(m["ts"]), reverse=True
+        )
+
+    def __call__(self, **params) -> dict:
+        oldest = float(params["oldest"]) if params.get("oldest") else None
+        latest = float(params["latest"]) if params.get("latest") else None
+        if params.get("cursor"):
+            cursor = float(params["cursor"])
+            latest = cursor if latest is None else min(latest, cursor)
+        limit = params.get("limit") or 200
+
+        window = [
+            message
+            for message in self.messages
+            if (oldest is None or float(message["ts"]) > oldest)
+            and (latest is None or float(message["ts"]) < latest)
+        ]
+        page, rest = window[:limit], window[limit:]
+        body = {"ok": True, "messages": page, "has_more": bool(rest)}
+        if rest:
+            body["response_metadata"] = {"next_cursor": page[-1]["ts"]}
+        return body
+
+
+def client_serving(histories: dict[str, SlackHistory], *, replies=None, channels=None):
+    pages = dict(DIRECTORY)
+    if channels is not None:
+        pages["conversations.list"] = [{"ok": True, "channels": channels}]
+    pages["conversations.replies"] = replies or [{"ok": True, "messages": []}]
+    client = FakeSlack(pages)
+    directory_call = client.call
+
+    def call(method, **params):
+        if method != "conversations.history":
+            return directory_call(method, **params)
+        client.calls.append((method, params))
+        return histories[params["channel"]](**params)
+
+    client.call = call
+    return client
+
+
+def _backfill_complete(conn, channel_id: str = "D1") -> bool:
+    row = conn.execute(
+        "SELECT complete FROM backfill_state WHERE channel_id = ?", (channel_id,)
+    ).fetchone()
+    return bool(row and row[0])
+
+
+def history_params(client, *, only_with=None) -> list[dict]:
+    return [
+        params
+        for method, params in client.calls
+        if method == "conversations.history" and (only_with is None or params.get(only_with))
+    ]
+
+
 class TickingClock:
     """A fake wall clock that advances by one second per call, so budget math
     in the ingester is exercised deterministically instead of racing the real
@@ -114,8 +186,8 @@ def test_edited_message_text_is_updated_in_place(tmp_path):
 def test_tombstone_messages_are_not_stored(tmp_path):
     conn = open_db(tmp_path / "c.db")
     client = client_with([{"ok": True, "messages": [
-        {"ts": "100.0", "user": "U_H", "text": "real"},
         {"ts": "101.0", "user": "U_H", "text": "This message was deleted.", "subtype": "tombstone"},
+        {"ts": "100.0", "user": "U_H", "text": "real"},
     ]}])
     ingest_workspace(conn, client, "gravitate", me=None)
     assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 1
@@ -259,32 +331,86 @@ def test_thread_sweep_skips_threads_dead_for_the_entire_window(tmp_path):
     assert "should never arrive" not in texts
 
 
-def test_history_pagination_stops_at_the_budget_and_resumes_without_loss(tmp_path):
+def test_an_interrupted_pass_over_newest_first_history_loses_nothing(tmp_path):
+    """The defect this module exists to avoid: history arrives newest-first, so
+    a run cut off by the budget has stored only the top of the range. Anything
+    that pins a cursor there buries the rest of that page below it forever."""
     conn = open_db(tmp_path / "c.db")
-    client = client_with([{"ok": True, "messages": [
-        {"ts": f"{i}.0", "user": "U_H", "text": f"m{i}"} for i in range(1, 61)
-    ]}])
+    history = SlackHistory([{"ts": f"{i}.0", "user": "U_H", "text": f"m{i}"} for i in range(1, 1001)])
+    client = client_serving({"D1": history})
     clock = TickingClock()
-    report = ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=100.0, now=clock)
 
-    stored = conn.execute("SELECT count(*) FROM messages").fetchone()[0]
-    assert 0 < stored < 60
-    assert report.messages == stored
-    last_ts = conn.execute(
+    first = ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=6.0, now=clock)
+    assert 0 < first.messages < 1000  # the run really was cut short
+
+    for _ in range(30):
+        ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=6.0, now=clock)
+
+    stored = {row[0] for row in conn.execute("SELECT text FROM messages")}
+    assert stored == {f"m{i}" for i in range(1, 1001)}
+
+
+def test_a_first_backfill_terminates_instead_of_refetching_the_newest_pages(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    history = SlackHistory([{"ts": f"{i}.0", "user": "U_H", "text": f"m{i}"} for i in range(1, 1001)])
+    client = client_serving({"D1": history})
+    clock = TickingClock()
+
+    runs = 0
+    while not _backfill_complete(conn) and runs < 30:
+        ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=6.0, now=clock)
+        runs += 1
+
+    assert _backfill_complete(conn)
+    assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 1000
+
+    backward = [params["latest"] for params in history_params(client, only_with="latest")]
+    assert len(backward) == len(set(backward))  # each page picks up below the last, never restarts
+
+
+def test_a_completed_backfill_stops_asking_for_older_pages(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    history = SlackHistory([{"ts": f"{i}.0", "user": "U_H", "text": f"m{i}"} for i in range(1, 301)])
+    client = client_serving({"D1": history})
+    clock = TickingClock()
+
+    for _ in range(10):
+        ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=1000.0, now=clock)
+    assert _backfill_complete(conn)
+
+    client.calls.clear()
+    ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=1000.0, now=clock)
+    assert history_params(client, only_with="latest") == []
+
+
+def test_a_swept_reply_does_not_advance_the_history_cursor(tmp_path):
+    """A reply can be newer than main-channel messages the run has not reached
+    yet; letting it raise the history cursor steps straight over them."""
+    conn = open_db(tmp_path / "c.db")
+    history = SlackHistory([
+        {"ts": "100.0", "user": "U_H", "text": "parent", "thread_ts": "100.0", "reply_count": 1},
+    ])
+    client = client_serving(
+        {"D1": history},
+        replies=[{"ok": True, "messages": [
+            {"ts": "100.0", "user": "U_H", "text": "parent", "thread_ts": "100.0"},
+            {"ts": "500.0", "user": "U_ME", "text": "reply from the future", "thread_ts": "100.0"},
+        ]}],
+    )
+    ingest_workspace(conn, client, "gravitate", me=None, now=lambda: 500.0)
+
+    assert conn.execute(
         "SELECT last_ts FROM sync_state WHERE channel_id='D1'"
-    ).fetchone()[0]
-    assert last_ts == stored  # the newest message actually stored, not the newest fetched
+    ).fetchone()[0] == 100.0
 
-    remaining = [
-        {"ts": f"{i}.0", "user": "U_H", "text": f"m{i}"} for i in range(1, 61) if float(f"{i}.0") > last_ts
-    ]
-    client._pages["conversations.history"] = [{"ok": True, "messages": remaining}]
-    ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=100.0, now=clock)
+    history.add(
+        {"ts": "200.0", "user": "U_H", "text": "posted while the thread ran"},
+        {"ts": "300.0", "user": "U_H", "text": "and another"},
+    )
+    ingest_workspace(conn, client, "gravitate", me=None, now=lambda: 500.0)
 
-    total_stored = conn.execute("SELECT count(*) FROM messages").fetchone()[0]
-    distinct_texts = conn.execute("SELECT count(DISTINCT text) FROM messages").fetchone()[0]
-    assert total_stored == 60
-    assert distinct_texts == 60
+    texts = {row[0] for row in conn.execute("SELECT text FROM messages")}
+    assert {"posted while the thread ran", "and another"} <= texts
 
 
 def test_sweep_caps_parents_per_run_and_covers_the_backlog_over_successive_runs(tmp_path):
@@ -292,7 +418,7 @@ def test_sweep_caps_parents_per_run_and_covers_the_backlog_over_successive_runs(
     thread_count = THREAD_SWEEP_PER_CHANNEL_CAP + 5
     parents = [
         {"ts": f"{i}.0", "user": "U_H", "text": f"parent{i}", "thread_ts": f"{i}.0", "reply_count": 1}
-        for i in range(1, thread_count + 1)
+        for i in range(thread_count, 0, -1)
     ]
     client = client_with(
         history=[{"ok": True, "messages": parents}],
@@ -323,29 +449,18 @@ def test_sweep_caps_parents_per_run_and_covers_the_backlog_over_successive_runs(
 
 def test_a_busy_tier_one_channel_does_not_starve_tier_three(tmp_path):
     conn = open_db(tmp_path / "c.db")
-    pages = dict(DIRECTORY)
-    pages["conversations.list"] = [{"ok": True, "channels": [
-        {"id": "D1", "is_im": True, "user": "U_H"},
-        {"id": "C3", "name": "other", "is_channel": True, "is_member": True},
-    ]}]
-
-    huge_backlog = [{"ts": f"{i}.0", "user": "U_H", "text": f"m{i}"} for i in range(1, 2000)]
+    huge_backlog = [{"ts": f"{i}.0", "user": "U_H", "text": f"m{i}"} for i in range(1, 5000)]
     small_backlog = [{"ts": "5.0", "user": "U_H", "text": "hi from C3"}]
-
-    def history(method, **params):
-        messages = huge_backlog if params.get("channel") == "D1" else small_backlog
-        return {"ok": True, "messages": messages}
-
-    pages["conversations.history"] = [{"ok": True, "messages": []}]
-    pages["conversations.replies"] = [{"ok": True, "messages": []}]
-    client = FakeSlack(pages)
-    original_call = client.call
-    client.call = lambda method, **params: (
-        history(method, **params) if method == "conversations.history" else original_call(method, **params)
+    client = client_serving(
+        {"D1": SlackHistory(huge_backlog), "C3": SlackHistory(small_backlog)},
+        channels=[
+            {"id": "D1", "is_im": True, "user": "U_H"},
+            {"id": "C3", "name": "other", "is_channel": True, "is_member": True},
+        ],
     )
 
     clock = TickingClock()
-    report = ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=100.0, now=clock)
+    report = ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=20.0, now=clock)
 
     d1_stored = conn.execute("SELECT count(*) FROM messages WHERE channel_id = 'D1'").fetchone()[0]
     c3_stored = conn.execute("SELECT count(*) FROM messages WHERE channel_id = 'C3'").fetchone()[0]

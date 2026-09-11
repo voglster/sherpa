@@ -128,6 +128,16 @@ MIGRATIONS: list[str] = [
 
     CREATE INDEX IF NOT EXISTS thread_sweeps_order ON thread_sweeps (workspace, channel_id, last_swept);
     """,
+    """
+    CREATE TABLE IF NOT EXISTS backfill_state (
+        workspace  TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        oldest_ts  REAL,                         -- NULL until the first page lands
+        complete   INTEGER NOT NULL DEFAULT 0,
+        updated_at REAL NOT NULL DEFAULT 0,
+        PRIMARY KEY (workspace, channel_id)
+    );
+    """,
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)
