@@ -133,11 +133,14 @@ def test_5xx_response_retries_then_raises_retryable():
         StubResponse({"error": "too_many_requests"}, status_code=503),
         StubResponse({"error": "something_bad"}, status_code=500),
     ])
-    client = HttpSlackClient("xoxp-x", transport=transport)
+    slept = []
+    client = HttpSlackClient("xoxp-x", transport=transport, sleep=slept.append)
     with pytest.raises(SlackError) as caught:
         client.call("conversations.history", channel="C1")
     assert caught.value.retryable is True
-    assert caught.value.code == "ratelimited"
+    # HTTP error exhaustion should identify the status, not report ratelimited
+    assert caught.value.code.startswith("http_")
+    assert "500" in caught.value.code  # Last attempt was 500
     # Verify all 5 attempts were made
     assert len(transport.requests) == 5
 

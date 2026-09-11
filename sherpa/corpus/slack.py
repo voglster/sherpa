@@ -43,6 +43,8 @@ class HttpSlackClient:
 
     def call(self, method: str, **params: Any) -> dict:
         payload = {k: v for k, v in params.items() if v is not None}
+        last_error_type = None
+        last_status = None
         for attempt in range(MAX_RETRIES):
             response = self._transport.post(
                 API + method,
@@ -55,8 +57,11 @@ class HttpSlackClient:
                 except ValueError:
                     delay = 1.0
                 self._sleep(delay)
+                last_error_type = "ratelimit"
                 continue
             if response.status_code < 200 or response.status_code >= 300:
+                last_error_type = "http_error"
+                last_status = response.status_code
                 self._sleep(2.0 * (attempt + 1))
                 continue
             body = response.json()
@@ -67,8 +72,11 @@ class HttpSlackClient:
                 raise AuthError(code)
             if code == "ratelimited":
                 self._sleep(2.0 * (attempt + 1))
+                last_error_type = "ratelimit"
                 continue
             raise SlackError(code)
+        if last_error_type == "http_error":
+            raise SlackError(f"http_{last_status}", retryable=True)
         raise SlackError("ratelimited", retryable=True)
 
     def paginate(self, method: str, key: str, **params: Any) -> Iterator[dict]:
