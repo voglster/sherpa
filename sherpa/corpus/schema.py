@@ -11,7 +11,7 @@ EMBED_DIM = 768
 
 MIGRATIONS: list[str] = [
     """
-    CREATE TABLE messages (
+    CREATE TABLE IF NOT EXISTS messages (
         id            TEXT PRIMARY KEY,   -- workspace:channel_id:ts
         workspace     TEXT NOT NULL,
         channel_id    TEXT NOT NULL,
@@ -27,34 +27,34 @@ MIGRATIONS: list[str] = [
         meta          TEXT NOT NULL DEFAULT '{}'
     );
 
-    CREATE INDEX messages_channel_ts ON messages (workspace, channel_id, ts);
-    CREATE INDEX messages_thread     ON messages (workspace, channel_id, thread_ts);
-    CREATE INDEX messages_mine       ON messages (is_me, ts);
-    CREATE INDEX messages_author     ON messages (author_name, ts);
+    CREATE INDEX IF NOT EXISTS messages_channel_ts ON messages (workspace, channel_id, ts);
+    CREATE INDEX IF NOT EXISTS messages_thread     ON messages (workspace, channel_id, thread_ts);
+    CREATE INDEX IF NOT EXISTS messages_mine       ON messages (is_me, ts);
+    CREATE INDEX IF NOT EXISTS messages_author     ON messages (author_name, ts);
 
-    CREATE VIRTUAL TABLE messages_fts USING fts5 (
+    CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5 (
         id UNINDEXED, text, author_name, channel_name,
         content = 'messages', content_rowid = 'rowid'
     );
 
-    CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
+    CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
         INSERT INTO messages_fts (rowid, id, text, author_name, channel_name)
         VALUES (new.rowid, new.id, new.text, new.author_name, new.channel_name);
     END;
 
-    CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+    CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
         INSERT INTO messages_fts (messages_fts, rowid, id, text, author_name, channel_name)
         VALUES ('delete', old.rowid, old.id, old.text, old.author_name, old.channel_name);
     END;
 
-    CREATE TRIGGER messages_au AFTER UPDATE ON messages BEGIN
+    CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
         INSERT INTO messages_fts (messages_fts, rowid, id, text, author_name, channel_name)
         VALUES ('delete', old.rowid, old.id, old.text, old.author_name, old.channel_name);
         INSERT INTO messages_fts (rowid, id, text, author_name, channel_name)
         VALUES (new.rowid, new.id, new.text, new.author_name, new.channel_name);
     END;
 
-    CREATE TABLE channels (
+    CREATE TABLE IF NOT EXISTS channels (
         workspace  TEXT NOT NULL,
         id         TEXT NOT NULL,
         name       TEXT NOT NULL,
@@ -64,7 +64,7 @@ MIGRATIONS: list[str] = [
         PRIMARY KEY (workspace, id)
     );
 
-    CREATE TABLE users (
+    CREATE TABLE IF NOT EXISTS users (
         workspace    TEXT NOT NULL,
         id           TEXT NOT NULL,
         name         TEXT NOT NULL,
@@ -73,7 +73,7 @@ MIGRATIONS: list[str] = [
         PRIMARY KEY (workspace, id)
     );
 
-    CREATE TABLE sync_state (
+    CREATE TABLE IF NOT EXISTS sync_state (
         workspace  TEXT NOT NULL,
         channel_id TEXT NOT NULL,
         last_ts    REAL NOT NULL DEFAULT 0,
@@ -84,7 +84,7 @@ MIGRATIONS: list[str] = [
         PRIMARY KEY (workspace, channel_id)
     );
 
-    CREATE TABLE chunks (
+    CREATE TABLE IF NOT EXISTS chunks (
         id           INTEGER PRIMARY KEY,
         workspace    TEXT NOT NULL,
         channel_id   TEXT NOT NULL,
@@ -100,15 +100,15 @@ MIGRATIONS: list[str] = [
         embedded     INTEGER NOT NULL DEFAULT 0
     );
 
-    CREATE INDEX chunks_channel  ON chunks (workspace, channel_id, start_ts);
-    CREATE INDEX chunks_pending  ON chunks (embedded);
-    CREATE UNIQUE INDEX chunks_range ON chunks (workspace, channel_id, msg_first_id, msg_last_id);
+    CREATE INDEX IF NOT EXISTS chunks_channel  ON chunks (workspace, channel_id, start_ts);
+    CREATE INDEX IF NOT EXISTS chunks_pending  ON chunks (embedded);
+    CREATE UNIQUE INDEX IF NOT EXISTS chunks_range ON chunks (workspace, channel_id, msg_first_id, msg_last_id);
 
-    CREATE VIRTUAL TABLE chunks_fts USING fts5 (
+    CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5 (
         chunk_id UNINDEXED, header, text, participants
     );
 
-    CREATE TABLE sync_runs (
+    CREATE TABLE IF NOT EXISTS sync_runs (
         id         INTEGER PRIMARY KEY,
         workspace  TEXT NOT NULL,
         started_at REAL NOT NULL,

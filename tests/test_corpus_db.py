@@ -75,3 +75,28 @@ def test_vec_table_accepts_embed_dim_vectors(tmp_path):
     )
     conn.commit()
     assert conn.execute("SELECT count(*) FROM chunks_vec").fetchone()[0] == 1
+
+
+def test_migration_is_crash_safe(tmp_path):
+    """Verify that forced version reset does not break re-open (tests idempotent DDL)."""
+    path = tmp_path / "c.db"
+    conn = open_db(path)
+    conn.close()
+
+    # Simulate crash: reset user_version to 0 while tables exist
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA user_version = 0")
+    conn.commit()
+    conn.close()
+
+    # This should succeed with idempotent DDL (IF NOT EXISTS)
+    conn = open_db(path)
+    tables = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table','view')")
+    }
+    assert {"messages", "chunks", "channels", "users", "sync_state"} <= tables
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    conn.close()

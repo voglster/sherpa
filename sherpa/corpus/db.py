@@ -34,13 +34,11 @@ def open_db(path: Path, *, vec: bool = True) -> sqlite3.Connection:
 
 def _migrate(conn: sqlite3.Connection, *, vec: bool) -> None:
     applied = conn.execute("PRAGMA user_version").fetchone()[0]
-    for statement in MIGRATIONS[applied:]:
-        conn.executescript(statement)
+    for idx, statement in enumerate(MIGRATIONS[applied:], start=applied + 1):
+        conn.executescript(statement + f"\nPRAGMA user_version = {idx};")
     if vec:
         conn.execute(
             f"CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0("
             f"chunk_id INTEGER PRIMARY KEY, embedding FLOAT[{EMBED_DIM}])"
         )
-    if applied != SCHEMA_VERSION:
-        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
