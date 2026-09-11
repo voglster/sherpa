@@ -100,3 +100,28 @@ def test_migration_is_crash_safe(tmp_path):
     assert {"messages", "chunks", "channels", "users", "sync_state"} <= tables
     assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     conn.close()
+
+
+def test_a_column_addition_and_its_backfill_are_one_transaction(tmp_path, monkeypatch):
+    """sqlite3 runs DDL in autocommit and opens a fresh transaction for the
+    UPDATE that follows, so a crash between them leaves the column present and
+    unfilled -- and "does the column exist" is the only guard, so the backfill
+    would never run again. thread_ts_raw stuck at '' means the whole thread
+    sweep goes quiet, silently and permanently."""
+    from sherpa.corpus import db as db_module
+
+    path = tmp_path / "c.db"
+    open_db(path).close()
+
+    monkeypatch.setattr(
+        db_module,
+        "COLUMN_ADDITIONS",
+        [("messages", "half_written", "TEXT NOT NULL DEFAULT ''", "UPDATE nonexistent SET x = 1")],
+    )
+    with pytest.raises(Exception):
+        open_db(path).close()
+
+    monkeypatch.undo()
+    conn = open_db(path)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    assert "half_written" not in columns

@@ -22,7 +22,7 @@ _SPEC.loader.exec_module(corpus_tool)
 from sherpa.corpus.chunk import build_chunks
 from sherpa.corpus.db import open_db
 from sherpa.corpus.embed import EmbeddingError, FakeEmbedder
-from sherpa.corpus.ingest import IngestReport
+from sherpa.corpus.ingest import IngestReport, mark_dirty
 from sherpa.corpus.slack import AuthError, SlackError
 
 
@@ -462,6 +462,7 @@ def test_sync_also_chunks_and_embeds(workspace, monkeypatch, capsys):
     def _fake_ingest(conn, client, name, me, budget_seconds):
         _insert_message(conn, 1000.0, "Hunter Reeves", "can you take the flag work?")
         _insert_message(conn, 1060.0, "Jim Vogel", "yeah I'll have it thursday", is_me=1)
+        mark_dirty(conn, name, "D1")
         conn.commit()
         return IngestReport(
             workspace=name, messages=2, channels_done=1, channels_failed=[],
@@ -576,6 +577,7 @@ def test_sync_rechunks_only_the_channels_that_received_messages(workspace, monke
     def _fake_ingest(conn, client, name, me, budget_seconds):
         _insert_message(conn, 1757606500.000100, "Hunter Reeves", "can you take the flag work?")
         _insert_message(conn, 1757606560.000100, "Jim Vogel", "yeah I'll have it thursday", is_me=1)
+        mark_dirty(conn, name, "D1")
         conn.commit()
         return IngestReport(
             workspace=name, messages=2, channels_done=1, channels_touched={"D1"}
@@ -615,3 +617,90 @@ def test_sync_reports_failed_threads_and_exits_1(workspace, monkeypatch, capsys)
     assert caught.value.code == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["synced"][0]["threads_failed"] == 1
+
+
+def test_messages_committed_by_an_aborted_run_are_chunked_by_the_next_one(
+    workspace, monkeypatch, capsys
+):
+    """Ingest commits messages page by page, but sync only rebuilds chunks after
+    ingest_workspace returns -- and a rejected token, a rate-limit exhaustion or
+    a kill all leave through paths that never reach it. A dirty set held in
+    memory dies with the process, so those messages have no chunk, no fts row
+    and no vector, forever: invisible to every read command, while `status`
+    reports healthy because it counts only unembedded chunks and there are
+    none. The next successful run has to pick them up."""
+    config, vault = workspace
+    monkeypatch.setattr(corpus_tool, "notify", lambda *a, **k: None)
+    monkeypatch.setattr(corpus_tool, "HttpSlackClient", lambda token: object())
+    monkeypatch.setattr(corpus_tool, "make_embedder", lambda vault=None: FakeEmbedder())
+
+    def _abort_after_committing(conn, client, name, me, budget_seconds):
+        conn.execute(
+            "INSERT INTO sync_state (workspace, channel_id, tier) VALUES (?, 'D1', 1)"
+            " ON CONFLICT (workspace, channel_id) DO NOTHING",
+            (name,),
+        )
+        _insert_message(conn, 1757606400.000100, "Jim Vogel",
+                        "I owe Hunter the schema", is_me=1)
+        mark_dirty(conn, name, "D1")
+        conn.commit()
+        raise AuthError("token_revoked")
+
+    monkeypatch.setattr(corpus_tool, "ingest_workspace", _abort_after_committing)
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(["sync", "--config", str(config), "--vault", str(vault)])
+    assert caught.value.code == 2
+    capsys.readouterr()
+
+    conn = open_db(config.parent / "c.db")
+    assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM chunks").fetchone()[0] == 0
+    conn.close()
+
+    # A fresh process: nothing survives but the database.
+    monkeypatch.setattr(
+        corpus_tool,
+        "ingest_workspace",
+        lambda conn, client, name, me, budget_seconds: IngestReport(workspace=name),
+    )
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(["sync", "--config", str(config), "--vault", str(vault), "--json"])
+    assert caught.value.code == 0
+
+    conn = open_db(config.parent / "c.db")
+    assert conn.execute("SELECT count(*) FROM chunks").fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM chunks WHERE embedded = 1").fetchone()[0] == 1
+
+
+def test_a_first_backfill_is_not_reported_as_a_healthy_corpus(workspace, tmp_path, capsys):
+    """During the first cold backfill -- days, and exactly when the corpus is
+    least complete -- nothing said so: staleness, unembedded chunks and failed
+    channels were all clean, so `status` exited 0 and `search` printed no
+    warning. An agent asking "did I miss anything?" got a confident partial
+    answer."""
+    import time
+
+    config, _ = workspace
+    conn = open_db(config.parent / "c.db")
+    conn.execute(
+        "INSERT INTO sync_state (workspace, channel_id, status, updated_at)"
+        " VALUES ('gravitate', 'D1', 'ok', ?)",
+        (time.time(),),
+    )
+    conn.execute(
+        "INSERT INTO backfill_state (workspace, channel_id, oldest_ts, complete)"
+        " VALUES ('gravitate', 'D1', 1757606400.000100, 0)"
+    )
+    conn.execute(
+        "INSERT INTO thread_sweeps (workspace, channel_id, thread_ts, thread_ts_raw, swept)"
+        " VALUES ('gravitate', 'D1', 1757606400.0001, '1757606400.000100', 0)"
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(["status", "--config", str(config), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert caught.value.code == 2
+    assert any("backfill" in line for line in payload["warnings"])
+    assert any("thread" in line for line in payload["warnings"])

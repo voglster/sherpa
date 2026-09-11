@@ -58,12 +58,24 @@ def _add_columns(conn: sqlite3.Connection) -> None:
     tables = {
         row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
     }
-    for table, column, declaration, backfill in COLUMN_ADDITIONS:
-        if table not in tables:
-            continue
-        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
-        if column in existing:
-            continue
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
-        if backfill:
-            conn.execute(backfill)
+    # One transaction around both halves. sqlite3 runs DDL in autocommit and
+    # opens a separate transaction for the following UPDATE, so a crash between
+    # them would leave the column present but unfilled -- and "does the column
+    # exist" is the only guard, so the backfill would never run again. The
+    # column would then read empty forever, silently, which for thread_ts_raw
+    # means the whole sweep path goes quiet.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for table, column, declaration, backfill in COLUMN_ADDITIONS:
+            if table not in tables:
+                continue
+            existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if column in existing:
+                continue
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+            if backfill:
+                conn.execute(backfill)
+    except Exception:
+        conn.rollback()
+        raise
+    conn.commit()

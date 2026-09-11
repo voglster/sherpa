@@ -95,6 +95,24 @@ def rechunk_channels(conn: sqlite3.Connection, workspace: str, channel_ids) -> i
     return sum(build_chunks(conn, workspace, channel_id) for channel_id in sorted(channel_ids))
 
 
+def rechunk_dirty(conn: sqlite3.Connection, workspace: str) -> int:
+    """Rebuild every channel the database says is out of date, then clear it.
+
+    The dirty flag is written alongside the messages and cleared only after the
+    rebuild, so a run that aborts between the two -- a rejected token, a
+    rate-limit exhaustion, a kill -- leaves the work outstanding for the next
+    run instead of leaving messages that nothing will ever chunk.
+    """
+    from sherpa.corpus.ingest import clear_dirty, dirty_channels
+
+    rebuilt = 0
+    for channel_id in dirty_channels(conn, workspace):
+        rebuilt += build_chunks(conn, workspace, channel_id)
+        clear_dirty(conn, workspace, channel_id)
+    conn.commit()
+    return rebuilt
+
+
 def build_chunks(conn: sqlite3.Connection, workspace: str, channel_id: str) -> int:
     """Make the stored chunks for one channel exactly match its current windowing.
 

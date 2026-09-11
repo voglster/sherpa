@@ -173,20 +173,30 @@ LATE_INDEXES: list[str] = [
 # that is ever handed back to Slack.
 COLUMN_ADDITIONS: list[tuple[str, str, str, str | None]] = [
     ("messages", "ts_raw", "TEXT NOT NULL DEFAULT ''",
-     "UPDATE messages SET ts_raw = CAST(ts AS TEXT)"),
+     "UPDATE messages SET ts_raw = CAST(ts AS TEXT) WHERE ts_raw = ''"),
     ("messages", "thread_ts_raw", "TEXT NOT NULL DEFAULT ''",
-     "UPDATE messages SET thread_ts_raw = CAST(thread_ts AS TEXT) WHERE thread_ts IS NOT NULL"),
+     "UPDATE messages SET thread_ts_raw = CAST(thread_ts AS TEXT)"
+     " WHERE thread_ts IS NOT NULL AND thread_ts_raw = ''"),
     ("sync_state", "last_ts_raw", "TEXT NOT NULL DEFAULT ''", None),
     ("backfill_state", "oldest_ts_raw", "TEXT NOT NULL DEFAULT ''", None),
     ("thread_sweeps", "thread_ts_raw", "TEXT NOT NULL DEFAULT ''",
-     "UPDATE thread_sweeps SET thread_ts_raw = CAST(thread_ts AS TEXT)"),
+     "UPDATE thread_sweeps SET thread_ts_raw = CAST(thread_ts AS TEXT)"
+     " WHERE thread_ts_raw = ''"),
     ("thread_sweeps", "swept", "INTEGER NOT NULL DEFAULT 0",
      "UPDATE thread_sweeps SET swept = 1"),
     # Everyone the conversation is with, not only whoever spoke in this window:
     # an outstanding promise is one-sided by construction, and `participants`
     # (window speakers) cannot see the other party at all.
     ("chunks", "people", "TEXT NOT NULL DEFAULT ''",
-     "UPDATE chunks SET people = participants"),
+     "UPDATE chunks SET people = participants WHERE people = ''"),
+    # The dirty set has to outlive the process. Ingest commits messages page by
+    # page, but chunks are rebuilt only after a run returns, and a rejected
+    # token or a kill leaves through paths that never get there -- so an
+    # in-memory set loses those messages permanently: no chunk, no fts row, no
+    # vector, and nothing in `status` to say so. Existing rows start dirty, so
+    # the first run after an upgrade rebuilds everything once.
+    ("sync_state", "needs_rechunk", "INTEGER NOT NULL DEFAULT 0",
+     "UPDATE sync_state SET needs_rechunk = 1"),
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)

@@ -340,6 +340,7 @@ def _sweep_threads(
                 # The parent is gone from Slack, so the thread is gone here too.
                 # This is the one deletion the API actually lets us observe.
                 _forget_thread(conn, workspace, channel_id, parent_ts)
+                mark_dirty(conn, workspace, channel_id)
                 report.channels_touched.add(channel_id)
                 continue
             # One unreachable thread must not mark the whole channel failed —
@@ -348,6 +349,7 @@ def _sweep_threads(
             report.threads_failed.append((channel_id, parent_ts, error.code))
             continue
         if _reconcile_thread(conn, workspace, channel_id, parent_ts, seen):
+            mark_dirty(conn, workspace, channel_id)
             report.channels_touched.add(channel_id)
         _mark_thread_swept(conn, workspace, channel_id, parent_ts, now())
     conn.commit()
@@ -500,6 +502,39 @@ def _mark_thread_swept(conn: sqlite3.Connection, workspace: str, channel_id: str
     )
 
 
+def mark_dirty(conn, workspace: str, channel_id: str) -> None:
+    """Record that a channel's windowing is out of date, durably.
+
+    Written in the same transaction as the messages themselves, and cleared
+    only once the rebuild has actually happened, so an abort between the two
+    leaves work to do rather than messages nothing will ever chunk.
+    """
+    conn.execute(
+        "INSERT INTO sync_state (workspace, channel_id, needs_rechunk) VALUES (?, ?, 1)"
+        " ON CONFLICT (workspace, channel_id) DO UPDATE SET needs_rechunk = 1"
+        " WHERE needs_rechunk = 0",
+        (workspace, channel_id),
+    )
+
+
+def dirty_channels(conn, workspace: str) -> list[str]:
+    return [
+        row[0]
+        for row in conn.execute(
+            "SELECT channel_id FROM sync_state WHERE workspace = ? AND needs_rechunk = 1"
+            " ORDER BY channel_id",
+            (workspace,),
+        )
+    ]
+
+
+def clear_dirty(conn, workspace: str, channel_id: str) -> None:
+    conn.execute(
+        "UPDATE sync_state SET needs_rechunk = 0 WHERE workspace = ? AND channel_id = ?",
+        (workspace, channel_id),
+    )
+
+
 def _is_storable(raw: dict) -> bool:
     return raw.get("subtype") not in SKIP_SUBTYPES and bool(raw.get("text"))
 
@@ -547,6 +582,7 @@ def _store(conn, resolver: Resolver, workspace: str, channel, raw: dict) -> int:
             json.dumps(meta),
         ),
     )
+    mark_dirty(conn, workspace, channel["id"])
     return 1
 
 

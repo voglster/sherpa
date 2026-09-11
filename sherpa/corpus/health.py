@@ -21,6 +21,8 @@ class Health:
     stale: bool
     unembedded: int
     failed_channels: int
+    backfilling: int = 0
+    unswept_threads: int = 0
 
 
 def check(conn: sqlite3.Connection, config: Config, *, now=time.time) -> list[Health]:
@@ -36,6 +38,18 @@ def check(conn: sqlite3.Connection, config: Config, *, now=time.time) -> list[He
             "SELECT count(*) FROM chunks WHERE workspace = ? AND embedded = 0",
             (workspace.name,),
         ).fetchone()[0]
+        # A corpus still reading its own history is incomplete in the way that
+        # matters most to "did I miss anything?", and a first backfill runs for
+        # days. Nothing else here can see it: staleness, embedding backlog and
+        # channel failures are all clean throughout.
+        backfilling = conn.execute(
+            "SELECT count(*) FROM backfill_state WHERE workspace = ? AND complete = 0",
+            (workspace.name,),
+        ).fetchone()[0]
+        unswept = conn.execute(
+            "SELECT count(*) FROM thread_sweeps WHERE workspace = ? AND swept = 0",
+            (workspace.name,),
+        ).fetchone()[0]
         reports.append(
             Health(
                 workspace=workspace.name,
@@ -43,6 +57,8 @@ def check(conn: sqlite3.Connection, config: Config, *, now=time.time) -> list[He
                 stale=(now() - last) > config.stale_after_hours * 3600,
                 unembedded=unembedded,
                 failed_channels=row["failed"] or 0,
+                backfilling=backfilling,
+                unswept_threads=unswept,
             )
         )
     return reports
@@ -50,7 +66,12 @@ def check(conn: sqlite3.Connection, config: Config, *, now=time.time) -> list[He
 
 def is_healthy(reports: list[Health]) -> bool:
     return all(
-        not r.stale and r.unembedded == 0 and r.failed_channels == 0 for r in reports
+        not r.stale
+        and r.unembedded == 0
+        and r.failed_channels == 0
+        and r.backfilling == 0
+        and r.unswept_threads == 0
+        for r in reports
     )
 
 
@@ -66,4 +87,14 @@ def warnings(reports: list[Health]) -> list[str]:
             lines.append(f"{report.workspace}: {report.unembedded} chunks unembedded — semantic recall is degraded")
         if report.failed_channels:
             lines.append(f"{report.workspace}: {report.failed_channels} channels failed to sync")
+        if report.backfilling:
+            lines.append(
+                f"{report.workspace}: {report.backfilling} channels still backfilling"
+                " — history before the current window is not in the corpus yet"
+            )
+        if report.unswept_threads:
+            lines.append(
+                f"{report.workspace}: {report.unswept_threads} threads never swept"
+                " — their replies are not in the corpus yet"
+            )
     return lines
