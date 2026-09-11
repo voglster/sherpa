@@ -8,7 +8,7 @@ name: corpus
 description: Search an indexed local corpus of your Slack — what you promised, what you missed.
 categories: [slack, search, memory, knowledge]
 axi: true
-secrets: [SLACK_USER_TOKEN_GRAVITATE]
+secrets: [SLACK_USER_TOKEN_GRAVITATE, LITELLM_KEY_CORPUS]
 usage: |
   search <QUERY> [--from NAME] [--mine] [--since 30d] [--k 5] [--context 3]
   with <NAME> [--since 30d]
@@ -55,18 +55,28 @@ outputBudget: 4000
 from __future__ import annotations
 
 import argparse
+import json
+import re
 import subprocess
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sherpa.render import bin_line, emit, fail, parse_strict, truncate
 
+from sherpa.corpus.chunk import rechunk_all
 from sherpa.corpus.config import ConfigError, MissingSecret, load_config, resolve_token
 from sherpa.corpus.db import open_db
+from sherpa.corpus.embed import DEFAULT_BASE_URL, DEFAULT_MODEL, EmbeddingError, GatewayEmbedder, embed_pending
 from sherpa.corpus.health import check, is_healthy, warnings
 from sherpa.corpus.ingest import ingest_workspace
+from sherpa.corpus.search import Filters, Hit, conversation_with, search, sent_to, thread_at
 from sherpa.corpus.slack import AuthError, HttpSlackClient, SlackError
+
+RELATIVE = re.compile(r"^(\d+)([hdw])$")
+SECONDS = {"h": 3600, "d": 86400, "w": 604800}
 
 
 def build_parser() -> tuple[argparse.ArgumentParser, dict]:
@@ -97,17 +107,42 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
     status.add_argument("--json", action="store_true")
     registry["status"] = status
 
-    for name, positional in (
-        ("search", "query"),
-        ("with", "person"),
-        ("owed", "person"),
-        ("thread", "permalink"),
-    ):
-        stub = subparsers.add_parser(name, allow_abbrev=False)
-        stub.add_argument(positional)
-        stub.add_argument("--config", default=None)
-        stub.add_argument("--json", action="store_true")
-        registry[name] = stub
+    search_parser = subparsers.add_parser("search", allow_abbrev=False)
+    search_parser.add_argument("query")
+    search_parser.add_argument("--from", dest="from_person", default=None)
+    search_parser.add_argument("--mine", action="store_true")
+    search_parser.add_argument("--since", default=None)
+    search_parser.add_argument("--workspace", default=None)
+    search_parser.add_argument("--channel", default=None)
+    search_parser.add_argument("--k", type=int, default=5)
+    search_parser.add_argument("--context", type=int, default=3)
+    search_parser.add_argument("--config", default=None)
+    search_parser.add_argument("--vault", default=None)
+    search_parser.add_argument("--json", action="store_true")
+    search_parser.add_argument("--stale-ok", dest="stale_ok", action="store_true")
+    registry["search"] = search_parser
+
+    with_parser = subparsers.add_parser("with", allow_abbrev=False)
+    with_parser.add_argument("person")
+    with_parser.add_argument("--since", default=None)
+    with_parser.add_argument("--config", default=None)
+    with_parser.add_argument("--json", action="store_true")
+    with_parser.add_argument("--stale-ok", dest="stale_ok", action="store_true")
+    registry["with"] = with_parser
+
+    owed_parser = subparsers.add_parser("owed", allow_abbrev=False)
+    owed_parser.add_argument("person")
+    owed_parser.add_argument("--config", default=None)
+    owed_parser.add_argument("--json", action="store_true")
+    owed_parser.add_argument("--stale-ok", dest="stale_ok", action="store_true")
+    registry["owed"] = owed_parser
+
+    thread_parser = subparsers.add_parser("thread", allow_abbrev=False)
+    thread_parser.add_argument("permalink")
+    thread_parser.add_argument("--config", default=None)
+    thread_parser.add_argument("--json", action="store_true")
+    thread_parser.add_argument("--stale-ok", dest="stale_ok", action="store_true")
+    registry["thread"] = thread_parser
 
     return parser, registry
 
@@ -123,6 +158,122 @@ def notify(title: str, message: str) -> None:
         )
     except Exception:
         pass  # the non-zero exit and stdout error still carry the failure
+
+
+def parse_since(value: str) -> float:
+    if match := RELATIVE.match(value):
+        amount, unit = match.groups()
+        return time.time() - int(amount) * SECONDS[unit]
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        fail(
+            f"could not read --since {value!r}",
+            help="sherpa corpus search <QUERY> --since 30d   (or an ISO date: 2026-01-01)",
+            usage=True,
+        )
+
+
+def make_embedder():
+    vault_path = Path.home() / ".sherpa" / "vault.json"
+    vault = json.loads(vault_path.read_text()) if vault_path.exists() else {}
+    key = vault.get("LITELLM_KEY_CORPUS") or vault.get("LITELLM_KEY", "")
+    if not key:
+        print("MISSING_SECRET: LITELLM_KEY_CORPUS", file=sys.stderr)
+        fail(
+            "missing secret LITELLM_KEY_CORPUS",
+            help="sherpa vault_manager set LITELLM_KEY_CORPUS <key>   (mint one: sherpa litellm_keys create)",
+            usage=True,
+        )
+    return GatewayEmbedder(DEFAULT_BASE_URL, key, DEFAULT_MODEL)
+
+
+def render(hits: list[Hit], *, limit_chars: int = 1200) -> list[dict]:
+    rendered = []
+    for hit in hits:
+        transcript, notice = truncate(hit.transcript, limit_chars)
+        entry = {
+            "when": datetime.fromtimestamp(hit.start_ts).strftime("%Y-%m-%d %H:%M"),
+            "where": hit.header,
+            "conversation": transcript,
+            "permalink": hit.permalink,
+        }
+        if notice:
+            entry["truncated"] = notice
+        rendered.append(entry)
+    return rendered
+
+
+def with_health(payload: dict, conn, config, stale_ok: bool) -> dict:
+    if stale_ok:
+        return payload
+    if lines := warnings(check(conn, config)):
+        payload["warnings"] = lines
+        payload["help"] = ["sherpa corpus sync"]
+    return payload
+
+
+def cmd_search(args, config) -> int:
+    conn = open_db(config.db)
+    filters = Filters(
+        person=args.from_person,
+        mine=args.mine,
+        workspace=args.workspace,
+        channel=args.channel,
+        since=parse_since(args.since) if args.since else None,
+    )
+    try:
+        hits = search(conn, args.query, make_embedder(), filters=filters, k=args.k, context=args.context)
+    except EmbeddingError as error:
+        notify("Slack corpus: embedding gateway down", error.detail)
+        fail(
+            f"embedding gateway unavailable: {error.detail}",
+            help="sherpa corpus search <QUERY>   (retry once the gateway is reachable)",
+        )
+
+    payload = {"query": args.query, "count": len(hits), "results": render(hits)}
+    if not hits:
+        payload["results"] = []
+        payload["note"] = f"no conversations matched {args.query!r}"
+    emit(with_health(payload, conn, config, args.stale_ok), as_json=args.json)
+    return 0
+
+
+def cmd_with(args, config) -> int:
+    conn = open_db(config.db)
+    hits = conversation_with(conn, args.person, since=parse_since(args.since) if args.since else None)
+    payload = {"person": args.person, "count": len(hits), "results": render(hits)}
+    if not hits:
+        payload["note"] = f"no conversations with {args.person!r} in the corpus"
+    emit(with_health(payload, conn, config, args.stale_ok), as_json=args.json)
+    return 0
+
+
+def cmd_owed(args, config) -> int:
+    conn = open_db(config.db)
+    hits = sent_to(conn, args.person)
+    payload = {
+        "person": args.person,
+        "count": len(hits),
+        "results": render(hits),
+        "note": "Read these and summarize what was promised — this is a filter, not a classifier.",
+    }
+    if not hits:
+        payload["note"] = f"no messages of mine to {args.person!r} in the corpus"
+    emit(with_health(payload, conn, config, args.stale_ok), as_json=args.json)
+    return 0
+
+
+def cmd_thread(args, config) -> int:
+    conn = open_db(config.db)
+    hit = thread_at(conn, args.permalink)
+    if hit is None:
+        fail(
+            f"no message in the corpus at {args.permalink}",
+            help="sherpa corpus sync",
+        )
+    emit(with_health({"result": render([hit])[0]}, conn, config, args.stale_ok), as_json=args.json)
+    return 0
 
 
 def cmd_sync(args, config) -> int:
@@ -174,12 +325,24 @@ def cmd_sync(args, config) -> int:
                 f"{workspace.name}: slack sync failed ({error.code})",
                 help="sherpa corpus sync",
             )
+
+        rechunk_all(conn, workspace.name)
+        try:
+            embedded = embed_pending(conn, make_embedder())
+        except EmbeddingError as error:
+            notify("Slack corpus: embedding gateway down", error.detail)
+            fail(
+                f"embedding gateway unavailable: {error.detail}",
+                help="sherpa corpus sync   (retry once the gateway is reachable)",
+            )
+
         results.append(
             {
                 "workspace": report.workspace,
                 "messages": report.messages,
                 "channels": report.channels_done,
                 "failed": len(report.channels_failed),
+                "embedded": embedded,
             }
         )
 
@@ -219,15 +382,6 @@ def cmd_status(args, config) -> int:
     return 0 if is_healthy(reports) else 2
 
 
-def cmd_unimplemented(args, config) -> int:
-    """Fail as `usage=True`: retrying identically can never work until Task 10 ships."""
-    fail(
-        f"'{args.command}' is not implemented yet",
-        help="sherpa corpus status",
-        usage=True,
-    )
-
-
 def home_view(config_path) -> int:
     print(bin_line(Path(__file__).resolve()))
     print("description: Search an indexed local corpus of your Slack.")
@@ -254,10 +408,10 @@ def main(argv: list[str] | None = None) -> None:
     handlers = {
         "sync": cmd_sync,
         "status": cmd_status,
-        "search": cmd_unimplemented,
-        "with": cmd_unimplemented,
-        "owed": cmd_unimplemented,
-        "thread": cmd_unimplemented,
+        "search": cmd_search,
+        "with": cmd_with,
+        "owed": cmd_owed,
+        "thread": cmd_thread,
     }
     sys.exit(handlers[args.command](args, config))
 

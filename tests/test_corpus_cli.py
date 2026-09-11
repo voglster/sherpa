@@ -19,7 +19,9 @@ _SPEC = importlib.util.spec_from_file_location("corpus_tool", ROOT / "tools" / "
 corpus_tool = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(corpus_tool)
 
+from sherpa.corpus.chunk import build_chunks
 from sherpa.corpus.db import open_db
+from sherpa.corpus.embed import EmbeddingError, FakeEmbedder
 from sherpa.corpus.ingest import IngestReport
 from sherpa.corpus.slack import AuthError, SlackError
 
@@ -75,25 +77,188 @@ def test_status_emits_json_when_asked(workspace, capsys):
     assert caught.value.code == 2  # never synced is not healthy
 
 
-@pytest.mark.parametrize("command,positional", [
-    ("search", "foo"),
-    ("with", "alice"),
-    ("owed", "alice"),
-    ("thread", "https://x.slack.com/archives/C1/p1"),
-])
-def test_unimplemented_subcommand_exits_2_not_1(workspace, command, positional, capsys):
-    """Retrying an unimplemented subcommand can never succeed, so it must be 2, not 1.
+def _insert_message(conn, ts, author, text, *, is_me=0, channel="D1", kind="im", name="Hunter Reeves"):
+    conn.execute(
+        "INSERT INTO messages (id, workspace, channel_id, channel_name, channel_kind, ts,"
+        " author_id, author_name, is_me, text, permalink)"
+        " VALUES (?, 'gravitate', ?, ?, ?, ?, 'U', ?, ?, ?, ?)",
+        (
+            f"gravitate:{channel}:{ts}",
+            channel,
+            name,
+            kind,
+            ts,
+            author,
+            is_me,
+            text,
+            f"https://gravitate.slack.com/archives/{channel}/p{int(ts)}",
+        ),
+    )
 
-    Exit 1 means "the world was uncooperative, retry is reasonable" per
-    docs/SHERPA_STANDARDS.md; an agent that saw 1 here would retry a command
-    that cannot ever succeed until Task 10 lands. Checking only "it failed"
-    would not catch a regression to the wrong exit code.
-    """
-    config, _ = workspace
+
+def _seeded_db(path):
+    conn = open_db(path)
+    _insert_message(conn, 1000.0, "Hunter Reeves", "can you take the flag work?")
+    _insert_message(conn, 1060.0, "Jim Vogel", "yeah I'll have it thursday", is_me=1)
+    conn.commit()
+    build_chunks(conn, "gravitate", "D1")
+    from sherpa.corpus.embed import embed_pending
+
+    embed_pending(conn, FakeEmbedder())
+    return conn
+
+
+def test_parse_since_accepts_relative_and_iso_forms():
+    import time
+
+    now = time.time()
+    assert abs(corpus_tool.parse_since("1d") - (now - 86400)) < 5
+    assert abs(corpus_tool.parse_since("2h") - (now - 7200)) < 5
+    assert abs(corpus_tool.parse_since("1w") - (now - 604800)) < 5
+    assert corpus_tool.parse_since("2026-01-01") < now
+
+
+def test_parse_since_rejects_garbage():
     with pytest.raises(SystemExit) as caught:
-        corpus_tool.main([command, positional, "--config", str(config)])
+        corpus_tool.parse_since("soonish")
     assert caught.value.code == 2
+
+
+class _StubEmbedder:
+    def embed(self, texts):
+        return [[0.0] * 768 for _ in texts]
+
+
+def test_search_warns_loudly_when_the_corpus_is_stale(workspace, capsys, monkeypatch):
+    config, _ = workspace
+    monkeypatch.setattr(corpus_tool, "make_embedder", lambda: _StubEmbedder())
+    with pytest.raises(SystemExit):
+        corpus_tool.main(["search", "anything", "--config", str(config), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["warnings"]
+
+
+def test_stale_ok_suppresses_the_warning(workspace, capsys, monkeypatch):
+    config, _ = workspace
+    monkeypatch.setattr(corpus_tool, "make_embedder", lambda: _StubEmbedder())
+    with pytest.raises(SystemExit):
+        corpus_tool.main(["search", "anything", "--config", str(config), "--stale-ok", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert "warnings" not in payload
+
+
+def test_search_returns_hits_and_exits_0(workspace, capsys, monkeypatch, tmp_path):
+    config, _ = workspace
+    _seeded_db(config.parent / "c.db").close()
+    monkeypatch.setattr(corpus_tool, "make_embedder", lambda: FakeEmbedder())
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(["search", "flag work", "--config", str(config), "--stale-ok", "--json"])
+    assert caught.value.code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] >= 1
+    assert "Hunter" in payload["results"][0]["conversation"] or "Jim" in payload["results"][0]["conversation"]
+
+
+def test_search_with_no_matches_reports_a_definitive_empty_state(workspace, capsys, monkeypatch):
+    config, _ = workspace
+    open_db(config.parent / "c.db").close()
+    monkeypatch.setattr(corpus_tool, "make_embedder", lambda: FakeEmbedder())
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(["search", "nothing here", "--config", str(config), "--stale-ok", "--json"])
+    assert caught.value.code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 0
+    assert payload["results"] == []
+    assert "note" in payload
+
+
+def test_search_embedding_error_notifies_and_exits_1(workspace, capsys, monkeypatch):
+    config, _ = workspace
+    open_db(config.parent / "c.db").close()
+    monkeypatch.setattr(corpus_tool, "notify", lambda *a, **k: None)
+
+    class _BrokenEmbedder:
+        def embed(self, texts):
+            raise EmbeddingError("gateway down")
+
+    monkeypatch.setattr(corpus_tool, "make_embedder", lambda: _BrokenEmbedder())
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(["search", "anything", "--config", str(config), "--stale-ok"])
+    assert caught.value.code == 1
+    assert "gateway down" in capsys.readouterr().out
+
+
+def test_with_returns_conversation_and_owed_filters_to_my_messages(workspace, capsys):
+    config, _ = workspace
+    _seeded_db(config.parent / "c.db").close()
+
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(["with", "Hunter Reeves", "--config", str(config), "--stale-ok", "--json"])
+    assert caught.value.code == 0
+    with_payload = json.loads(capsys.readouterr().out)
+    assert with_payload["count"] >= 1
+
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(["owed", "Hunter Reeves", "--config", str(config), "--stale-ok", "--json"])
+    assert caught.value.code == 0
+    owed_payload = json.loads(capsys.readouterr().out)
+    assert owed_payload["count"] >= 1
+    assert "filter" in owed_payload["note"].lower() or "summarize" in owed_payload["note"].lower()
+    assert all("Jim Vogel" in r["conversation"] for r in owed_payload["results"])
+
+
+def test_owed_with_no_conversation_reports_a_definitive_empty_state(workspace, capsys):
+    config, _ = workspace
+    open_db(config.parent / "c.db").close()
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(["owed", "Nobody Ever", "--config", str(config), "--stale-ok", "--json"])
+    assert caught.value.code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 0
+    assert "Nobody Ever" in payload["note"]
+
+
+def test_thread_at_known_permalink_returns_a_result(workspace, capsys):
+    config, _ = workspace
+    _seeded_db(config.parent / "c.db").close()
+    permalink = "https://gravitate.slack.com/archives/D1/p1000"
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(["thread", permalink, "--config", str(config), "--stale-ok", "--json"])
+    assert caught.value.code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["result"]["permalink"] == permalink
+
+
+def test_thread_at_unknown_permalink_exits_1_with_help(workspace, capsys):
+    config, _ = workspace
+    open_db(config.parent / "c.db").close()
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(
+            ["thread", "https://gravitate.slack.com/archives/D1/pNOPE", "--config", str(config), "--stale-ok"]
+        )
+    assert caught.value.code == 1
     assert capsys.readouterr().out.startswith("error:")
+
+
+def test_sync_also_chunks_and_embeds(workspace, monkeypatch, capsys):
+    config, vault = workspace
+    monkeypatch.setattr(corpus_tool, "notify", lambda *a, **k: None)
+    monkeypatch.setattr(corpus_tool, "HttpSlackClient", lambda token: object())
+    monkeypatch.setattr(corpus_tool, "make_embedder", lambda: FakeEmbedder())
+
+    def _fake_ingest(conn, client, name, me, budget_seconds):
+        _insert_message(conn, 1000.0, "Hunter Reeves", "can you take the flag work?")
+        _insert_message(conn, 1060.0, "Jim Vogel", "yeah I'll have it thursday", is_me=1)
+        conn.commit()
+        return IngestReport(workspace=name, messages=2, channels_done=1, channels_failed=[])
+
+    monkeypatch.setattr(corpus_tool, "ingest_workspace", _fake_ingest)
+
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(["sync", "--config", str(config), "--vault", str(vault), "--json"])
+    assert caught.value.code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["synced"][0]["embedded"] >= 1
 
 
 def test_sync_exits_2_when_token_is_rejected(workspace, monkeypatch, capsys):
@@ -118,6 +283,7 @@ def test_sync_exits_1_when_some_channels_merely_fail(workspace, monkeypatch, cap
     config, vault = workspace
     monkeypatch.setattr(corpus_tool, "notify", lambda *a, **k: None)
     monkeypatch.setattr(corpus_tool, "HttpSlackClient", lambda token: object())
+    monkeypatch.setattr(corpus_tool, "make_embedder", lambda: FakeEmbedder())
 
     def _partial_failure(*args, **kwargs):
         return IngestReport(
