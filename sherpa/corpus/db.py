@@ -7,7 +7,7 @@ from pathlib import Path
 
 import sqlite_vec
 
-from sherpa.corpus.schema import EMBED_DIM, MIGRATIONS, SCHEMA_VERSION
+from sherpa.corpus.schema import COLUMN_ADDITIONS, EMBED_DIM, LATE_INDEXES, MIGRATIONS, SCHEMA_VERSION
 
 __all__ = ["EMBED_DIM", "SCHEMA_VERSION", "open_db"]
 
@@ -36,9 +36,34 @@ def _migrate(conn: sqlite3.Connection, *, vec: bool) -> None:
     applied = conn.execute("PRAGMA user_version").fetchone()[0]
     for idx, statement in enumerate(MIGRATIONS[applied:], start=applied + 1):
         conn.executescript(statement + f"\nPRAGMA user_version = {idx};")
+    _add_columns(conn)
+    for statement in LATE_INDEXES:
+        conn.execute(statement)
     if vec:
         conn.execute(
             f"CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0("
             f"chunk_id INTEGER PRIMARY KEY, embedding FLOAT[{EMBED_DIM}])"
         )
     conn.commit()
+
+
+def _add_columns(conn: sqlite3.Connection) -> None:
+    """Apply COLUMN_ADDITIONS to whichever tables exist, exactly once each.
+
+    `ADD COLUMN` has no idempotent form, so the guard is an explicit look at
+    what the table already has. The backfill runs only in the pass that adds
+    the column: it is a whole-table write, and re-running it every open would
+    also overwrite values written since.
+    """
+    tables = {
+        row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    for table, column, declaration, backfill in COLUMN_ADDITIONS:
+        if table not in tables:
+            continue
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column in existing:
+            continue
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+        if backfill:
+            conn.execute(backfill)

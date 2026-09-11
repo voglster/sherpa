@@ -140,4 +140,38 @@ MIGRATIONS: list[str] = [
     """,
 ]
 
+# Indexes over added columns. Applied after COLUMN_ADDITIONS on every open, for
+# the same reason those are not migrations: a migration may be replayed before
+# the column it indexes exists.
+LATE_INDEXES: list[str] = [
+    "CREATE INDEX IF NOT EXISTS messages_thread_raw"
+    " ON messages (workspace, channel_id, thread_ts_raw)",
+]
+
+# Added columns, applied idempotently on every open.
+#
+# `ALTER TABLE ... ADD COLUMN` has no `IF NOT EXISTS` form, so it cannot live in
+# MIGRATIONS: those must survive being replayed from user_version 0 against a
+# database that already has the tables. Each entry names its table, its column
+# definition, and the statement that fills the column in for rows written before
+# it existed -- run only in the same pass that adds the column.
+#
+# A Slack ts is a string with exactly six fractional digits and the API matches
+# it literally: `str(float("1789151200.000100"))` is "1789151200.0001", which
+# addresses no message at all. The REAL columns stay -- they are what ordering
+# and range queries want -- and these carry the exact string for every value
+# that is ever handed back to Slack.
+COLUMN_ADDITIONS: list[tuple[str, str, str, str | None]] = [
+    ("messages", "ts_raw", "TEXT NOT NULL DEFAULT ''",
+     "UPDATE messages SET ts_raw = CAST(ts AS TEXT)"),
+    ("messages", "thread_ts_raw", "TEXT NOT NULL DEFAULT ''",
+     "UPDATE messages SET thread_ts_raw = CAST(thread_ts AS TEXT) WHERE thread_ts IS NOT NULL"),
+    ("sync_state", "last_ts_raw", "TEXT NOT NULL DEFAULT ''", None),
+    ("backfill_state", "oldest_ts_raw", "TEXT NOT NULL DEFAULT ''", None),
+    ("thread_sweeps", "thread_ts_raw", "TEXT NOT NULL DEFAULT ''",
+     "UPDATE thread_sweeps SET thread_ts_raw = CAST(thread_ts AS TEXT)"),
+    ("thread_sweeps", "swept", "INTEGER NOT NULL DEFAULT 0",
+     "UPDATE thread_sweeps SET swept = 1"),
+]
+
 SCHEMA_VERSION = len(MIGRATIONS)

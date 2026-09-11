@@ -96,6 +96,28 @@ def client_serving(histories: dict[str, SlackHistory], *, replies=None, channels
     return client
 
 
+
+def serve_threads(client, threads: dict[str, list[dict]]):
+    """`conversations.replies` as Slack serves it: the thread you asked for.
+
+    A fixture that replays one canned thread for every `ts` hides both halves of
+    the timestamp bug -- the request never has to be right, and the reply set
+    never has to belong to the parent.
+    """
+    original = client.call
+
+    def call(method, **params):
+        if method != "conversations.replies":
+            return original(method, **params)
+        client.calls.append((method, params))
+        if params["ts"] not in threads:
+            raise SlackError("thread_not_found")
+        return {"ok": True, "messages": threads[params["ts"]]}
+
+    client.call = call
+    return client
+
+
 def _backfill_complete(conn, channel_id: str = "D1") -> bool:
     row = conn.execute(
         "SELECT complete FROM backfill_state WHERE channel_id = ?", (channel_id,)
@@ -472,12 +494,15 @@ def test_sweep_caps_parents_per_run_and_covers_the_backlog_over_successive_runs(
         {"ts": f"{i}.0", "user": "U_H", "text": f"parent{i}", "thread_ts": f"{i}.0", "reply_count": 1}
         for i in range(thread_count, 0, -1)
     ]
-    client = client_with(
-        history=[{"ok": True, "messages": parents}],
-        replies=[{"ok": True, "messages": [
-            {"ts": "1.0", "user": "U_H", "text": "reply-echo", "thread_ts": "1.0"},
-        ]}],
-    )
+    client = client_with(history=[{"ok": True, "messages": parents}])
+    serve_threads(client, {
+        parent["ts"]: [
+            {"ts": parent["ts"], "user": "U_H", "text": parent["text"], "thread_ts": parent["ts"]},
+            {"ts": f"{float(parent['ts']) + 0.5}", "user": "U_ME", "text": f"reply to {parent['text']}",
+             "thread_ts": parent["ts"]},
+        ]
+        for parent in parents
+    })
     clock = TickingClock()
     ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=100000.0, now=clock)
 
@@ -555,3 +580,130 @@ def test_one_failing_channel_is_recorded_and_others_continue(tmp_path):
 
 def test_message_id_is_stable_and_namespaced():
     assert message_id("gravitate", "D1", "100.0") == "gravitate:D1:100.0"
+
+
+# --- Slack timestamps are strings, not floats -------------------------------
+#
+# A Slack ts has exactly six fractional digits and is matched by the API as the
+# literal string. `str(float("1789151200.000100"))` is "1789151200.0001", which
+# matches no message: conversations.replies answers `thread_not_found`. Every
+# fixture below uses a realistic six-digit ts, because "100.0" is the only shape
+# under which a float round-trip looks correct.
+
+PARENT_TS = "1757606400.000100"
+REPLY_TS = "1757606460.000200"
+
+
+def _threaded_client(*, replies=None):
+    return client_with(
+        history=[{"ok": True, "messages": [
+            {"ts": PARENT_TS, "user": "U_H", "text": "parent",
+             "thread_ts": PARENT_TS, "reply_count": 1},
+        ]}],
+        replies=replies or [{"ok": True, "messages": [
+            {"ts": PARENT_TS, "user": "U_H", "text": "parent", "thread_ts": PARENT_TS},
+            {"ts": REPLY_TS, "user": "U_ME", "text": "on it", "thread_ts": PARENT_TS},
+        ]}],
+    )
+
+
+def test_sweep_asks_slack_for_the_exact_thread_ts_string(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = _threaded_client()
+    ingest_workspace(conn, client, "gravitate", me=None, now=lambda: float(REPLY_TS))
+
+    asked = [params["ts"] for method, params in client.calls if method == "conversations.replies"]
+    assert asked == [PARENT_TS]
+
+
+def test_a_thread_parent_already_swept_this_run_is_not_swept_twice(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = _threaded_client()
+    ingest_workspace(conn, client, "gravitate", me=None, now=lambda: float(REPLY_TS))
+
+    asked = [params["ts"] for method, params in client.calls if method == "conversations.replies"]
+    assert len(asked) == len(set(asked))
+
+
+def test_one_broken_thread_does_not_fail_the_whole_channel(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    other_parent = "1757606500.000300"
+    client = client_with(
+        history=[{"ok": True, "messages": [
+            {"ts": PARENT_TS, "user": "U_H", "text": "parent",
+             "thread_ts": PARENT_TS, "reply_count": 1},
+            {"ts": other_parent, "user": "U_H", "text": "other parent",
+             "thread_ts": other_parent, "reply_count": 1},
+        ]}],
+    )
+    original = client.call
+
+    def flaky(method, **params):
+        if method == "conversations.replies" and params.get("ts") == PARENT_TS:
+            raise SlackError("ratelimited")
+        if method == "conversations.replies":
+            return {"ok": True, "messages": [
+                {"ts": other_parent, "user": "U_H", "text": "other parent",
+                 "thread_ts": other_parent},
+                {"ts": "1757606560.000400", "user": "U_ME", "text": "survived",
+                 "thread_ts": other_parent},
+            ]}
+        return original(method, **params)
+
+    client.call = flaky
+    report = ingest_workspace(conn, client, "gravitate", me=None, now=lambda: float(REPLY_TS))
+
+    texts = {row[0] for row in conn.execute("SELECT text FROM messages")}
+    assert "survived" in texts
+    assert report.channels_failed == []
+    assert [t for _, t, _ in report.threads_failed] == [PARENT_TS]
+    assert conn.execute(
+        "SELECT status FROM sync_state WHERE channel_id = 'D1'"
+    ).fetchone()[0] == "ok"
+
+
+# --- Thread replies during backfill -----------------------------------------
+#
+# A channel with backlog exhausts the history budget on every run, so anything
+# the sweep is asked to pay for out of the leftovers is paid nothing for the
+# whole length of the backfill -- days on a real workspace. A parent discovered
+# there and held only in a local set is dropped, and its replies are then
+# unrecoverable: a backfilled thread with no stored replies has MAX(ts) equal to
+# the parent's own ts, which is outside the sweep's recency window forever.
+
+OLD_PARENT_TS = "1700049000.000100"
+OLD_REPLY_TS = "1700049100.000200"
+
+
+def test_a_thread_found_during_a_budget_exhausted_backfill_is_still_swept(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    backlog = [
+        {"ts": f"{1700000000 + i}.000500", "user": "U_H", "text": f"m{i}"}
+        for i in range(1, 40000)
+    ]
+    parent = {"ts": OLD_PARENT_TS, "user": "U_H", "text": "old parent",
+              "thread_ts": OLD_PARENT_TS, "reply_count": 1}
+    history = SlackHistory([*backlog, parent])
+    client = client_serving({"D1": history})
+    serve_threads(client, {OLD_PARENT_TS: [
+        parent,
+        {"ts": OLD_REPLY_TS, "user": "U_ME", "text": "the promise in the thread",
+         "thread_ts": OLD_PARENT_TS},
+    ]})
+
+    clock = TickingClock(start=1800000000.0)
+    ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=100.0, now=clock)
+
+    assert not _backfill_complete(conn)  # the backfill really is still running
+    texts = {row[0] for row in conn.execute("SELECT text FROM messages")}
+    assert "the promise in the thread" in texts
+
+
+def test_a_thread_parent_is_recorded_the_moment_it_is_seen(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = _threaded_client()
+    ingest_workspace(conn, client, "gravitate", me=None, now=lambda: float(REPLY_TS))
+
+    assert conn.execute(
+        "SELECT thread_ts_raw FROM thread_sweeps WHERE channel_id = 'D1'"
+    ).fetchone()[0] == PARENT_TS
