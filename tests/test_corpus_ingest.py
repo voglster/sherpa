@@ -1341,3 +1341,100 @@ def test_a_tier_that_finishes_early_hands_its_time_onward(tmp_path):
         "SELECT count(*) FROM sync_state WHERE attempted_at > 0"
     ).fetchone()[0]
     assert attempted > len(only_lurked) * TIER_BUDGET_SHARE[4]
+
+
+# --- No bare IDs in anything an agent reads ----------------------------------
+#
+# 5,053 of 588,575 messages carried a raw id as the author name -- external and
+# Slack Connect users in shared channels, plus deactivated accounts -- and 232
+# chunks had one as a speaker. The spec is explicit: an agent searching for
+# "Hunter" must not need to know he is U03K2. DM counterparties already got
+# this treatment; the authorship path never did.
+
+def _client_with_stranger(messages, *, user_info=None, bot_info=None):
+    pages = dict(DIRECTORY)
+    pages["conversations.history"] = [{"ok": True, "messages": messages}]
+    pages["conversations.replies"] = [{"ok": True, "messages": []}]
+    if user_info is not None:
+        pages["users.info"] = [user_info]
+    if bot_info is not None:
+        pages["bots.info"] = [bot_info]
+    return FakeSlack(pages)
+
+
+def test_an_author_absent_from_the_user_list_is_resolved_by_lookup(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = _client_with_stranger(
+        [{"ts": "1757606400.000100", "user": "U07D4LWMWKW",
+          "text": "I've been asked to review Eraser AI"}],
+        user_info={"ok": True, "user": {"id": "U07D4LWMWKW", "name": "erin",
+                                        "profile": {"real_name": "Erin Calder"}}},
+    )
+    ingest_workspace(conn, client, "gravitate", me=None)
+
+    assert conn.execute("SELECT author_name FROM messages").fetchone()[0] == "Erin Calder"
+
+
+def test_an_unresolvable_author_gets_a_marked_placeholder_not_a_bare_id(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = _client_with_stranger(
+        [{"ts": "1757606400.000100", "user": "U080JQRV29H", "text": "released a new tool"}],
+        user_info={"ok": False, "error": "user_not_found"},
+    )
+    ingest_workspace(conn, client, "gravitate", me=None)
+
+    name = conn.execute("SELECT author_name FROM messages").fetchone()[0]
+    assert name != "U080JQRV29H"
+    assert "U080JQRV29H" in name and "Unknown" in name
+
+
+def test_an_unknown_author_is_looked_up_once_however_many_messages(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = _client_with_stranger(
+        [{"ts": f"175760640{i}.000100", "user": "U07D4LWMWKW", "text": f"m{i}"}
+         for i in range(5)],
+        user_info={"ok": True, "user": {"id": "U07D4LWMWKW", "name": "erin",
+                                        "profile": {"real_name": "Erin Calder"}}},
+    )
+    ingest_workspace(conn, client, "gravitate", me=None)
+
+    assert len([1 for method, _ in client.calls if method == "users.info"]) == 1
+
+
+def test_a_bot_first_seen_as_a_message_author_resolves_through_bots_info(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = _client_with_stranger(
+        [{"ts": "1757606400.000100", "bot_id": "B01T0JT986T", "text": "GSD-9015 created"}],
+        bot_info={"ok": True, "bot": {"id": "B01T0JT986T", "name": "Jira"}},
+    )
+    ingest_workspace(conn, client, "gravitate", me=None)
+
+    assert conn.execute("SELECT author_name FROM messages").fetchone()[0] == "Jira"
+
+
+def test_rows_already_stored_with_a_bare_id_are_repaired(tmp_path):
+    """0.86% of a 588k-message corpus, ingested before the lookup existed.
+    Repairing them from the users table costs one lookup per distinct author."""
+    conn = open_db(tmp_path / "c.db")
+    client = _client_with_stranger(
+        [{"ts": "1757700000.000100", "user": "U03K2ABCD", "text": "hello"}],
+        user_info={"ok": True, "user": {"id": "U07D4LWMWKW", "name": "erin",
+                                        "profile": {"real_name": "Erin Calder"}}},
+    )
+    conn.execute(
+        "INSERT INTO messages (id, workspace, channel_id, channel_name, channel_kind, ts,"
+        " ts_raw, thread_ts, thread_ts_raw, author_id, author_name, is_me, text, permalink, meta)"
+        " VALUES ('gravitate:D1:1757606400.000100', 'gravitate', 'D1', 'Hunter Davis', 'im',"
+        " 1757606400.0001, '1757606400.000100', NULL, '', 'U07D4LWMWKW', 'U07D4LWMWKW', 0,"
+        " 'older message', 'x', '{}')"
+    )
+    conn.commit()
+
+    ingest_workspace(conn, client, "gravitate", me=None)
+
+    assert conn.execute(
+        "SELECT author_name FROM messages WHERE text = 'older message'"
+    ).fetchone()[0] == "Erin Calder"
+    assert conn.execute(
+        "SELECT needs_rechunk FROM sync_state WHERE channel_id = 'D1'"
+    ).fetchone()[0] == 1

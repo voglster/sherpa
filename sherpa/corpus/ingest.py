@@ -74,6 +74,11 @@ if abs(sum(TIER_BUDGET_SHARE.values()) - 1.0) > 1e-9 or any(
         f" got {TIER_BUDGET_SHARE} summing to {sum(TIER_BUDGET_SHARE.values())}"
     )
 
+# Distinct unresolved authors repaired per run. Bounded because each one is an
+# API call, and there are only ever a few dozen: an author is unresolved once,
+# then cached forever.
+AUTHOR_REPAIR_PER_RUN = 50
+
 # Even with the clock already spent, every tier gets this long -- enough for one
 # channel to be attempted and commit a page. A tier reached with nothing left is
 # a tier that makes no progress ever, which is the whole failure being fixed
@@ -126,6 +131,7 @@ def ingest_workspace(
         deadline=min(overall_deadline, now() + budget_seconds * DIRECTORY_BUDGET_SHARE),
     )
     resolver = Resolver(conn, workspace, client)
+    repair_author_names(conn, resolver, workspace)
     report = IngestReport(workspace=workspace)
 
     by_tier = _channels_by_tier(conn, workspace)
@@ -157,6 +163,46 @@ def ingest_workspace(
     report.channels_never_synced = never_synced(conn, workspace)
     conn.commit()
     return report
+
+
+def repair_author_names(
+    conn: sqlite3.Connection, resolver: Resolver, workspace: str, limit: int = AUTHOR_REPAIR_PER_RUN
+) -> int:
+    """Give a human name to messages stored before their author could be resolved.
+
+    Rows written before the authorship lookup existed carry the bare id, and
+    nothing re-fetches them -- so without this they keep it forever, in `owed`
+    and `with` transcripts an agent reads. One lookup per distinct author, a
+    few dozen in total, and the channels involved are marked for rechunk so the
+    name reaches chunk text too.
+    """
+    unresolved = [
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT author_id FROM messages"
+            " WHERE workspace = ? AND author_name = author_id AND author_id <> ''"
+            " LIMIT ?",
+            (workspace, limit),
+        )
+    ]
+
+    repaired = 0
+    for author_id in unresolved:
+        name = resolver.user_name(author_id)
+        if name == author_id:
+            continue  # nothing better to say; leaving it avoids a rewrite loop
+        for row in conn.execute(
+            "SELECT DISTINCT channel_id FROM messages WHERE workspace = ? AND author_id = ?",
+            (workspace, author_id),
+        ).fetchall():
+            mark_dirty(conn, workspace, row[0])
+        conn.execute(
+            "UPDATE messages SET author_name = ? WHERE workspace = ? AND author_id = ?",
+            (name, workspace, author_id),
+        )
+        repaired += 1
+    conn.commit()
+    return repaired
 
 
 def unswept_threads(conn: sqlite3.Connection, workspace: str) -> tuple[int, int]:

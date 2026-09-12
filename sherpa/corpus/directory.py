@@ -403,6 +403,9 @@ class Resolver:
         ).fetchone()
         self.me_id = me["id"] if me else ""
         self.team_host = team_host(conn, workspace)
+        # The same lookup-and-negative-cache path the directory walk uses for
+        # DM counterparties. Authors were the one place it was never applied.
+        self._people = _UserResolver(conn, client, workspace) if client else None
 
     def user_name(self, user_id: str) -> str:
         """Resolve an author id, asking bots.info for the ones users.list omits.
@@ -414,8 +417,17 @@ class Resolver:
         """
         if user_id in self._users:
             return self._users[user_id]
-        if not (self._client and user_id.startswith("B")):
+        if not self._client:
             return user_id
+        if not user_id.startswith("B"):
+            # An external or Slack Connect user, or a deactivated account:
+            # absent from users.list, present in the conversation. Resolved and
+            # cached here, or stored as a marked placeholder -- never as the
+            # bare id, which is precisely what the spec forbids reaching an
+            # agent.
+            name = self._people.resolve(user_id)
+            self._users[user_id] = name
+            return name
 
         name = f"Unknown bot ({user_id})"
         try:
