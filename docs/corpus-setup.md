@@ -1,6 +1,6 @@
 # Slack corpus — setup and operation
 
-A local SQLite corpus of your Slack, synced incrementally from cron, queryable by
+A local SQLite corpus of your Slack, synced incrementally on a timer, queryable by
 your agents through `sherpa corpus`. Everything stays on this machine; embeddings
 run on your own hardware.
 
@@ -104,17 +104,33 @@ SELECT count(*) FROM channels ch WHERE ch.is_member = 1
   AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.channel_id = ch.id);
 ```
 
-## Tuning
+## Tuning and how `search` avoids making things up
 
-`knn_distance_floor` (default 0.96) decides when a vector hit is "close enough"
-to return. Below it, `search` correctly returns nothing rather than handing an
-agent five plausible-but-unrelated conversations to confabulate from.
+Two independent guards, because they catch different failures.
 
-Calibrated 2026-09-12 against a 277k-message corpus with `nomic-embed-text`:
-worst true match 0.948, best nonsense match 0.982. The margin is thin and drawn
-from eight queries. **If real searches start coming back empty when they should
-not, raise this first.** BM25 bypasses the floor, so exact-token queries (a Jira
-key, a hostname, a repo) are unaffected by it.
+**Adaptive distance floor.** A vector-only hit must sit at least 3 standard
+deviations below the background distance for that query, measured against 200
+randomly sampled chunks per search. An earlier absolute threshold
+(`knn_distance_floor`, default 0.96) proved to decay as the corpus grew — it
+rejected nonsense at 44k chunks and admitted it at 72k — because the nearest
+neighbour of any query gets closer as chunks accumulate. The relative rule does
+not drift with size. The absolute value survives only as a fallback when the
+sample is too small, and is still overridable in `corpus.toml`.
+
+**Term coverage.** Distance cannot detect a well-formed question about something
+absent — "the acquisition of Northwind Logistics" is genuinely close to business
+Slack in embedding space whether or not it happened. So each substantive query
+term is counted against the index. Any term with zero occurrences produces a
+warning naming it; if every term is absent, `search` returns nothing with a note.
+This is the guard that stops an agent summarising three topically-related
+conversations as an answer.
+
+BM25 bypasses both, so exact-token queries (a Jira key, a hostname, a repo) are
+never suppressed.
+
+If real searches start coming back empty when they should not, the term-coverage
+short-circuit is the first thing to look at — it trades some pure-paraphrase
+recall for the guarantee above.
 
 ## What is deliberately excluded
 
