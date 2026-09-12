@@ -68,14 +68,25 @@ token_key = "SLACK_USER_TOKEN"
 Add a workspace by adding a `[workspace.<name>]` block with its own `token_key`,
 then `sherpa corpus sync --workspace <name>`.
 
-## Cron
+## Scheduling
+
+This machine has no `crontab`; scheduling is a systemd user timer.
 
 ```
-*/15 * * * * cd $HOME && /usr/bin/env sherpa corpus sync --budget 600 >> $HOME/.sherpa/corpus.log 2>&1
+~/.config/systemd/user/slack-corpus.service   oneshot: sherpa corpus sync --budget 600
+~/.config/systemd/user/slack-corpus.timer     OnUnitActiveSec=15min, Persistent=true
 ```
 
-`sync` takes an advisory lock, so an overrunning run does not collide with the
-next — the second exits cleanly saying it stepped aside.
+```bash
+systemctl --user status slack-corpus.service      # last run
+systemctl --user list-timers slack-corpus.timer   # next run
+journalctl --user -u slack-corpus.service -n 50   # output
+systemctl --user disable --now slack-corpus.timer # stop syncing
+```
+
+`sync` takes an advisory lock, so a run that overruns its 15-minute slot does not
+collide with the next — the second exits cleanly saying it stepped aside.
+`Persistent=true` means a missed run (laptop asleep) fires on resume.
 
 ## Reading `status`
 
