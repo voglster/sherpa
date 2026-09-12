@@ -12,7 +12,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sherpa.corpus.db import open_db
-from sherpa.corpus.directory import Resolver, sync_directory, tier_for
+from sherpa.corpus.directory import (
+    MEMBERS_PER_RUN,
+    Resolver,
+    sync_directory,
+    tier_for,
+)
 from sherpa.corpus.slack import FakeSlack, AuthError
 
 
@@ -193,7 +198,11 @@ def test_autherror_from_users_info_propagates(tmp_path):
 
 
 def test_autherror_from_conversations_members_propagates(tmp_path):
-    """AuthError from conversations.members must propagate out of sync_directory."""
+    """AuthError from conversations.members must propagate out of sync_directory.
+
+    A group DM, because an IM no longer makes that call at all -- both of its
+    parties are already known from the listing.
+    """
     client = FakeSlack({
         "auth.test": [{"ok": True, "user_id": "U_ME"}],
         "users.list": [{"ok": True, "members": [
@@ -201,7 +210,7 @@ def test_autherror_from_conversations_members_propagates(tmp_path):
             {"id": "U_ALICE", "name": "alice", "profile": {"real_name": "Alice Smith"}},
         ]}],
         "conversations.list": [{"ok": True, "channels": [
-            {"id": "D_DM", "is_im": True, "user": "U_ALICE"},
+            {"id": "G_GROUP", "is_mpim": True, "name": "mpdm-alice-1"},
         ]}],
         "conversations.members": [{"ok": False, "error": "token_revoked"}],
     })
@@ -253,3 +262,101 @@ def test_departure_does_not_touch_another_workspace(tmp_path):
     assert conn.execute(
         "SELECT is_member FROM channels WHERE workspace='other' AND id='C1'"
     ).fetchone()[0] == 1
+
+
+# --- Membership is fetched incrementally ------------------------------------
+#
+# The real workspace has 254 IMs and 1,382 group DMs. One conversations.members
+# call each, on every run, before the wall-clock budget is even computed, made a
+# `--budget 120` sync take about seven minutes with not one message fetched --
+# so `--budget` meant nothing and a 15-minute cron was impossible. Group DM
+# membership is near-static; it does not need re-reading every quarter hour.
+
+def _mpim_client(count: int, *, members=("U_ME", "U_H")):
+    return FakeSlack({
+        "auth.test": [{"ok": True, "user_id": "U_ME"}],
+        "users.list": [{"ok": True, "members": [
+            {"id": "U_ME", "name": "jim", "profile": {"real_name": "Jim Vogel"}},
+            {"id": "U_H", "name": "hunter", "profile": {"real_name": "Hunter Reeves"}},
+        ]}],
+        "conversations.list": [{"ok": True, "channels": [
+            {"id": f"G{i}", "is_mpim": True, "name": f"mpdm-jim--hunter-{i}"}
+            for i in range(count)
+        ]}],
+        "conversations.members": [{"ok": True, "members": list(members)}],
+    })
+
+
+def _member_calls(client):
+    return [p for m, p in client.calls if m == "conversations.members"]
+
+
+def test_membership_is_not_refetched_on_every_run(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = _mpim_client(1)
+    sync_directory(conn, client, "gravitate", me=None)
+    assert len(_member_calls(client)) == 1
+
+    client.calls.clear()
+    sync_directory(conn, client, "gravitate", me=None)
+    assert _member_calls(client) == []
+
+
+def test_a_newly_appeared_group_dm_has_its_membership_fetched(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = _mpim_client(1)
+    sync_directory(conn, client, "gravitate", me=None)
+
+    client._pages["conversations.list"] = [{"ok": True, "channels": [
+        {"id": "G0", "is_mpim": True, "name": "mpdm-jim--hunter-0"},
+        {"id": "G_NEW", "is_mpim": True, "name": "mpdm-jim--hunter-new"},
+    ]}]
+    client.calls.clear()
+    sync_directory(conn, client, "gravitate", me=None)
+
+    assert [p["channel"] for p in _member_calls(client)] == ["G_NEW"]
+    assert conn.execute("SELECT name FROM channels WHERE id='G_NEW'").fetchone()[0] == (
+        "Jim Vogel, Hunter Reeves"
+    )
+
+
+def test_membership_refreshes_are_capped_per_run_and_finish_over_later_runs(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    total = MEMBERS_PER_RUN + 3
+    client = _mpim_client(total)
+
+    sync_directory(conn, client, "gravitate", me=None)
+    assert len(_member_calls(client)) == MEMBERS_PER_RUN
+
+    client.calls.clear()
+    sync_directory(conn, client, "gravitate", me=None)
+    assert len(_member_calls(client)) == 3
+
+    unfetched = conn.execute(
+        "SELECT count(*) FROM channels WHERE workspace='gravitate' AND members_fetched_at = 0"
+    ).fetchone()[0]
+    assert unfetched == 0
+
+
+def test_a_dm_needs_no_members_call_at_all(tmp_path):
+    """Both parties to an IM are already known: me, and the user the listing
+    names. 254 requests a run for something already in hand."""
+    conn = open_db(tmp_path / "c.db")
+    client = make_basic_client()
+    sync_directory(conn, client, "gravitate", me=None)
+
+    assert _member_calls(client) == []
+    assert conn.execute("SELECT member_ids FROM channels WHERE id='D1'").fetchone()[0] == (
+        '["U_ME", "U_H"]'
+    )
+
+
+def test_directory_sync_stops_fetching_membership_at_its_deadline(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = _mpim_client(10)
+    ticking = iter(range(1000))
+    sync_directory(
+        conn, client, "gravitate", me=None,
+        now=lambda: float(next(ticking)), deadline=8.0,
+    )
+    assert 0 < len(_member_calls(client)) < 10

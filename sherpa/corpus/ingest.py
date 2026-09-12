@@ -46,6 +46,11 @@ THREAD_SWEEP_PER_CHANNEL_CAP = 25
 # able to consume the whole run and leave lower tiers permanently unbackfilled.
 TIER_BUDGET_SHARE = {1: 0.5, 2: 0.3, 3: 0.2}
 
+# The directory walk is part of the run, so it answers to the run's clock. Left
+# unbounded it spent about seven minutes of a two-minute budget on membership
+# reads before a single message was fetched.
+DIRECTORY_BUDGET_SHARE = 0.2
+
 # A channel with a long backlog always exhausts the history budget, so a sweep
 # paid out of what history leaves behind is paid nothing — for the whole length
 # of a backfill, which on a real workspace is days. It gets its own reserved
@@ -76,10 +81,17 @@ def ingest_workspace(
     budget_seconds: float = 900.0,
     now=time.time,
 ) -> IngestReport:
-    sync_directory(conn, client, workspace, me)
+    overall_deadline = now() + budget_seconds
+    sync_directory(
+        conn,
+        client,
+        workspace,
+        me,
+        now=now,
+        deadline=min(overall_deadline, now() + budget_seconds * DIRECTORY_BUDGET_SHARE),
+    )
     resolver = Resolver(conn, workspace)
     report = IngestReport(workspace=workspace)
-    overall_deadline = now() + budget_seconds
 
     for tier, channels in _channels_by_tier(conn, workspace).items():
         share = TIER_BUDGET_SHARE.get(tier, 0.0)

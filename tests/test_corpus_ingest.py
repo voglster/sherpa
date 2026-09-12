@@ -894,3 +894,23 @@ def test_a_workspace_with_no_known_host_still_gets_a_permalink(tmp_path):
     assert conn.execute("SELECT permalink FROM messages").fetchone()[0] == (
         "https://gravitate.slack.com/archives/D1/p1757606400000100"
     )
+
+
+def test_the_directory_walk_answers_to_the_runs_budget(tmp_path):
+    """1,382 group DMs at one membership call each, before the deadline was
+    even computed, made a --budget 120 run take about seven minutes with no
+    messages fetched. The walk is part of the run and answers to its clock."""
+    conn = open_db(tmp_path / "c.db")
+    pages = dict(DIRECTORY)
+    pages["conversations.list"] = [{"ok": True, "channels": [
+        {"id": f"G{i}", "is_mpim": True, "name": f"mpdm-jim--hunter-{i}"} for i in range(60)
+    ]}]
+    pages["conversations.members"] = [{"ok": True, "members": ["U07JIMVOG", "U03K2ABCD"]}]
+    pages["conversations.history"] = [{"ok": True, "messages": []}]
+    pages["conversations.replies"] = [{"ok": True, "messages": []}]
+    client = FakeSlack(pages)
+
+    ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=40.0, now=TickingClock())
+
+    member_calls = [1 for method, _ in client.calls if method == "conversations.members"]
+    assert 0 < len(member_calls) < 60

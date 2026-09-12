@@ -207,6 +207,13 @@ COLUMN_ADDITIONS: list[tuple[str, str, str, str | None]] = [
     # the first run after an upgrade rebuilds everything once.
     ("sync_state", "needs_rechunk", "INTEGER NOT NULL DEFAULT 0",
      "UPDATE sync_state SET needs_rechunk = 1"),
+    # Group DM membership is near-static and there are thousands of them, so it
+    # is read on a slow cadence rather than once per channel per run. Rows that
+    # already have members start the clock now; rows without one are due
+    # immediately, since membership is what names a group DM.
+    ("channels", "members_fetched_at", "REAL NOT NULL DEFAULT 0",
+     "UPDATE channels SET members_fetched_at = CAST(strftime('%s','now') AS REAL)"
+     " WHERE member_ids <> '[]'"),
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)

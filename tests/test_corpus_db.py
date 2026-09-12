@@ -125,3 +125,28 @@ def test_a_column_addition_and_its_backfill_are_one_transaction(tmp_path, monkey
     conn = open_db(path)
     columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
     assert "half_written" not in columns
+
+
+def test_opening_for_reading_does_not_block_on_a_writer(tmp_path):
+    """Every read command opens the database, and _add_columns took a write
+    lock unconditionally -- so `status` or `search` during a sync died with a
+    raw `database is locked` traceback, not even the structured error the AXI
+    contract requires. On a 15-minute cron with multi-minute syncs that is a
+    large fraction of the time."""
+    import sqlite3
+
+    path = tmp_path / "c.db"
+    open_db(path).close()
+
+    writer = sqlite3.connect(path)
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute(
+        "INSERT INTO channels (workspace, id, name, kind) VALUES ('w', 'C1', 'x', 'public')"
+    )
+    try:
+        reader = open_db(path)
+        assert reader.execute("SELECT count(*) FROM messages").fetchone()[0] == 0
+        reader.close()
+    finally:
+        writer.rollback()
+        writer.close()

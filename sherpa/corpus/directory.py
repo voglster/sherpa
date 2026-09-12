@@ -11,7 +11,15 @@ import json
 import re
 import sqlite3
 
+import time as _time
+
 from sherpa.corpus.slack import SlackClient, SlackError, AuthError
+
+# Group DM membership barely moves, and the real workspace has 1,382 of them.
+# Re-reading all of it every quarter hour cost about seven minutes before a
+# single message was fetched, which made --budget meaningless.
+MEMBERS_REFRESH_SECONDS = 24 * 60 * 60
+MEMBERS_PER_RUN = 100
 
 # Slack's message-text markup. Every form carries an ID and an optional display
 # label after a pipe; the label is authoritative when present, since it is what
@@ -72,7 +80,15 @@ def _learn_team_host(conn: sqlite3.Connection, workspace: str, url: str | None) 
         )
 
 
-def sync_directory(conn: sqlite3.Connection, client: SlackClient, workspace: str, me: str | None) -> str:
+def sync_directory(
+    conn: sqlite3.Connection,
+    client: SlackClient,
+    workspace: str,
+    me: str | None,
+    *,
+    now=_time.time,
+    deadline: float | None = None,
+) -> str:
     # Called even when `me` is configured: it is the only source of the team's
     # real host, and one request per workspace per run is nothing next to the
     # thousands ingest makes -- while skipping it would pin the host at whatever
@@ -98,8 +114,22 @@ def sync_directory(conn: sqlite3.Connection, client: SlackClient, workspace: str
         )
 
     resolver = _UserResolver(conn, client, workspace)
+    known = {
+        row["id"]: row
+        for row in conn.execute(
+            "SELECT id, member_ids, members_fetched_at FROM channels WHERE workspace = ?",
+            (workspace,),
+        )
+    }
     listed: list[str] = []
+    stale: list[str] = []
+    # One reading of the clock for the whole walk: which memberships are due is
+    # a question about the run, not about each channel's microsecond.
+    walked_at = now()
 
+    # The listing walk still runs in full every time: it is what catches new
+    # channels and, per the departure rule, channels that have gone. Only the
+    # per-channel membership reads became incremental.
     for channel in client.paginate(
         "conversations.list",
         "channels",
@@ -107,26 +137,37 @@ def sync_directory(conn: sqlite3.Connection, client: SlackClient, workspace: str
         exclude_archived=True,
     ):
         kind = _kind(channel)
-        member_ids = _fetch_member_ids(channel, kind, client)
-        name = _resolve_channel_name(channel, kind, resolver, member_ids)
+        stored = known.get(channel["id"])
+        member_ids, fetched_at = _known_members(stored)
+
+        if kind == "im":
+            # Both parties are already in hand: me, and the user the listing
+            # names. 254 requests a run for something nobody had to ask for.
+            member_ids = [me_id, channel.get("user")] if channel.get("user") else member_ids
+            fetched_at = walked_at
+        elif kind == "mpim" and _members_due(fetched_at, walked_at):
+            stale.append(channel["id"])
 
         conn.execute(
-            "INSERT INTO channels (workspace, id, name, kind, is_member, member_ids)"
-            " VALUES (?, ?, ?, ?, ?, ?)"
+            "INSERT INTO channels (workspace, id, name, kind, is_member, member_ids, members_fetched_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)"
             " ON CONFLICT (workspace, id) DO UPDATE SET"
-            " name = excluded.name, kind = excluded.kind, is_member = excluded.is_member, member_ids = excluded.member_ids",
+            " name = excluded.name, kind = excluded.kind, is_member = excluded.is_member,"
+            " member_ids = excluded.member_ids, members_fetched_at = excluded.members_fetched_at",
             (
                 workspace,
                 channel["id"],
-                name,
+                _resolve_channel_name(channel, kind, resolver, member_ids),
                 kind,
                 1 if channel.get("is_member") or kind in ("im", "mpim") else 0,
                 json.dumps(member_ids),
+                fetched_at,
             ),
         )
         listed.append(channel["id"])
 
     _mark_departures(conn, workspace, listed)
+    _refresh_memberships(conn, client, resolver, workspace, stale, now, deadline)
     conn.commit()
     return me_id
 
@@ -154,6 +195,66 @@ def _mark_departures(conn: sqlite3.Connection, workspace: str, listed: list[str]
         (workspace,),
     )
     conn.execute("DELETE FROM listed_channels")
+
+
+def _known_members(stored) -> tuple[list, float]:
+    if stored is None:
+        return [], 0.0
+    try:
+        return json.loads(stored["member_ids"]), stored["members_fetched_at"]
+    except (TypeError, ValueError):
+        return [], stored["members_fetched_at"]
+
+
+def _members_due(fetched_at: float, current: float) -> bool:
+    return not fetched_at or (current - fetched_at) >= MEMBERS_REFRESH_SECONDS
+
+
+def _refresh_memberships(
+    conn: sqlite3.Connection,
+    client: SlackClient,
+    resolver: "_UserResolver",
+    workspace: str,
+    candidates: list[str],
+    now,
+    deadline: float | None,
+) -> None:
+    """Read group DM membership for the channels most overdue for it.
+
+    Least-recently-read first, so a channel with none at all -- which is what
+    names a group DM -- goes first and a workspace with thousands of them
+    completes over the next few runs instead of blocking the first one for
+    minutes. Bounded by both a per-run count and the run's own clock.
+    """
+    if not candidates:
+        return
+
+    ordered = [
+        row["id"]
+        for row in conn.execute(
+            "SELECT id FROM channels WHERE workspace = ? AND id IN ({})"
+            " ORDER BY members_fetched_at ASC, id ASC LIMIT ?".format(
+                ",".join("?" * len(candidates))
+            ),
+            (workspace, *candidates, MEMBERS_PER_RUN),
+        )
+    ]
+
+    for channel_id in ordered:
+        member_ids = _fetch_member_ids({"id": channel_id}, "mpim", client)
+        if member_ids:
+            names = ", ".join(resolver.resolve(uid) for uid in member_ids)
+            conn.execute(
+                "UPDATE channels SET member_ids = ?, members_fetched_at = ?, name = ?"
+                " WHERE workspace = ? AND id = ?",
+                (json.dumps(member_ids), now(), names, workspace, channel_id),
+            )
+            conn.commit()
+        # Checked after a completed read, so a workspace whose directory budget
+        # is always spent still names one more group DM every run rather than
+        # never naming any.
+        if deadline is not None and now() >= deadline:
+            return
 
 
 def _kind(channel: dict) -> str:
