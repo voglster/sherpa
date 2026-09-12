@@ -44,7 +44,9 @@ THREAD_SWEEP_PER_CHANNEL_CAP = 25
 # content lives, but every tier gets *some* guaranteed time regardless of how
 # much backlog a higher tier has — a single busy tier-1 channel must not be
 # able to consume the whole run and leave lower tiers permanently unbackfilled.
-TIER_BUDGET_SHARE = {1: 0.5, 2: 0.3, 3: 0.2}
+# 1:1 DMs get the largest guaranteed slice: fewest channels, highest value.
+# Every tier still gets its own, so no tier can be starved by a busier one.
+TIER_BUDGET_SHARE = {1: 0.4, 2: 0.2, 3: 0.2, 4: 0.2}
 
 # The directory walk is part of the run, so it answers to the run's clock. Left
 # unbounded it spent about seven minutes of a two-minute budget on membership
@@ -101,6 +103,7 @@ def ingest_workspace(
         for channel in channels:
             if now() >= tier_deadline:
                 break
+            _mark_attempted(conn, workspace, channel["id"], time.time())
             try:
                 stored = _ingest_channel(
                     conn, client, resolver, workspace, channel, now, tier_deadline, report
@@ -146,7 +149,8 @@ def _channels_by_tier(conn: sqlite3.Connection, workspace: str) -> dict[int, lis
             (workspace,),
         )
     }
-    # Never-synced first, then least-recently-advanced.
+    # Never-synced first, then least-recently-attempted, then
+    # least-recently-advanced.
     #
     # With no ordering at all the same channels won every run, and a channel in
     # the tail was never reached -- the 1:1 DM holding 5,657 unfetched messages
@@ -155,16 +159,26 @@ def _channels_by_tier(conn: sqlite3.Connection, workspace: str) -> dict[int, lis
     # nothing about its position said so. Ordering after that by when each
     # channel last advanced rotates the tail, so coverage is bounded by a
     # number of runs rather than left to table order.
+    #
+    # `attempted_at` is stamped on every channel the scheduler reaches, whether
+    # or not anything moved, which is what makes this a strict round robin: a
+    # channel reached this run sorts behind every channel that was not, so the
+    # worst case to reach any channel is ceil(channels / reached per run) runs
+    # -- independent of id, kind or count. An arbitrary tiebreak like `id`
+    # cannot be the deciding factor across a large set, which is precisely how
+    # 844 group DMs (ids starting C) kept 254 1:1 DMs (ids starting D) waiting
+    # every single run.
     channels = conn.execute(
         "SELECT c.*,"
         "  CASE WHEN b.channel_id IS NULL AND COALESCE(s.last_ts, 0) = 0 THEN 0 ELSE 1 END"
         "    AS visited,"
+        "  COALESCE(s.attempted_at, 0) AS attempted_at,"
         "  COALESCE(s.updated_at, 0) AS advanced_at"
         " FROM channels c"
         " LEFT JOIN sync_state s ON s.workspace = c.workspace AND s.channel_id = c.id"
         " LEFT JOIN backfill_state b ON b.workspace = c.workspace AND b.channel_id = c.id"
         " WHERE c.workspace = ? AND c.is_member = 1"
-        " ORDER BY visited ASC, advanced_at ASC, c.id ASC",
+        " ORDER BY visited ASC, attempted_at ASC, advanced_at ASC, c.id ASC",
         (workspace,),
     ).fetchall()
 
@@ -637,6 +651,19 @@ def _store(conn, resolver: Resolver, workspace: str, channel, raw: dict) -> int:
 
 def _permalink(host: str, channel_id: str, ts: str) -> str:
     return f"https://{host}/archives/{channel_id}/p{ts.replace('.', '')}"
+
+
+def _mark_attempted(conn, workspace: str, channel_id: str, at: float) -> None:
+    """Stamp that the scheduler reached this channel, before it tries anything.
+
+    Stamped on reaching rather than on succeeding, so a channel that keeps
+    failing still rotates to the back instead of holding the front of its tier.
+    """
+    conn.execute(
+        "UPDATE sync_state SET attempted_at = ? WHERE workspace = ? AND channel_id = ?",
+        (at, workspace, channel_id),
+    )
+    conn.commit()
 
 
 def _mark(conn, workspace: str, channel_id: str, status: str, detail: str) -> None:

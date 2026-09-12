@@ -364,10 +364,19 @@ def _fetch_member_ids(channel: dict, kind: str, client: SlackClient) -> list:
 
 
 def tier_for(channel_row, has_posted: bool) -> int:
-    """Backfill priority: DMs first, then channels Jim has spoken in, then the rest."""
-    if channel_row["kind"] in ("im", "mpim"):
+    """Backfill priority: 1:1 DMs, group DMs, channels spoken in, then the rest.
+
+    A 1:1 DM is its own tier because that is where a promise to a specific
+    person lives -- the query this corpus exists to answer. There are 254 of
+    them against 1,382 group DMs, so sharing a tier meant they were simply
+    outnumbered: with group-DM ids starting with C and 1:1 ids with D, the
+    alphabet alone kept every IM behind every group DM, run after run.
+    """
+    if channel_row["kind"] == "im":
         return 1
-    return 2 if has_posted else 3
+    if channel_row["kind"] == "mpim":
+        return 2
+    return 3 if has_posted else 4
 
 
 class Resolver:

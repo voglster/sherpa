@@ -219,11 +219,13 @@ def test_autherror_from_conversations_members_propagates(tmp_path):
         sync_directory(conn, client, "gravitate", me=None)
 
 
-def test_tier_for_ranks_dms_then_posted_then_lurked():
+def test_tier_for_ranks_direct_dms_then_group_dms_then_posted_then_lurked():
+    """A 1:1 DM outranks a group DM: 254 against 1,382, and it is where a
+    promise to a named person lives."""
     assert tier_for({"kind": "im"}, has_posted=False) == 1
-    assert tier_for({"kind": "mpim"}, has_posted=False) == 1
-    assert tier_for({"kind": "public"}, has_posted=True) == 2
-    assert tier_for({"kind": "public"}, has_posted=False) == 3
+    assert tier_for({"kind": "mpim"}, has_posted=False) == 2
+    assert tier_for({"kind": "public"}, has_posted=True) == 3
+    assert tier_for({"kind": "public"}, has_posted=False) == 4
 
 
 def test_a_channel_that_disappears_from_the_listing_stops_being_a_member(tmp_path):

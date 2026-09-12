@@ -1052,3 +1052,61 @@ def test_the_report_names_how_many_channels_have_never_been_synced(tmp_path):
     report = ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=0.0,
                               now=TickingClock())
     assert report.channels_never_synced == 1
+
+
+# --- 1:1 DMs are their own priority -----------------------------------------
+#
+# Tier 1 lumped `im` and `mpim` together, and Slack group-DM ids begin with C
+# while 1:1 DM ids begin with D. With `id` as the tiebreak the alphabet
+# guaranteed that all 844 never-synced group DMs went before the first 1:1 DM:
+# 0 of 254 IMs ingested, including the DM holding 5,657 messages with the one
+# person the motivating query names.
+
+def _mixed_workspace(im_count: int, mpim_count: int):
+    channels = [
+        {"id": f"C{i:04d}GROUP", "is_mpim": True, "name": f"mpdm-{i}"}
+        for i in range(mpim_count)
+    ] + [
+        {"id": f"D{i:04d}DIRECT", "is_im": True, "user": "U03K2ABCD"}
+        for i in range(im_count)
+    ]
+    histories = {
+        channel["id"]: SlackHistory([
+            {"ts": f"{1700000000 + i}.000100", "user": "U03K2ABCD",
+             "text": f"{channel['id']}-m{i}"}
+            for i in range(2)
+        ])
+        for channel in channels
+    }
+    client = client_serving(histories, channels=channels)
+    client._pages["conversations.members"] = [
+        {"ok": True, "members": ["U07JIMVOG", "U03K2ABCD"]}
+    ]
+    return client, channels
+
+
+def test_a_one_to_one_dm_is_reached_in_the_first_run_despite_800_group_dms(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client, _ = _mixed_workspace(im_count=250, mpim_count=800)
+
+    ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=200.0,
+                     now=TickingClock())
+
+    ims_with_messages = conn.execute(
+        "SELECT count(DISTINCT m.channel_id) FROM messages m"
+        " JOIN channels c ON c.workspace = m.workspace AND c.id = m.channel_id"
+        " WHERE c.kind = 'im'"
+    ).fetchone()[0]
+    assert ims_with_messages > 0
+
+
+def test_no_kind_is_permanently_starved_across_runs(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client, channels = _mixed_workspace(im_count=12, mpim_count=30)
+
+    clock = TickingClock()
+    for _ in range(40):
+        ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=60.0, now=clock)
+
+    covered = {row[0] for row in conn.execute("SELECT DISTINCT channel_id FROM messages")}
+    assert covered == {channel["id"] for channel in channels}

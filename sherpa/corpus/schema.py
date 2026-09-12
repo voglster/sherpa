@@ -220,6 +220,10 @@ COLUMN_ADDITIONS: list[tuple[str, str, str, str | None]] = [
     # as the column, exactly once.
     ("users", "is_bot", "INTEGER NOT NULL DEFAULT 0",
      "UPDATE sync_state SET needs_rechunk = 1"),
+    # When the scheduler last reached this channel, as opposed to when the
+    # channel last advanced. It is what makes tier ordering a round robin
+    # rather than a fixed queue.
+    ("sync_state", "attempted_at", "REAL NOT NULL DEFAULT 0", None),
     ("channels", "members_fetched_at", "REAL NOT NULL DEFAULT 0",
      "UPDATE channels SET members_fetched_at = CAST(strftime('%s','now') AS REAL)"
      " WHERE member_ids <> '[]'"),
