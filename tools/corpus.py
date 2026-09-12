@@ -285,7 +285,15 @@ def cmd_search(args, config) -> int:
         since=parse_since(args.since) if args.since else None,
     )
     try:
-        hits = search(conn, args.query, make_embedder(args.vault), filters=filters, k=args.k, context=args.context)
+        hits = search(
+            conn,
+            args.query,
+            make_embedder(args.vault),
+            filters=filters,
+            k=args.k,
+            context=args.context,
+            knn_distance_floor=config.knn_distance_floor,
+        )
     except EmbeddingError as error:
         notify("Slack corpus: embedding gateway down", error.detail)
         fail(

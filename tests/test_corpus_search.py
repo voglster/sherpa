@@ -49,8 +49,16 @@ def _vector_at_distance(distance: float) -> list[float]:
 
 
 FLOOR_ORIGIN = [0.0] * EMBED_DIM
-FLOOR_FAR = _vector_at_distance(KNN_DISTANCE_FLOOR + 5.0)
-FLOOR_NEAR = _vector_at_distance(KNN_DISTANCE_FLOOR / 2)
+
+# Measured against real nomic-embed-text vectors over a 277k-message corpus,
+# 600 chunks sampled per query: the worst true match any real query found sat
+# at 0.948, and the best any nonsense query found sat at 0.982. These are those
+# two numbers, not values derived from the constant -- so a floor set outside
+# the measured gap fails these tests rather than following along with it.
+WORST_TRUE_MATCH = 0.948
+BEST_NONSENSE_MATCH = 0.982
+FLOOR_FAR = _vector_at_distance(BEST_NONSENSE_MATCH)
+FLOOR_NEAR = _vector_at_distance(WORST_TRUE_MATCH)
 
 
 def insert(conn, ts, author, text, *, is_me=0, channel="D1", kind="im", name="Hunter Reeves"):
@@ -291,14 +299,23 @@ def floor_corpus(tmp_path):
     return conn
 
 
+def test_the_floor_sits_inside_the_measured_gap():
+    """The calibration itself: a floor outside 0.948..0.982 is either rejecting
+    real matches or admitting nonsense, and both are failures."""
+    assert WORST_TRUE_MATCH < KNN_DISTANCE_FLOOR < BEST_NONSENSE_MATCH
+
+
 def test_knn_only_hit_beyond_the_floor_is_dropped(floor_corpus):
-    """No BM25 match, and the only vector candidate is well past the floor: []."""
+    """No BM25 match, and the only vector candidate sits where a nonsense query
+    landed in the real measurement: []."""
     embedder = ScriptedEmbedder({"nothing_like_this_corpus": FLOOR_FAR}, FLOOR_ORIGIN)
     assert search(floor_corpus, "nothing_like_this_corpus", embedder, filters=Filters(), k=5) == []
 
 
 def test_knn_only_hit_within_the_floor_is_returned(floor_corpus):
-    """No BM25 match, but the vector candidate clears the floor: it counts."""
+    """No BM25 match, but the candidate is as far as the worst real match
+    observed, so it must still count -- this is the half of the calibration
+    that a too-aggressive floor breaks."""
     embedder = ScriptedEmbedder({"nothing_like_this_corpus": FLOOR_NEAR}, FLOOR_ORIGIN)
     hits = search(floor_corpus, "nothing_like_this_corpus", embedder, filters=Filters(), k=5)
     assert hits
@@ -568,3 +585,16 @@ def test_a_substantially_stronger_old_match_still_wins(corpus):
     hits = search(corpus, query, embedder, k=5, now=lambda: 1757700000.0)
     assert hits
     assert hits[0].channel == "DOLD2"
+
+
+def test_the_floor_is_configurable_per_corpus(floor_corpus):
+    """The right value depends on the embedding model and the corpus, so it has
+    to be tunable without a code change."""
+    embedder = ScriptedEmbedder({"nothing_like_this_corpus": FLOOR_FAR}, FLOOR_ORIGIN)
+    assert search(floor_corpus, "nothing_like_this_corpus", embedder, k=5) == []
+
+    hits = search(
+        floor_corpus, "nothing_like_this_corpus", embedder, k=5,
+        knn_distance_floor=BEST_NONSENSE_MATCH + 0.01,
+    )
+    assert hits

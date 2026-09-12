@@ -12,6 +12,8 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
+from sherpa.corpus.search import KNN_DISTANCE_FLOOR
+
 DEFAULT_CONFIG_PATH = Path.home() / ".sherpa" / "corpus.toml"
 DEFAULT_VAULT_PATH = Path.home() / ".sherpa" / "vault.json"
 
@@ -44,6 +46,10 @@ class Config:
     db: Path
     workspaces: list[WorkspaceConfig]
     stale_after_hours: float = 24.0
+    # How close a vector match must be to count when BM25 did not also find it.
+    # Model- and corpus-dependent, so it is configurable; see the calibration
+    # note at search.KNN_DISTANCE_FLOOR for what the default was measured from.
+    knn_distance_floor: float = KNN_DISTANCE_FLOOR
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -81,6 +87,7 @@ def load_config(path: Path | None = None) -> Config:
         db=Path(raw.get("db", "~/.sherpa/corpus.db")).expanduser(),
         workspaces=workspaces,
         stale_after_hours=float(raw.get("stale_after_hours", 24.0)),
+        knn_distance_floor=float(raw.get("knn_distance_floor", KNN_DISTANCE_FLOOR)),
     )
 
 

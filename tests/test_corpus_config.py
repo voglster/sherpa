@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from sherpa.corpus.search import KNN_DISTANCE_FLOOR
 from sherpa.corpus.config import ConfigError, MissingSecret, load_config, resolve_token
 
 CONFIG = """
@@ -48,6 +49,7 @@ def test_load_config_reads_workspaces_in_order(tmp_path):
     assert config.workspaces[0].me == "U03ABC"
     assert config.workspaces[1].me is None
     assert config.stale_after_hours == 24
+    assert config.knn_distance_floor == KNN_DISTANCE_FLOOR  # the measured default
 
 
 def test_load_config_expands_db_path(tmp_path):
@@ -124,3 +126,14 @@ def test_resolve_token_non_object_vault_raises_config_error(tmp_path):
     assert caught.value.message
     assert caught.value.help
     assert "non-object" in caught.value.message.lower() or "json" in caught.value.message.lower()
+
+
+def test_the_knn_distance_floor_can_be_set_per_corpus(tmp_path):
+    path = tmp_path / "corpus.toml"
+    path.write_text(
+        'db = "~/.sherpa/corpus.db"\n'
+        "knn_distance_floor = 0.88\n\n"
+        '[workspace.gravitate]\n'
+        'token_key = "SLACK_USER_TOKEN_GRAVITATE"\n'
+    )
+    assert load_config(path).knn_distance_floor == 0.88

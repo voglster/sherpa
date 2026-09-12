@@ -68,10 +68,28 @@ IN_CLAUSE_LIMIT = 900
 # downstream agent reading them can confabulate a commitment that was never
 # made. So a KNN-only hit (one BM25 did not also surface) only counts if its
 # distance clears this floor; an exact-token BM25 hit is never subject to it.
-# This is an L2 distance against `chunks_vec` (vec0's default metric). Tuned
-# for now against untested assumptions about real nomic-embed-text vectors --
-# see the Task 9 report for the reasoning and why it may need retuning.
-KNN_DISTANCE_FLOOR = 1.2
+#
+# CALIBRATION. L2 distance against `chunks_vec` (vec0's default metric), for
+# `nomic-embed-text` (768-dim) over a 277k-message corpus, 600 chunks sampled
+# per query:
+#
+#   worst true match, over 5 real queries      0.948
+#   best nonsense match, over 3 nonsense ones  0.982
+#
+# 0.96 sits inside that gap: it admits every true match observed and rejects
+# every nonsense query observed. The previous value of 1.2 was a guess, and the
+# measurement shows it sat above the noise floor entirely -- it admitted
+# everything, including pure nonsense, and never once did the job it exists for.
+#
+# The margin is thin: 0.034, from eight queries. A legitimate weak semantic
+# match could plausibly exceed 0.96. That trade is deliberate -- BM25 handles
+# exact-token queries independently and bypasses this floor, so a missed weak
+# semantic match is recoverable by keyword while a confidently wrong answer is
+# not. If real searches start coming back empty when they should not, THIS IS
+# THE FIRST THING TO RAISE, and `knn_distance_floor` in corpus.toml raises it
+# without a code change. The value depends on the embedding model and the
+# corpus, so a different model needs a fresh measurement, not this number.
+KNN_DISTANCE_FLOOR = 0.96
 
 # A BM25 hit counts only if the chunk carries at least this many of the query's
 # substantive terms -- or all of them, when the query has fewer. One shared word
@@ -217,7 +235,9 @@ def _filters_active(filters: Filters) -> bool:
     )
 
 
-def _knn_ranked(conn, query: str, embedder: Embedder, filters: Filters) -> list[int]:
+def _knn_ranked(
+    conn, query: str, embedder: Embedder, filters: Filters, floor: float = KNN_DISTANCE_FLOOR
+) -> list[int]:
     """KNN restricted to the filtered chunk set -- genuinely pre-filtered, never
     a global top-N intersected with the filter afterward.
 
@@ -267,7 +287,7 @@ def _knn_ranked(conn, query: str, embedder: Embedder, filters: Filters) -> list[
             "SELECT chunk_id, distance FROM chunks_vec WHERE embedding MATCH ? AND k = ? ORDER BY distance",
             [packed, CANDIDATES],
         ).fetchall()
-        return [row[0] for row in rows if row[1] <= KNN_DISTANCE_FLOOR][:CANDIDATES]
+        return [row[0] for row in rows if row[1] <= floor][:CANDIDATES]
 
     clause, params = _where(filters)
     allowed = [row[0] for row in conn.execute(f"SELECT c.id FROM chunks c WHERE {clause}", params).fetchall()]
@@ -275,7 +295,7 @@ def _knn_ranked(conn, query: str, embedder: Embedder, filters: Filters) -> list[
         return []
 
     rows = _knn_within_allowed(conn, vector, allowed)
-    return [row[0] for row in rows if row[1] <= KNN_DISTANCE_FLOOR][:CANDIDATES]
+    return [row[0] for row in rows if row[1] <= floor][:CANDIDATES]
 
 
 def _knn_within_allowed(conn, vector: list[float], allowed: list[int]) -> list[tuple[int, float]]:
@@ -351,13 +371,14 @@ def search(
     k: int = 5,
     context: int = 3,
     now=time.time,
+    knn_distance_floor: float = KNN_DISTANCE_FLOOR,
 ) -> list[Hit]:
     filters = filters or Filters()
     fused = _prefer_recent(
         conn,
         _fuse(
             _bm25_ranked(conn, query, filters),
-            _knn_ranked(conn, query, embedder, filters),
+            _knn_ranked(conn, query, embedder, filters, knn_distance_floor),
         ),
         now(),
     )
