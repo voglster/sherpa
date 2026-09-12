@@ -163,6 +163,27 @@ def build_parser() -> tuple[argparse.ArgumentParser, dict]:
     return parser, registry
 
 
+def sync_lock(db_path):
+    """Hold an advisory lock for the duration of a sync, or return None.
+
+    A cron run that overruns its interval meets the next one, and two syncs on
+    one SQLite file collide on the write lock -- which surfaced as a raw
+    `database is locked` traceback. An overrun is expected operational
+    behavior, so the second run steps aside quietly rather than failing.
+    """
+    import fcntl
+
+    path = Path(db_path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path.with_suffix(path.suffix + ".sync.lock"), "w")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
 def notify(title: str, message: str) -> None:
     """Push loudly. A corpus that stops updating must not do so quietly."""
     try:
@@ -342,6 +363,18 @@ def cmd_thread(args, config) -> int:
 
 
 def cmd_sync(args, config) -> int:
+    lock = sync_lock(config.db)
+    if lock is None:
+        emit(
+            {
+                "note": "another sync is already running — this run stepped aside",
+                "count": 0,
+                "help": ["sherpa corpus status"],
+            },
+            as_json=args.json,
+        )
+        return 0
+
     conn = open_db(config.db)
     selected = [w for w in config.workspaces if args.workspace in (None, w.name)]
     if not selected:
@@ -417,6 +450,7 @@ def cmd_sync(args, config) -> int:
                 "channels": report.channels_done,
                 "failed": len(report.channels_failed),
                 "threads_failed": len(report.threads_failed),
+                "never_synced": report.channels_never_synced,
                 "embedded": embedded,
             }
         )
@@ -446,6 +480,7 @@ def cmd_status(args, config) -> int:
                 "stale": r.stale,
                 "unembedded": r.unembedded,
                 "failed": r.failed_channels,
+                "never_synced": r.never_synced,
                 "backfilling": r.backfilling,
                 "unswept_threads": r.unswept_threads,
             }

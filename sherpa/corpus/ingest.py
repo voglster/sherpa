@@ -66,6 +66,7 @@ class IngestReport:
     channels_failed: list[tuple[str, str]] = field(default_factory=list)
     threads_failed: list[tuple[str, str, str]] = field(default_factory=list)
     channels_touched: set[str] = field(default_factory=set)
+    channels_never_synced: int = 0
 
 
 def message_id(workspace: str, channel_id: str, ts: str) -> str:
@@ -115,8 +116,26 @@ def ingest_workspace(
                 report.channels_failed.append((channel["id"], error.code))
                 _mark(conn, workspace, channel["id"], "failed", error.code)
 
+    report.channels_never_synced = never_synced(conn, workspace)
     conn.commit()
     return report
+
+
+def never_synced(conn: sqlite3.Connection, workspace: str) -> int:
+    """Channels this workspace has never fetched a single message from.
+
+    "59,390 messages ingested" reads as success while an entire DM is
+    untouched, which is the confident-incompleteness failure in its purest
+    form. The count is reported by `sync` and warned about by `status`.
+    """
+    return conn.execute(
+        "SELECT count(*) FROM channels c"
+        " LEFT JOIN sync_state s ON s.workspace = c.workspace AND s.channel_id = c.id"
+        " LEFT JOIN backfill_state b ON b.workspace = c.workspace AND b.channel_id = c.id"
+        " WHERE c.workspace = ? AND c.is_member = 1"
+        " AND b.channel_id IS NULL AND COALESCE(s.last_ts, 0) = 0",
+        (workspace,),
+    ).fetchone()[0]
 
 
 def _channels_by_tier(conn: sqlite3.Connection, workspace: str) -> dict[int, list[sqlite3.Row]]:
@@ -127,8 +146,26 @@ def _channels_by_tier(conn: sqlite3.Connection, workspace: str) -> dict[int, lis
             (workspace,),
         )
     }
+    # Never-synced first, then least-recently-advanced.
+    #
+    # With no ordering at all the same channels won every run, and a channel in
+    # the tail was never reached -- the 1:1 DM holding 5,657 unfetched messages
+    # sat behind hundreds that were already current. A caught-up channel needs
+    # seconds of catch-up; a never-visited one holds its entire history, and
+    # nothing about its position said so. Ordering after that by when each
+    # channel last advanced rotates the tail, so coverage is bounded by a
+    # number of runs rather than left to table order.
     channels = conn.execute(
-        "SELECT * FROM channels WHERE workspace = ? AND is_member = 1", (workspace,)
+        "SELECT c.*,"
+        "  CASE WHEN b.channel_id IS NULL AND COALESCE(s.last_ts, 0) = 0 THEN 0 ELSE 1 END"
+        "    AS visited,"
+        "  COALESCE(s.updated_at, 0) AS advanced_at"
+        " FROM channels c"
+        " LEFT JOIN sync_state s ON s.workspace = c.workspace AND s.channel_id = c.id"
+        " LEFT JOIN backfill_state b ON b.workspace = c.workspace AND b.channel_id = c.id"
+        " WHERE c.workspace = ? AND c.is_member = 1"
+        " ORDER BY visited ASC, advanced_at ASC, c.id ASC",
+        (workspace,),
     ).fetchall()
 
     grouped: dict[int, list[sqlite3.Row]] = {}

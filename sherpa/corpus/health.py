@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 
 from sherpa.corpus.config import Config
+from sherpa.corpus.ingest import never_synced
 
 
 @dataclass
@@ -23,6 +24,7 @@ class Health:
     failed_channels: int
     backfilling: int = 0
     unswept_threads: int = 0
+    never_synced: int = 0
 
 
 def check(conn: sqlite3.Connection, config: Config, *, now=time.time) -> list[Health]:
@@ -50,6 +52,7 @@ def check(conn: sqlite3.Connection, config: Config, *, now=time.time) -> list[He
             "SELECT count(*) FROM thread_sweeps WHERE workspace = ? AND swept = 0",
             (workspace.name,),
         ).fetchone()[0]
+        untouched = never_synced(conn, workspace.name)
         reports.append(
             Health(
                 workspace=workspace.name,
@@ -59,6 +62,7 @@ def check(conn: sqlite3.Connection, config: Config, *, now=time.time) -> list[He
                 failed_channels=row["failed"] or 0,
                 backfilling=backfilling,
                 unswept_threads=unswept,
+                never_synced=untouched,
             )
         )
     return reports
@@ -97,6 +101,11 @@ def warnings(reports: list[Health]) -> list[str]:
             lines.append(
                 f"{report.workspace}: {report.backfilling} channels still backfilling"
                 " — history before the current window is not in the corpus yet"
+            )
+        if report.never_synced:
+            lines.append(
+                f"{report.workspace}: {report.never_synced} channels never synced"
+                " — nothing from them is in the corpus at all"
             )
         if report.unswept_threads:
             lines.append(

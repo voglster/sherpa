@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import time
 import sys
 from pathlib import Path
 
@@ -758,3 +759,86 @@ def test_search_still_warns_while_a_backfill_is_running(workspace, capsys, monke
         corpus_tool.main(["search", "schema", "--config", str(config), "--json"])
     payload = json.loads(capsys.readouterr().out)
     assert any("backfill" in line for line in payload["warnings"])
+
+
+def test_status_warns_about_channels_never_synced_and_stops_once_covered(workspace, capsys):
+    config, _ = workspace
+    conn = open_db(config.parent / "c.db")
+    conn.execute(
+        "INSERT INTO channels (workspace, id, name, kind, is_member)"
+        " VALUES ('gravitate', 'D03G5S683V4', 'Hunter Davis', 'im', 1)"
+    )
+    conn.execute(
+        "INSERT INTO sync_state (workspace, channel_id, status, updated_at)"
+        " VALUES ('gravitate', 'D03G5S683V4', 'pending', ?)",
+        (time.time(),),
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(SystemExit):
+        corpus_tool.main(["status", "--config", str(config), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["workspaces"][0]["never_synced"] == 1
+    assert any("never" in line for line in payload["warnings"])
+
+    conn = open_db(config.parent / "c.db")
+    conn.execute(
+        "UPDATE sync_state SET last_ts = 1757606400.000100, status = 'ok'"
+        " WHERE channel_id = 'D03G5S683V4'"
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(SystemExit):
+        corpus_tool.main(["status", "--config", str(config), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["workspaces"][0]["never_synced"] == 0
+    assert not any("never" in line for line in payload.get("warnings", []))
+
+
+def test_a_second_sync_steps_aside_instead_of_colliding(workspace, monkeypatch, capsys):
+    """A cron run that overruns its interval meets the next one. That is
+    expected operational behavior, not a fault -- and certainly not a raw
+    `database is locked` traceback."""
+    config, vault = workspace
+    open_db(config.parent / "c.db").close()
+    monkeypatch.setattr(corpus_tool, "notify", lambda *a, **k: None)
+    monkeypatch.setattr(corpus_tool, "HttpSlackClient", lambda token: object())
+
+    ran = []
+    monkeypatch.setattr(
+        corpus_tool,
+        "ingest_workspace",
+        lambda *a, **k: ran.append(1) or IngestReport(workspace="gravitate"),
+    )
+
+    held = corpus_tool.sync_lock(config.parent / "c.db")
+    assert held is not None
+    try:
+        with pytest.raises(SystemExit) as caught:
+            corpus_tool.main(["sync", "--config", str(config), "--vault", str(vault), "--json"])
+    finally:
+        held.close()
+
+    assert caught.value.code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "already running" in payload["note"]
+    assert ran == []
+
+
+def test_sync_runs_normally_when_no_other_holds_the_lock(workspace, monkeypatch, capsys):
+    config, vault = workspace
+    open_db(config.parent / "c.db").close()
+    monkeypatch.setattr(corpus_tool, "notify", lambda *a, **k: None)
+    monkeypatch.setattr(corpus_tool, "HttpSlackClient", lambda token: object())
+    monkeypatch.setattr(corpus_tool, "make_embedder", lambda vault=None: FakeEmbedder())
+    monkeypatch.setattr(
+        corpus_tool, "ingest_workspace", lambda *a, **k: IngestReport(workspace="gravitate")
+    )
+
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(["sync", "--config", str(config), "--vault", str(vault), "--json"])
+    assert caught.value.code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["synced"][0]["workspace"] == "gravitate"

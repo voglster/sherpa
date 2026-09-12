@@ -950,3 +950,105 @@ def test_an_unresolvable_bot_is_asked_about_only_once(tmp_path):
 
     assert len([1 for method, _ in client.calls if method == "bots.info"]) == 1
     assert "B0GONE" in conn.execute("SELECT author_name FROM messages").fetchone()[0]
+
+
+# --- Never-synced channels go first -----------------------------------------
+#
+# The tool failed its own motivating question: the 1:1 DM with Hunter Davis
+# held 5,657 messages from 2022 onward and not one of them was in the corpus,
+# while 59,390 messages from other channels were ingested across several runs.
+# With 254 IMs and 1,382 group DMs all in tier 1 and no ordering at all, the
+# same channels won every run and a channel in the tail was never reached --
+# not slowly, never. A caught-up channel needs seconds; a never-synced one
+# holds everything.
+
+def _mark_current(conn, channel_id, *, when=1757000000.0):
+    conn.execute(
+        "INSERT INTO sync_state (workspace, channel_id, last_ts, status, updated_at)"
+        " VALUES ('gravitate', ?, 1757606400.000100, 'ok', ?)"
+        " ON CONFLICT (workspace, channel_id) DO UPDATE SET"
+        " last_ts = excluded.last_ts, status = 'ok', updated_at = excluded.updated_at",
+        (channel_id, when),
+    )
+    conn.execute(
+        "INSERT INTO backfill_state (workspace, channel_id, oldest_ts, complete, updated_at)"
+        " VALUES ('gravitate', ?, 1757606400.000100, 1, ?)"
+        " ON CONFLICT (workspace, channel_id) DO UPDATE SET complete = 1,"
+        " updated_at = excluded.updated_at",
+        (channel_id, when),
+    )
+    conn.commit()
+
+
+def _dm_channels(ids):
+    return [{"id": cid, "is_im": True, "user": "U03K2ABCD"} for cid in ids]
+
+
+def test_a_never_synced_channel_is_reached_before_an_already_current_one(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    ids = ["D01CURRENT", "D02CURRENT", "D03NEVER"]
+    histories = {
+        "D01CURRENT": SlackHistory([]),
+        "D02CURRENT": SlackHistory([]),
+        "D03NEVER": SlackHistory([
+            {"ts": f"{1700000000 + i}.000100", "user": "U03K2ABCD", "text": f"m{i}"}
+            for i in range(50)
+        ]),
+    }
+    client = client_serving(histories, channels=_dm_channels(ids))
+    ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=1000.0,
+                     now=TickingClock())
+    conn.execute("DELETE FROM messages")
+    _mark_current(conn, "D01CURRENT")
+    _mark_current(conn, "D02CURRENT")
+    conn.execute(
+        "DELETE FROM sync_state WHERE channel_id = 'D03NEVER'"
+    )
+    conn.execute("DELETE FROM backfill_state WHERE channel_id = 'D03NEVER'")
+    conn.commit()
+
+    ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=12.0,
+                     now=TickingClock())
+
+    assert conn.execute(
+        "SELECT count(*) FROM messages WHERE channel_id = 'D03NEVER'"
+    ).fetchone()[0] > 0
+
+
+def test_every_channel_is_reached_within_a_bounded_number_of_runs(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    ids = [f"D{i:02d}" for i in range(8)]
+    histories = {
+        cid: SlackHistory([{"ts": f"{1700000000 + i}.000100", "user": "U03K2ABCD",
+                            "text": f"{cid}-m{i}"} for i in range(3)])
+        for i, cid in enumerate(ids)
+    }
+    client = client_serving(histories, channels=_dm_channels(ids))
+
+    clock = TickingClock()
+    for _ in range(12):
+        ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=20.0, now=clock)
+
+    covered = {
+        row[0]
+        for row in conn.execute("SELECT DISTINCT channel_id FROM messages")
+    }
+    assert covered == set(ids)
+
+
+def test_the_report_names_how_many_channels_have_never_been_synced(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    ids = ["D01", "D02", "D03"]
+    histories = {cid: SlackHistory([]) for cid in ids}
+    client = client_serving(histories, channels=_dm_channels(ids))
+
+    report = ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=1000.0,
+                              now=TickingClock())
+    assert report.channels_never_synced == 0
+
+    conn.execute("DELETE FROM sync_state WHERE channel_id = 'D03'")
+    conn.execute("DELETE FROM backfill_state WHERE channel_id = 'D03'")
+    conn.commit()
+    report = ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=0.0,
+                              now=TickingClock())
+    assert report.channels_never_synced == 1
