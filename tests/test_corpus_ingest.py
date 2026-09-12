@@ -1110,3 +1110,97 @@ def test_no_kind_is_permanently_starved_across_runs(tmp_path):
 
     covered = {row[0] for row in conn.execute("SELECT DISTINCT channel_id FROM messages")}
     assert covered == {channel["id"] for channel in channels}
+
+
+# --- Human threads are swept before bot threads ------------------------------
+#
+# The live backlog was 10,213 unswept threads concentrated in 9 channels, 87%
+# of them under Jira, Sentry and PR-bot parents whose messages the chunker then
+# excludes. At 25 per channel per run that is hours of API calls to fetch
+# replies nobody will ever retrieve, while 1,078 human-parent threads -- actual
+# conversation -- wait behind them in the same queue.
+
+def _thread_fixture(conn, *, humans, bots, channel="C0ALERTS"):
+    """Parents already stored and recorded as unswept, human ids after bot ids
+    so a purely chronological order puts the humans last."""
+    parents = []
+    for index in range(bots):
+        parents.append((f"{1700000000 + index}.000100", "B01T0JT986T", "Jira", "alert"))
+    for index in range(humans):
+        parents.append((f"{1700009000 + index}.000100", "U03K2ABCD", "Hunter Davis", "question"))
+    for ts_raw, author_id, author, text in parents:
+        conn.execute(
+            "INSERT INTO messages (id, workspace, channel_id, channel_name, channel_kind,"
+            " ts, ts_raw, thread_ts, thread_ts_raw, author_id, author_name, is_me, text,"
+            " permalink, meta)"
+            " VALUES (?, 'gravitate', ?, 'alerts', 'public', ?, ?, ?, ?, ?, ?, 0, ?, 'x', '{}')",
+            (f"gravitate:{channel}:{ts_raw}", channel, float(ts_raw), ts_raw,
+             float(ts_raw), ts_raw, author_id, author, text),
+        )
+        conn.execute(
+            "INSERT INTO thread_sweeps (workspace, channel_id, thread_ts, thread_ts_raw,"
+            " last_swept, swept) VALUES ('gravitate', ?, ?, ?, 0, 0)",
+            (channel, float(ts_raw), ts_raw),
+        )
+    conn.commit()
+    return [ts for ts, _, _, _ in parents]
+
+
+def _sweep_client(parents, channel="C0ALERTS"):
+    pages = dict(DIRECTORY)
+    pages["conversations.list"] = [{"ok": True, "channels": [
+        {"id": channel, "name": "alerts", "is_channel": True, "is_member": True},
+    ]}]
+    pages["conversations.history"] = [{"ok": True, "messages": []}]
+    client = FakeSlack(pages)
+    serve_threads(client, {
+        ts: [{"ts": ts, "user": "U03K2ABCD", "text": "parent", "thread_ts": ts}]
+        for ts in parents
+    })
+    return client
+
+
+def _swept(client):
+    return [p["ts"] for m, p in client.calls if m == "conversations.replies"]
+
+
+def test_a_human_parent_thread_is_swept_before_a_bot_parent_one(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    parents = _thread_fixture(conn, humans=2, bots=THREAD_SWEEP_PER_CHANNEL_CAP + 10)
+    human_parents = parents[-2:]
+    client = _sweep_client(parents)
+
+    ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=1000.0,
+                     now=lambda: 1700009100.0)
+
+    swept = _swept(client)
+    assert set(human_parents) <= set(swept)
+    assert swept[:2] == human_parents
+
+
+def test_bot_parent_threads_are_delayed_not_starved(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    parents = _thread_fixture(conn, humans=40, bots=10)
+    bot_parents = set(parents[:10])
+    client = _sweep_client(parents)
+
+    clock = 1700009100.0
+    swept_over_runs = set()
+    for _ in range(6):
+        client.calls.clear()
+        ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=1000.0,
+                         now=lambda: clock)
+        swept_over_runs |= set(_swept(client))
+
+    assert bot_parents <= swept_over_runs
+
+
+def test_the_per_channel_cap_still_bounds_a_prioritised_sweep(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    parents = _thread_fixture(conn, humans=60, bots=60)
+    client = _sweep_client(parents)
+
+    ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=1000.0,
+                     now=lambda: 1700009100.0)
+
+    assert len(_swept(client)) <= THREAD_SWEEP_PER_CHANNEL_CAP

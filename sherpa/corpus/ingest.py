@@ -24,6 +24,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 
+from sherpa.corpus.chunk import human_authored
 from sherpa.corpus.directory import Resolver, sync_directory, tier_for
 from sherpa.corpus.slack import AuthError, SlackClient, SlackError
 
@@ -39,6 +40,13 @@ THREAD_SWEEP_WINDOW_SECONDS = 30 * 24 * 60 * 60
 # of it every run instead of trying to re-verify all of it in one run and, in a
 # busy workspace, never finishing before the budget runs out.
 THREAD_SWEEP_PER_CHANNEL_CAP = 25
+
+# Of that cap, the share kept for threads whose parent is not a human message.
+# 87% of the real backlog sits under Jira, Sentry and PR-bot parents, so strict
+# priority would bury them forever -- and a human replying under a Sentry alert
+# is exactly the conversation this corpus should hold. They yield to human
+# threads; they are never blocked by them.
+SWEEP_LOW_PRIORITY_SHARE = 0.2
 
 # DMs get the largest guaranteed share since that's where the highest-value
 # content lives, but every tier gets *some* guaranteed time regardless of how
@@ -122,6 +130,28 @@ def ingest_workspace(
     report.channels_never_synced = never_synced(conn, workspace)
     conn.commit()
     return report
+
+
+def unswept_threads(conn: sqlite3.Connection, workspace: str) -> tuple[int, int]:
+    """(total, human-parent) threads whose replies have never been read.
+
+    Reported apart because they are very different statements about how
+    complete the corpus is: 1,078 outstanding human threads is a gap in the
+    conversation, 7,370 outstanding bot threads is a queue of alerts whose
+    replies the chunker would drop anyway.
+    """
+    row = conn.execute(
+        "SELECT count(*) AS total,"
+        f" sum(CASE WHEN p.id IS NOT NULL AND {human_authored('p', 'pu')} THEN 1 ELSE 0 END)"
+        "   AS human"
+        " FROM thread_sweeps s"
+        " LEFT JOIN messages p ON p.workspace = s.workspace"
+        "   AND p.channel_id = s.channel_id AND p.ts_raw = s.thread_ts_raw"
+        " LEFT JOIN users pu ON pu.workspace = p.workspace AND pu.id = p.author_id"
+        " WHERE s.workspace = ? AND s.swept = 0",
+        (workspace,),
+    ).fetchone()
+    return row["total"] or 0, row["human"] or 0
 
 
 def never_synced(conn: sqlite3.Connection, workspace: str) -> int:
@@ -228,9 +258,7 @@ def _ingest_channel(conn, client, resolver, workspace: str, channel, now, deadli
             conn, client, resolver, workspace, channel, covered_from, thread_parents,
             now, history_deadline,
         )
-    stored += _sweep_threads(
-        conn, client, resolver, workspace, channel, thread_parents, now, deadline, report
-    )
+    stored += _sweep_threads(conn, client, resolver, workspace, channel, now, deadline, report)
     conn.commit()
     return stored
 
@@ -367,7 +395,7 @@ def _backfill(
 
 
 def _sweep_threads(
-    conn, client, resolver, workspace: str, channel, thread_parents, now, deadline, report
+    conn, client, resolver, workspace: str, channel, now, deadline, report
 ) -> int:
     """Re-read threads whose parents the channel cursor has already passed.
 
@@ -380,12 +408,16 @@ def _sweep_threads(
 
     channel_id = channel["id"]
     window_start = now() - THREAD_SWEEP_WINDOW_SECONDS
-    due = _thread_parents_due_for_sweep(
-        conn, workspace, channel_id, window_start, exclude=thread_parents
-    )
+    # Discoveries from this run are already in the queue -- they were recorded
+    # as unswept the moment they were seen -- so the queue is the whole story,
+    # in priority order, and the per-channel cap really does bound the work.
+    due = _thread_parents_due_for_sweep(conn, workspace, channel_id, window_start)
 
     stored = 0
-    for parent_ts in sorted(thread_parents | due):
+    # `due` already contains this run's discoveries -- they were recorded as
+    # unswept the moment they were seen -- so it is the whole queue, in
+    # priority order, and the per-channel cap actually bounds the run's work.
+    for parent_ts in due:
         if now() >= deadline:
             break
         try:
@@ -518,9 +550,7 @@ def _thread_parents_due_for_sweep(
     workspace: str,
     channel_id: str,
     window_start: float,
-    *,
-    exclude: set[str],
-) -> set[str]:
+) -> list[str]:
     """Thread parents already in the corpus, so a reply landing on a thread the
     cursor has already passed still gets swept eventually.
 
@@ -546,13 +576,44 @@ def _thread_parents_due_for_sweep(
         "   SELECT a.raw, COALESCE(k.last_swept, 0), COALESCE(k.swept, 0), a.latest"
         "     FROM active a LEFT JOIN known k ON k.raw = a.raw"
         " )"
-        " SELECT raw FROM merged"
-        " WHERE swept = 0 OR (latest IS NOT NULL AND latest >= ?)"
-        " ORDER BY swept ASC, last_swept ASC, raw ASC"
+        " SELECT merged.raw AS raw,"
+        "   CASE"
+        "     WHEN p.id IS NULL THEN 1"
+        f"    WHEN {human_authored('p', 'pu')} THEN 0"
+        "     ELSE 2"
+        "   END AS priority"
+        " FROM merged"
+        " LEFT JOIN messages p"
+        "   ON p.workspace = ? AND p.channel_id = ? AND p.ts_raw = merged.raw"
+        " LEFT JOIN users pu ON pu.workspace = p.workspace AND pu.id = p.author_id"
+        " WHERE merged.swept = 0 OR (merged.latest IS NOT NULL AND merged.latest >= ?)"
+        " ORDER BY priority ASC, merged.swept ASC, merged.last_swept ASC, merged.raw ASC"
         " LIMIT ?",
-        (workspace, channel_id, workspace, channel_id, window_start, THREAD_SWEEP_PER_CHANNEL_CAP),
+        (
+            workspace, channel_id, workspace, channel_id, workspace, channel_id,
+            window_start, THREAD_SWEEP_PER_CHANNEL_CAP * 4,
+        ),
     ).fetchall()
-    return {row["raw"] for row in rows} - exclude
+
+    human = [row["raw"] for row in rows if row["priority"] == 0]
+    rest = [row["raw"] for row in rows if row["priority"] != 0]
+    return _share_the_cap(human, rest)
+
+
+def _share_the_cap(human: list[str], rest: list[str]) -> list[str]:
+    """Human-parent threads first, with a reserved minority for the others.
+
+    Strict priority would be simpler and wrong: in a channel that keeps
+    producing human threads, the bot-parent ones would never be read at all,
+    and a human answering under an alert is real conversation. Reserving a
+    slice means they are always behind, never blocked.
+    """
+    reserved = min(len(rest), max(1, round(THREAD_SWEEP_PER_CHANNEL_CAP * SWEEP_LOW_PRIORITY_SHARE)))
+    chosen = human[: THREAD_SWEEP_PER_CHANNEL_CAP - reserved] + rest[:reserved]
+    if len(chosen) < THREAD_SWEEP_PER_CHANNEL_CAP:
+        spare = THREAD_SWEEP_PER_CHANNEL_CAP - len(chosen)
+        chosen += [raw for raw in human + rest if raw not in chosen][:spare]
+    return chosen
 
 
 def _mark_thread_swept(conn: sqlite3.Connection, workspace: str, channel_id: str, thread_ts: str, swept_at: float) -> None:

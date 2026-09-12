@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 
 from sherpa.corpus.config import Config
-from sherpa.corpus.ingest import never_synced
+from sherpa.corpus.ingest import never_synced, unswept_threads
 
 
 @dataclass
@@ -24,6 +24,7 @@ class Health:
     failed_channels: int
     backfilling: int = 0
     unswept_threads: int = 0
+    unswept_human_threads: int = 0
     never_synced: int = 0
 
 
@@ -48,10 +49,7 @@ def check(conn: sqlite3.Connection, config: Config, *, now=time.time) -> list[He
             "SELECT count(*) FROM backfill_state WHERE workspace = ? AND complete = 0",
             (workspace.name,),
         ).fetchone()[0]
-        unswept = conn.execute(
-            "SELECT count(*) FROM thread_sweeps WHERE workspace = ? AND swept = 0",
-            (workspace.name,),
-        ).fetchone()[0]
+        unswept, unswept_human = unswept_threads(conn, workspace.name)
         untouched = never_synced(conn, workspace.name)
         reports.append(
             Health(
@@ -62,6 +60,7 @@ def check(conn: sqlite3.Connection, config: Config, *, now=time.time) -> list[He
                 failed_channels=row["failed"] or 0,
                 backfilling=backfilling,
                 unswept_threads=unswept,
+                unswept_human_threads=unswept_human,
                 never_synced=untouched,
             )
         )
@@ -110,6 +109,7 @@ def warnings(reports: list[Health]) -> list[str]:
         if report.unswept_threads:
             lines.append(
                 f"{report.workspace}: {report.unswept_threads} threads never swept"
+                f" ({report.unswept_human_threads} with a human parent)"
                 " — their replies are not in the corpus yet"
             )
     return lines

@@ -842,3 +842,41 @@ def test_sync_runs_normally_when_no_other_holds_the_lock(workspace, monkeypatch,
     assert caught.value.code == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["synced"][0]["workspace"] == "gravitate"
+
+
+def test_status_separates_the_human_thread_backlog_from_the_bot_one(workspace, capsys):
+    """10,213 outstanding threads of which 1,078 have a human parent is a very
+    different statement about completeness than one number can make."""
+    config, _ = workspace
+    conn = open_db(config.parent / "c.db")
+    conn.execute(
+        "INSERT INTO sync_state (workspace, channel_id, status, updated_at)"
+        " VALUES ('gravitate', 'C0ALERTS', 'ok', ?)",
+        (time.time(),),
+    )
+    for ts_raw, author_id in (("1700000000.000100", "B01T0JT986T"),
+                              ("1700000001.000100", "B01T0JT986T"),
+                              ("1700009000.000100", "U03K2ABCD")):
+        conn.execute(
+            "INSERT INTO messages (id, workspace, channel_id, channel_name, channel_kind,"
+            " ts, ts_raw, thread_ts, thread_ts_raw, author_id, author_name, is_me, text,"
+            " permalink, meta)"
+            " VALUES (?, 'gravitate', 'C0ALERTS', 'alerts', 'public', ?, ?, ?, ?, ?, 'x', 0,"
+            " 'parent', 'x', '{}')",
+            (f"gravitate:C0ALERTS:{ts_raw}", float(ts_raw), ts_raw, float(ts_raw), ts_raw,
+             author_id),
+        )
+        conn.execute(
+            "INSERT INTO thread_sweeps (workspace, channel_id, thread_ts, thread_ts_raw, swept)"
+            " VALUES ('gravitate', 'C0ALERTS', ?, ?, 0)",
+            (float(ts_raw), ts_raw),
+        )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(SystemExit):
+        corpus_tool.main(["status", "--config", str(config), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["workspaces"][0]["unswept_threads"] == 3
+    assert payload["workspaces"][0]["unswept_human_threads"] == 1
+    assert any("1 with a human parent" in line for line in payload["warnings"])

@@ -491,6 +491,7 @@ def cmd_status(args, config) -> int:
                 "never_synced": r.never_synced,
                 "backfilling": r.backfilling,
                 "unswept_threads": r.unswept_threads,
+                "unswept_human_threads": r.unswept_human_threads,
             }
             for r in reports
         ],

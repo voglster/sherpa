@@ -17,11 +17,21 @@ from datetime import datetime, timezone
 # Three ways a message is machine-generated: an app user listed by users.list
 # (Jira, Optimus), a bot id Slack never lists at all, and the bot_id the
 # payload itself carries.
-HUMAN_AUTHORED = (
-    "COALESCE(u.is_bot, 0) = 0"
-    " AND m.author_id NOT LIKE 'B%'"
-    " AND json_extract(m.meta, '$.bot_id') IS NULL"
-)
+def human_authored(message: str = "m", user: str = "u") -> str:
+    """SQL for "this message was written by a person", over the given aliases.
+
+    One definition, used by the chunker to decide what becomes a retrieval unit
+    and by the sweep to decide which threads to read first. A second copy of it
+    would drift.
+    """
+    return (
+        f"COALESCE({user}.is_bot, 0) = 0"
+        f" AND {message}.author_id NOT LIKE 'B%'"
+        f" AND json_extract({message}.meta, '$.bot_id') IS NULL"
+    )
+
+
+HUMAN_AUTHORED = human_authored()
 
 GAP_SECONDS = 1800
 MAX_MESSAGES = 40
