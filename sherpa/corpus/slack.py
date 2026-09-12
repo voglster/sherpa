@@ -15,6 +15,22 @@ import httpx
 
 API = "https://slack.com/api/"
 AUTH_ERRORS = {"invalid_auth", "token_revoked", "account_inactive", "not_authed"}
+
+# Errors that say "this will never work", as opposed to "try later". The
+# Slackbot DM answers channel_not_found to conversations.history for the life
+# of the workspace; retrying it every run and counting it as an outstanding
+# fault is a health signal that can never reach green, which teaches everyone
+# to ignore the one that matters. Lives here so the scheduler and any future
+# caller classify the same way.
+PERMANENT_ERRORS = {
+    "channel_not_found",
+    "is_archived",
+    "not_in_channel",
+    "method_not_supported_for_channel_type",
+    "missing_scope",
+    "restricted_action",
+    "user_not_found",
+}
 MAX_RETRIES = 5
 
 
@@ -23,6 +39,11 @@ class SlackError(Exception):
         super().__init__(code)
         self.code = code
         self.retryable = retryable
+
+    @property
+    def permanent(self) -> bool:
+        """Whether another attempt could ever succeed."""
+        return self.code in PERMANENT_ERRORS
 
 
 class AuthError(SlackError):

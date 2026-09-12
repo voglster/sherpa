@@ -880,3 +880,23 @@ def test_status_separates_the_human_thread_backlog_from_the_bot_one(workspace, c
     assert payload["workspaces"][0]["unswept_threads"] == 3
     assert payload["workspaces"][0]["unswept_human_threads"] == 1
     assert any("1 with a human parent" in line for line in payload["warnings"])
+
+
+def test_an_unavailable_channel_is_visible_but_does_not_hold_status_red(workspace, capsys):
+    config, _ = workspace
+    conn = open_db(config.parent / "c.db")
+    conn.execute(
+        "INSERT INTO sync_state (workspace, channel_id, status, updated_at)"
+        " VALUES ('gravitate', 'D0SLACKBOT', 'unavailable', ?)",
+        (time.time(),),
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(["status", "--config", str(config), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert caught.value.code == 0
+    assert payload["workspaces"][0]["unavailable"] == 1
+    assert payload["workspaces"][0]["failed"] == 0
+    assert any("unavailable" in line for line in payload["warnings"])

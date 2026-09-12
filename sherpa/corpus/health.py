@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 
 from sherpa.corpus.config import Config
-from sherpa.corpus.ingest import never_synced, unswept_threads
+from sherpa.corpus.ingest import never_synced, unavailable_channels, unswept_threads
 
 
 @dataclass
@@ -26,6 +26,7 @@ class Health:
     unswept_threads: int = 0
     unswept_human_threads: int = 0
     never_synced: int = 0
+    unavailable: int = 0
 
 
 def check(conn: sqlite3.Connection, config: Config, *, now=time.time) -> list[Health]:
@@ -51,6 +52,7 @@ def check(conn: sqlite3.Connection, config: Config, *, now=time.time) -> list[He
         ).fetchone()[0]
         unswept, unswept_human = unswept_threads(conn, workspace.name)
         untouched = never_synced(conn, workspace.name)
+        unavailable = unavailable_channels(conn, workspace.name)
         reports.append(
             Health(
                 workspace=workspace.name,
@@ -62,6 +64,7 @@ def check(conn: sqlite3.Connection, config: Config, *, now=time.time) -> list[He
                 unswept_threads=unswept,
                 unswept_human_threads=unswept_human,
                 never_synced=untouched,
+                unavailable=unavailable,
             )
         )
     return reports
@@ -96,6 +99,11 @@ def warnings(reports: list[Health]) -> list[str]:
             lines.append(f"{report.workspace}: {report.unembedded} chunks unembedded — semantic recall is degraded")
         if report.failed_channels:
             lines.append(f"{report.workspace}: {report.failed_channels} channels failed to sync")
+        if report.unavailable:
+            lines.append(
+                f"{report.workspace}: {report.unavailable} channels unavailable"
+                " — Slack will not serve them, and nothing can be done about it"
+            )
         if report.backfilling:
             lines.append(
                 f"{report.workspace}: {report.backfilling} channels still backfilling"

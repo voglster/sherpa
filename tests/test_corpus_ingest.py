@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sherpa.corpus.db import open_db
 from sherpa.corpus.ingest import (
     THREAD_SWEEP_PER_CHANNEL_CAP,
+    UNAVAILABLE_RETRY_SECONDS,
     TIER_BUDGET_SHARE,
     THREAD_SWEEP_WINDOW_SECONDS,
     ingest_workspace,
@@ -556,7 +557,9 @@ def test_auth_error_propagates_rather_than_being_swallowed(tmp_path):
         ingest_workspace(conn, FakeSlack(pages), "gravitate", me=None)
 
 
-def test_one_failing_channel_is_recorded_and_others_continue(tmp_path):
+def test_one_transiently_failing_channel_is_recorded_and_others_continue(tmp_path):
+    """A transient error, because a permanent one is now set aside rather than
+    counted as an outstanding fault -- see the unavailable tests below."""
     conn = open_db(tmp_path / "c.db")
     pages = dict(DIRECTORY)
     pages["conversations.list"] = [{"ok": True, "channels": [
@@ -569,7 +572,7 @@ def test_one_failing_channel_is_recorded_and_others_continue(tmp_path):
 
     def flaky(method, **params):
         if method == "conversations.history" and params.get("channel") == "D1":
-            raise SlackError("channel_not_found")
+            raise SlackError("ratelimited")
         if method == "conversations.history":
             return {"ok": True, "messages": [{"ts": "5.0", "user": "U03K2ABCD", "text": "hi"}]}
         return original(method, **params)
@@ -1438,3 +1441,92 @@ def test_rows_already_stored_with_a_bare_id_are_repaired(tmp_path):
     assert conn.execute(
         "SELECT needs_rechunk FROM sync_state WHERE channel_id = 'D1'"
     ).fetchone()[0] == 1
+
+
+# --- A signal that can never go green is not a signal -------------------------
+#
+# The Slackbot DM fails `channel_not_found` on every run for the life of the
+# corpus: conversations.history cannot read it at all. Counting it as an
+# outstanding fault kept `status` non-zero permanently and put a warning on
+# every read command that nothing could ever clear -- the same alarm fatigue
+# the is_member fix removed for channels the user had left.
+
+def _failing_client(error, channel="D0SLACKBOT"):
+    pages = dict(DIRECTORY)
+    pages["conversations.list"] = [{"ok": True, "channels": [
+        {"id": channel, "is_im": True, "user": "USLACKBOT"},
+        {"id": "D1", "is_im": True, "user": "U03K2ABCD"},
+    ]}]
+    pages["conversations.replies"] = [{"ok": True, "messages": []}]
+    client = FakeSlack(pages)
+    original = client.call
+
+    def call(method, **params):
+        if method == "conversations.history" and params.get("channel") == channel:
+            client.calls.append((method, params))
+            raise SlackError(error)
+        if method == "conversations.history":
+            client.calls.append((method, params))
+            return {"ok": True, "messages": []}
+        return original(method, **params)
+
+    client.call = call
+    return client
+
+
+def _history_calls_for(client, channel):
+    return [p for m, p in client.calls if m == "conversations.history" and p.get("channel") == channel]
+
+
+def test_a_permanently_unreachable_channel_is_recorded_as_unavailable(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = _failing_client("channel_not_found")
+    report = ingest_workspace(conn, client, "gravitate", me=None)
+
+    assert conn.execute(
+        "SELECT status FROM sync_state WHERE channel_id = 'D0SLACKBOT'"
+    ).fetchone()[0] == "unavailable"
+    assert report.channels_failed == []
+    assert [c for c, _ in report.channels_unavailable] == ["D0SLACKBOT"]
+
+
+def test_an_unavailable_channel_is_not_rescheduled_next_run(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = _failing_client("channel_not_found")
+    ingest_workspace(conn, client, "gravitate", me=None)
+
+    client.calls.clear()
+    ingest_workspace(conn, client, "gravitate", me=None)
+    assert _history_calls_for(client, "D0SLACKBOT") == []
+    assert _history_calls_for(client, "D1")  # the rest of the workspace is unaffected
+
+
+def test_a_transient_failure_is_retried_and_still_counts_as_a_fault(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = _failing_client("ratelimited")
+    report = ingest_workspace(conn, client, "gravitate", me=None)
+
+    assert [c for c, _ in report.channels_failed] == ["D0SLACKBOT"]
+    assert report.channels_unavailable == []
+
+    client.calls.clear()
+    ingest_workspace(conn, client, "gravitate", me=None)
+    assert _history_calls_for(client, "D0SLACKBOT")  # tried again
+
+
+def test_an_unavailable_channel_is_re_checked_eventually(tmp_path):
+    """Permanent as far as this run is concerned, not as far as forever is: a
+    channel the user rejoins must find its way back in."""
+    conn = open_db(tmp_path / "c.db")
+    client = _failing_client("channel_not_found")
+    ingest_workspace(conn, client, "gravitate", me=None)
+
+    conn.execute(
+        "UPDATE sync_state SET updated_at = updated_at - ?"
+        " WHERE channel_id = 'D0SLACKBOT'",
+        (UNAVAILABLE_RETRY_SECONDS + 1,),
+    )
+    conn.commit()
+    client.calls.clear()
+    ingest_workspace(conn, client, "gravitate", me=None)
+    assert _history_calls_for(client, "D0SLACKBOT")

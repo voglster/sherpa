@@ -458,6 +458,7 @@ def cmd_sync(args, config) -> int:
                 "channels": report.channels_done,
                 "failed": len(report.channels_failed),
                 "threads_failed": len(report.threads_failed),
+                "unavailable": len(report.channels_unavailable),
                 "never_synced": report.channels_never_synced,
                 "embedded": embedded,
             }
@@ -488,6 +489,7 @@ def cmd_status(args, config) -> int:
                 "stale": r.stale,
                 "unembedded": r.unembedded,
                 "failed": r.failed_channels,
+                "unavailable": r.unavailable,
                 "never_synced": r.never_synced,
                 "backfilling": r.backfilling,
                 "unswept_threads": r.unswept_threads,

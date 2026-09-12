@@ -79,6 +79,12 @@ if abs(sum(TIER_BUDGET_SHARE.values()) - 1.0) > 1e-9 or any(
 # then cached forever.
 AUTHOR_REPAIR_PER_RUN = 50
 
+# A channel marked unavailable is left alone for this long. "Permanent" is a
+# statement about this run, not about forever: a channel the user rejoins, or
+# an archive that is restored, has to find its way back in without anyone
+# clearing a flag by hand.
+UNAVAILABLE_RETRY_SECONDS = 7 * 24 * 60 * 60
+
 # Even with the clock already spent, every tier gets this long -- enough for one
 # channel to be attempted and commit a page. A tier reached with nothing left is
 # a tier that makes no progress ever, which is the whole failure being fixed
@@ -103,6 +109,7 @@ class IngestReport:
     messages: int = 0
     channels_done: int = 0
     channels_failed: list[tuple[str, str]] = field(default_factory=list)
+    channels_unavailable: list[tuple[str, str]] = field(default_factory=list)
     threads_failed: list[tuple[str, str, str]] = field(default_factory=list)
     channels_touched: set[str] = field(default_factory=set)
     channels_never_synced: int = 0
@@ -157,8 +164,14 @@ def ingest_workspace(
             except AuthError:
                 raise
             except SlackError as error:
-                report.channels_failed.append((channel["id"], error.code))
-                _mark(conn, workspace, channel["id"], "failed", error.code)
+                # A permanent failure is recorded and set aside; a transient one
+                # stays an outstanding fault until it succeeds.
+                if error.permanent:
+                    report.channels_unavailable.append((channel["id"], error.code))
+                    _mark(conn, workspace, channel["id"], "unavailable", error.code)
+                else:
+                    report.channels_failed.append((channel["id"], error.code))
+                    _mark(conn, workspace, channel["id"], "failed", error.code)
 
     report.channels_never_synced = never_synced(conn, workspace)
     conn.commit()
@@ -203,6 +216,14 @@ def repair_author_names(
         repaired += 1
     conn.commit()
     return repaired
+
+
+def unavailable_channels(conn: sqlite3.Connection, workspace: str) -> int:
+    """Channels Slack will not serve, for reasons no one can act on."""
+    return conn.execute(
+        "SELECT count(*) FROM sync_state WHERE workspace = ? AND status = 'unavailable'",
+        (workspace,),
+    ).fetchone()[0]
 
 
 def unswept_threads(conn: sqlite3.Connection, workspace: str) -> tuple[int, int]:
@@ -298,8 +319,9 @@ def _channels_by_tier(conn: sqlite3.Connection, workspace: str) -> dict[int, lis
         " LEFT JOIN sync_state s ON s.workspace = c.workspace AND s.channel_id = c.id"
         " LEFT JOIN backfill_state b ON b.workspace = c.workspace AND b.channel_id = c.id"
         " WHERE c.workspace = ? AND c.is_member = 1"
+        "   AND (COALESCE(s.status, '') <> 'unavailable' OR s.updated_at < ?)"
         " ORDER BY visited ASC, attempted_at ASC, advanced_at ASC, c.id ASC",
-        (workspace,),
+        (workspace, time.time() - UNAVAILABLE_RETRY_SECONDS),
     ).fetchall()
 
     grouped: dict[int, list[sqlite3.Row]] = {}
