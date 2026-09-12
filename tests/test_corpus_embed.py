@@ -14,7 +14,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sherpa.corpus.db import EMBED_DIM, open_db
-from sherpa.corpus.embed import EmbeddingError, FakeEmbedder, GatewayEmbedder, embed_pending
+from sherpa.corpus.embed import (
+    EMBED_RETRIES,
+    EmbeddingError,
+    FakeEmbedder,
+    GatewayEmbedder,
+    embed_pending,
+)
 
 
 def add_chunk(conn, chunk_id, text="hello", embedded=0):
@@ -269,3 +275,120 @@ def test_the_fake_embedder_uses_every_dimension():
     assert len(vector) == 768
     assert any(value for value in vector[256:])
     assert len({value for value in vector[256:]}) > 1
+
+
+# --- A cold model load is not a fault ---------------------------------------
+#
+# From a real overnight run: embed_pending died after 126.7s with "The read
+# operation timed out", 15,973 chunks pending. Not chunk size and not batch
+# size -- once warm a 32-chunk batch embeds in 0.3s. It was ollama pulling
+# nomic-embed-text back into VRAM after eviction, which the first request of
+# any run on a shared GPU will routinely pay. With no retry, one such stall
+# aborts the whole sync, and on a box that evicts between runs that is most
+# runs.
+
+class _ColdThenWarm:
+    """Times out `stalls` times, then answers normally."""
+
+    def __init__(self, stalls: int, *, dim: int = EMBED_DIM) -> None:
+        self.stalls = stalls
+        self.dim = dim
+        self.attempts = 0
+
+    def post(self, url, headers=None, json=None):
+        import httpx
+
+        self.attempts += 1
+        if self.attempts <= self.stalls:
+            raise httpx.ReadTimeout("The read operation timed out")
+        return _Response(200, {"data": [{"embedding": [0.1] * self.dim} for _ in json["input"]]})
+
+
+class _Response:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+def test_a_cold_model_load_is_retried_rather_than_fatal(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    for i in range(3):
+        add_chunk(conn, i + 1)
+    conn.commit()
+
+    transport = _ColdThenWarm(stalls=1)
+    slept = []
+    embedder = GatewayEmbedder(transport=transport, sleep=slept.append)
+
+    assert embed_pending(conn, embedder, batch=2) == 3
+    assert conn.execute("SELECT count(*) FROM chunks WHERE embedded = 0").fetchone()[0] == 0
+    assert transport.attempts == 3  # one stall, one retry, one more batch
+    assert slept  # it backed off rather than hammering
+
+
+def test_an_unreachable_gateway_is_still_fatal_after_its_retries(tmp_path):
+    """Exhausted retries must still abort loudly. No degrading to keyword-only,
+    no silently leaving chunks pending -- that distinction is this module."""
+    conn = open_db(tmp_path / "c.db")
+    add_chunk(conn, 1)
+    conn.commit()
+
+    transport = _ColdThenWarm(stalls=99)
+    embedder = GatewayEmbedder(transport=transport, sleep=lambda _: None)
+
+    with pytest.raises(EmbeddingError):
+        embed_pending(conn, embedder)
+    assert transport.attempts == EMBED_RETRIES
+    assert conn.execute("SELECT embedded FROM chunks WHERE id = 1").fetchone()[0] == 0
+
+
+def test_a_bad_request_is_not_retried(tmp_path):
+    """A gateway answering 400 will answer 400 again; only transport failures
+    and the statuses a loaded-but-busy gateway returns are worth another go."""
+
+    class _Rejecting:
+        def __init__(self):
+            self.attempts = 0
+
+        def post(self, url, headers=None, json=None):
+            self.attempts += 1
+            return _Response(400, {})
+
+    transport = _Rejecting()
+    embedder = GatewayEmbedder(transport=transport, sleep=lambda _: None)
+    with pytest.raises(EmbeddingError):
+        embedder.embed(["x"])
+    assert transport.attempts == 1
+
+
+def test_the_embed_phase_stops_at_its_deadline_and_leaves_the_rest_pending(tmp_path):
+    """A run that spends its budget on ingest and then embeds for many minutes
+    more has no wall-clock bound at all, and a 15-minute cron overlaps itself.
+    The remainder stays pending, which `status` already reports."""
+    conn = open_db(tmp_path / "c.db")
+    for i in range(10):
+        add_chunk(conn, i + 1)
+    conn.commit()
+
+    ticking = iter(range(1000))
+    done = embed_pending(
+        conn, FakeEmbedder(), batch=2, now=lambda: float(next(ticking)), deadline=2.0
+    )
+
+    assert 0 < done < 10
+    assert conn.execute("SELECT count(*) FROM chunks WHERE embedded = 0").fetchone()[0] == 10 - done
+
+
+def test_the_default_batch_is_the_measured_one(tmp_path):
+    """32 real chunks is ~23k characters and embeds in 0.3s warm; 64 doubles
+    the payload for no throughput gain and widens the cold-start blast radius."""
+    conn = open_db(tmp_path / "c.db")
+    for i in range(33):
+        add_chunk(conn, i + 1)
+    conn.commit()
+    embedder = FakeEmbedder()
+    embed_pending(conn, embedder)
+    assert [len(b) for b in embedder.batches] == [32, 1]

@@ -73,7 +73,14 @@ from sherpa.render import bin_line, emit, fail, parse_strict, truncate
 from sherpa.corpus.chunk import rechunk_dirty
 from sherpa.corpus.config import ConfigError, MissingSecret, load_config, resolve_token
 from sherpa.corpus.db import open_db
-from sherpa.corpus.embed import DEFAULT_BASE_URL, DEFAULT_MODEL, EmbeddingError, GatewayEmbedder, embed_pending
+from sherpa.corpus.embed import (
+    DEFAULT_BASE_URL,
+    DEFAULT_MODEL,
+    EMBED_BUDGET_SHARE,
+    EmbeddingError,
+    GatewayEmbedder,
+    embed_pending,
+)
 from sherpa.corpus.health import check, is_healthy, warnings
 from sherpa.corpus.ingest import ingest_workspace
 from sherpa.corpus.search import Filters, Hit, conversation_with, search, sent_to, thread_at
@@ -354,9 +361,16 @@ def cmd_sync(args, config) -> int:
             fail(missing.message, help=missing.help, usage=True)
 
         client = HttpSlackClient(token)
+        # --budget bounds the whole run, not just its first phase: an unbounded
+        # embed tail is how a 15-minute cron overlaps itself.
+        started = time.time()
         try:
             report = ingest_workspace(
-                conn, client, workspace.name, workspace.me, budget_seconds=args.budget
+                conn,
+                client,
+                workspace.name,
+                workspace.me,
+                budget_seconds=args.budget * (1 - EMBED_BUDGET_SHARE),
             )
         except AuthError as error:
             notify(
@@ -386,7 +400,9 @@ def cmd_sync(args, config) -> int:
 
         rechunk_dirty(conn, workspace.name)
         try:
-            embedded = embed_pending(conn, make_embedder(args.vault))
+            embedded = embed_pending(
+                conn, make_embedder(args.vault), deadline=started + args.budget
+            )
         except EmbeddingError as error:
             notify("Slack corpus: embedding gateway down", error.detail)
             fail(

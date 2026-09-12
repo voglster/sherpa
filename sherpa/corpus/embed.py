@@ -10,12 +10,37 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 import struct
+import time
 from typing import Any, Protocol
 
 from sherpa.corpus.db import EMBED_DIM
 
 DEFAULT_MODEL = "ollama/nomic-embed-text:latest"
 DEFAULT_BASE_URL = "https://llm.jc.turbo.inc/v1"
+
+# The first request of a run routinely waits for ollama to pull the model back
+# into VRAM on a box that also serves other models. Measured cold: 126s. Warm,
+# a 32-chunk batch answers in 0.3s -- so a generous ceiling costs nothing in the
+# normal case and is the difference between a wasted cron run and a slow one.
+DEFAULT_TIMEOUT = 300.0
+
+# A cold load is expected operational behavior, not a fault, so it is retried.
+# An unreachable gateway is a fault, so exhausting these still raises.
+EMBED_RETRIES = 4
+RETRY_BACKOFF_SECONDS = 4.0
+
+# A gateway that is loaded but busy, or briefly gone behind its proxy. A 4xx is
+# not here on purpose: a request the gateway rejects will be rejected again.
+RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+
+# 32 real chunks is ~23k characters and embeds in 0.3s warm. 64 doubles the
+# payload for no throughput gain and doubles what a cold-start stall costs.
+DEFAULT_BATCH = 32
+
+# The embed phase answers to the run's clock like every other phase: a sync
+# that spends its budget on ingest and then embeds for minutes more has no
+# wall-clock bound, and a 15-minute cron overlaps itself.
+EMBED_BUDGET_SHARE = 0.3
 
 
 class EmbeddingError(Exception):
@@ -36,31 +61,23 @@ class GatewayEmbedder:
         model: str = DEFAULT_MODEL,
         *,
         transport: Any = None,
+        sleep=time.sleep,
     ) -> None:
         self._url = base_url.rstrip("/") + "/embeddings"
         self._key = api_key
         self._model = model
         self._transport = transport
+        self._sleep = sleep
 
     def _client(self):
         if self._transport is None:
             import httpx
 
-            self._transport = httpx.Client(timeout=120.0)
+            self._transport = httpx.Client(timeout=DEFAULT_TIMEOUT)
         return self._transport
 
     def embed(self, texts: list[str]) -> list[list[float]]:
-        try:
-            response = self._client().post(
-                self._url,
-                headers={"Authorization": f"Bearer {self._key}"},
-                json={"model": self._model, "input": texts},
-            )
-        except Exception as error:
-            raise EmbeddingError(f"embedding gateway unreachable: {error}") from error
-
-        if response.status_code != 200:
-            raise EmbeddingError(f"embedding gateway returned HTTP {response.status_code}")
+        response = self._request(texts)
 
         try:
             body = response.json()
@@ -80,6 +97,57 @@ class GatewayEmbedder:
                     f"embedding gateway returned dimension {len(vector)}, expected {EMBED_DIM}"
                 )
         return vectors
+
+    def _request(self, texts: list[str]):
+        """POST the batch, retrying the failures a cold model load produces.
+
+        Retrying transport failures and busy-gateway statuses is the whole
+        difference between a slow run and a wasted one. It is not a softening
+        of the abort rule: when the attempts run out this still raises
+        EmbeddingError, the caller still stops, and nothing degrades to
+        keyword-only or quietly leaves chunks pending.
+        """
+        last = ""
+        for attempt in range(EMBED_RETRIES):
+            try:
+                response = self._client().post(
+                    self._url,
+                    headers={"Authorization": f"Bearer {self._key}"},
+                    json={"model": self._model, "input": texts},
+                )
+            except Exception as error:
+                if not _is_transient(error):
+                    raise EmbeddingError(f"embedding gateway unreachable: {error}") from error
+                last = f"unreachable: {error}"
+            else:
+                if response.status_code == 200:
+                    return response
+                if response.status_code not in RETRY_STATUS:
+                    raise EmbeddingError(
+                        f"embedding gateway returned HTTP {response.status_code}"
+                    )
+                last = f"HTTP {response.status_code}"
+
+            if attempt + 1 < EMBED_RETRIES:
+                self._sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+
+        raise EmbeddingError(
+            f"embedding gateway unreachable after {EMBED_RETRIES} attempts ({last})"
+        )
+
+
+def _is_transient(error: Exception) -> bool:
+    """Whether another attempt could plausibly succeed.
+
+    A timeout or a refused connection is the gateway being slow or briefly
+    away; anything else is this code asking for something wrong.
+    """
+    try:
+        import httpx
+
+        return isinstance(error, httpx.TransportError)
+    except ImportError:  # pragma: no cover - httpx is a declared dependency
+        return isinstance(error, (TimeoutError, ConnectionError, OSError))
 
 
 def _stable_hash(text: str) -> int:
@@ -116,13 +184,24 @@ def _pack(vector: list[float]) -> bytes:
     return struct.pack(f"{len(vector)}f", *vector)
 
 
-def embed_pending(conn: sqlite3.Connection, embedder: Embedder, *, batch: int = 64) -> int:
+def embed_pending(
+    conn: sqlite3.Connection,
+    embedder: Embedder,
+    *,
+    batch: int = DEFAULT_BATCH,
+    deadline: float | None = None,
+    now=time.time,
+) -> int:
     pending = conn.execute(
         "SELECT id, header, text FROM chunks WHERE embedded = 0 ORDER BY id"
     ).fetchall()
 
     done = 0
     for start in range(0, len(pending), batch):
+        # Between batches, never inside one: a batch is already committed as a
+        # unit, and what is left stays pending, which `status` reports.
+        if deadline is not None and start and now() >= deadline:
+            break
         window = pending[start : start + batch]
         texts = [f"{row['header']}\n{row['text']}" for row in window]
         vectors = embedder.embed(texts)
