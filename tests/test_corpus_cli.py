@@ -900,3 +900,26 @@ def test_an_unavailable_channel_is_visible_but_does_not_hold_status_red(workspac
     assert payload["workspaces"][0]["unavailable"] == 1
     assert payload["workspaces"][0]["failed"] == 0
     assert any("unavailable" in line for line in payload["warnings"])
+
+
+def test_a_blocked_channel_holds_status_red_and_names_the_remedy(workspace, capsys):
+    """A missing scope is the one failure here the user can fix in two minutes.
+    Hiding it would stop the corpus covering a whole class of channel while
+    status read green -- confident incompleteness with a timer on it."""
+    config, _ = workspace
+    conn = open_db(config.parent / "c.db")
+    conn.execute(
+        "INSERT INTO sync_state (workspace, channel_id, status, detail, updated_at)"
+        " VALUES ('gravitate', 'C0PRIVATE', 'blocked', 'missing_scope: groups:history', ?)",
+        (time.time(),),
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(["status", "--config", str(config), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert caught.value.code == 2
+    assert payload["workspaces"][0]["blocked"] == 1
+    assert any("groups:history" in line for line in payload["warnings"])
+    assert any("SLACK_USER_TOKEN_GRAVITATE" in line for line in payload["help"])

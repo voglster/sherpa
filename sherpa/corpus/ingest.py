@@ -110,6 +110,7 @@ class IngestReport:
     channels_done: int = 0
     channels_failed: list[tuple[str, str]] = field(default_factory=list)
     channels_unavailable: list[tuple[str, str]] = field(default_factory=list)
+    channels_blocked: list[tuple[str, str]] = field(default_factory=list)
     threads_failed: list[tuple[str, str, str]] = field(default_factory=list)
     channels_touched: set[str] = field(default_factory=set)
     channels_never_synced: int = 0
@@ -164,11 +165,16 @@ def ingest_workspace(
             except AuthError:
                 raise
             except SlackError as error:
-                # A permanent failure is recorded and set aside; a transient one
-                # stays an outstanding fault until it succeeds.
-                if error.permanent:
+                # Three outcomes, because "retrying cannot help" and "nobody
+                # can help" are different: set aside quietly, set aside loudly,
+                # or retry.
+                if error.unavailable:
                     report.channels_unavailable.append((channel["id"], error.code))
                     _mark(conn, workspace, channel["id"], "unavailable", error.code)
+                elif error.blocked:
+                    detail = f"{error.code}: {error.detail}" if error.detail else error.code
+                    report.channels_blocked.append((channel["id"], detail))
+                    _mark(conn, workspace, channel["id"], "blocked", detail)
                 else:
                     report.channels_failed.append((channel["id"], error.code))
                     _mark(conn, workspace, channel["id"], "failed", error.code)
@@ -224,6 +230,20 @@ def unavailable_channels(conn: sqlite3.Connection, workspace: str) -> int:
         "SELECT count(*) FROM sync_state WHERE workspace = ? AND status = 'unavailable'",
         (workspace,),
     ).fetchone()[0]
+
+
+def blocked_channels(conn: sqlite3.Connection, workspace: str) -> tuple[int, list[str]]:
+    """(count, the distinct reasons) for channels the user could unblock.
+
+    The reasons carry the scope Slack named, because "grant a scope" without
+    saying which one is not a remedy.
+    """
+    rows = conn.execute(
+        "SELECT detail FROM sync_state WHERE workspace = ? AND status = 'blocked'",
+        (workspace,),
+    ).fetchall()
+    reasons = sorted({row[0] for row in rows if row[0]})
+    return len(rows), reasons
 
 
 def unswept_threads(conn: sqlite3.Connection, workspace: str) -> tuple[int, int]:
@@ -319,7 +339,8 @@ def _channels_by_tier(conn: sqlite3.Connection, workspace: str) -> dict[int, lis
         " LEFT JOIN sync_state s ON s.workspace = c.workspace AND s.channel_id = c.id"
         " LEFT JOIN backfill_state b ON b.workspace = c.workspace AND b.channel_id = c.id"
         " WHERE c.workspace = ? AND c.is_member = 1"
-        "   AND (COALESCE(s.status, '') <> 'unavailable' OR s.updated_at < ?)"
+        "   AND (COALESCE(s.status, '') NOT IN ('unavailable', 'blocked')"
+        "        OR s.updated_at < ?)"
         " ORDER BY visited ASC, attempted_at ASC, advanced_at ASC, c.id ASC",
         (workspace, time.time() - UNAVAILABLE_RETRY_SECONDS),
     ).fetchall()

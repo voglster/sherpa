@@ -81,7 +81,7 @@ from sherpa.corpus.embed import (
     GatewayEmbedder,
     embed_pending,
 )
-from sherpa.corpus.health import check, is_healthy, warnings
+from sherpa.corpus.health import check, is_healthy, remedies, warnings
 from sherpa.corpus.ingest import ingest_workspace
 from sherpa.corpus.search import Filters, Hit, conversation_with, search, sent_to, thread_at
 from sherpa.corpus.slack import AuthError, HttpSlackClient, SlackError
@@ -244,12 +244,13 @@ def render(hits: list[Hit], *, limit_chars: int = 1200) -> list[dict]:
 def with_health(payload: dict, conn, config, stale_ok: bool) -> dict:
     if stale_ok:
         return payload
-    if lines := warnings(check(conn, config)):
+    health = check(conn, config)
+    if lines := warnings(health):
         payload["warnings"] = lines
         # Additive, not overwriting: cmd_with/cmd_owed may already have set a
         # pagination `help` hint (see more results with --limit N) before this
-        # runs, and both hints are legitimate at once.
-        payload["help"] = payload.get("help", []) + ["sherpa corpus sync"]
+        # runs, and all of these hints are legitimate at once.
+        payload["help"] = payload.get("help", []) + remedies(health) + ["sherpa corpus sync"]
     return payload
 
 
@@ -459,6 +460,7 @@ def cmd_sync(args, config) -> int:
                 "failed": len(report.channels_failed),
                 "threads_failed": len(report.threads_failed),
                 "unavailable": len(report.channels_unavailable),
+                "blocked": len(report.channels_blocked),
                 "never_synced": report.channels_never_synced,
                 "embedded": embedded,
             }
@@ -490,6 +492,7 @@ def cmd_status(args, config) -> int:
                 "unembedded": r.unembedded,
                 "failed": r.failed_channels,
                 "unavailable": r.unavailable,
+                "blocked": r.blocked,
                 "never_synced": r.never_synced,
                 "backfilling": r.backfilling,
                 "unswept_threads": r.unswept_threads,
@@ -500,7 +503,7 @@ def cmd_status(args, config) -> int:
     }
     if lines := warnings(reports):
         payload["warnings"] = lines
-        payload["help"] = ["sherpa corpus sync"]
+        payload["help"] = remedies(reports) + ["sherpa corpus sync"]
     emit(payload, as_json=args.json)
     return 0 if is_healthy(reports) else 2
 

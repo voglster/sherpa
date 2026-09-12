@@ -9,10 +9,15 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sherpa.corpus.config import Config
-from sherpa.corpus.ingest import never_synced, unavailable_channels, unswept_threads
+from sherpa.corpus.ingest import (
+    blocked_channels,
+    never_synced,
+    unavailable_channels,
+    unswept_threads,
+)
 
 
 @dataclass
@@ -27,6 +32,9 @@ class Health:
     unswept_human_threads: int = 0
     never_synced: int = 0
     unavailable: int = 0
+    blocked: int = 0
+    blocked_reasons: list[str] = field(default_factory=list)
+    token_key: str = ""
 
 
 def check(conn: sqlite3.Connection, config: Config, *, now=time.time) -> list[Health]:
@@ -53,6 +61,7 @@ def check(conn: sqlite3.Connection, config: Config, *, now=time.time) -> list[He
         unswept, unswept_human = unswept_threads(conn, workspace.name)
         untouched = never_synced(conn, workspace.name)
         unavailable = unavailable_channels(conn, workspace.name)
+        blocked, blocked_reasons = blocked_channels(conn, workspace.name)
         reports.append(
             Health(
                 workspace=workspace.name,
@@ -65,6 +74,9 @@ def check(conn: sqlite3.Connection, config: Config, *, now=time.time) -> list[He
                 unswept_human_threads=unswept_human,
                 never_synced=untouched,
                 unavailable=unavailable,
+                blocked=blocked,
+                blocked_reasons=blocked_reasons,
+                token_key=workspace.token_key,
             )
         )
     return reports
@@ -77,13 +89,15 @@ def is_healthy(reports: list[Health]) -> bool:
     faults: per docs/SHERPA_STANDARDS.md a non-zero exit says the caller must
     change flags or environment before retrying is worth attempting, and
     neither of those is something anyone can fix -- the system is working as
-    designed and needs time. Exiting non-zero for the days a first backfill
+    designed and needs time. A blocked channel is the opposite and counts: the
+    user can grant the scope in two minutes, and nothing else will. Exiting non-zero for the days a first backfill
     takes would train the caller to ignore the signal, which is precisely how
     the corpus ends up silently incomplete. They stay loud in `warnings()`,
     where "incomplete" is exactly the right thing to say.
     """
     return all(
-        not r.stale and r.unembedded == 0 and r.failed_channels == 0 for r in reports
+        not r.stale and r.unembedded == 0 and r.failed_channels == 0 and r.blocked == 0
+        for r in reports
     )
 
 
@@ -99,6 +113,12 @@ def warnings(reports: list[Health]) -> list[str]:
             lines.append(f"{report.workspace}: {report.unembedded} chunks unembedded — semantic recall is degraded")
         if report.failed_channels:
             lines.append(f"{report.workspace}: {report.failed_channels} channels failed to sync")
+        if report.blocked:
+            reasons = "; ".join(report.blocked_reasons) or "no reason given"
+            lines.append(
+                f"{report.workspace}: {report.blocked} channels blocked ({reasons})"
+                " — nothing from them is in the corpus, and only you can unblock it"
+            )
         if report.unavailable:
             lines.append(
                 f"{report.workspace}: {report.unavailable} channels unavailable"
@@ -121,3 +141,13 @@ def warnings(reports: list[Health]) -> list[str]:
                 " — their replies are not in the corpus yet"
             )
     return lines
+
+
+def remedies(reports: list[Health]) -> list[str]:
+    """Concrete next actions for the faults that have one."""
+    return [
+        f"re-install the {report.workspace} Slack app with the scope above, then"
+        f" sherpa vault_manager set {report.token_key} <xoxp-token>"
+        for report in reports
+        if report.blocked
+    ]

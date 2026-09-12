@@ -1530,3 +1530,60 @@ def test_an_unavailable_channel_is_re_checked_eventually(tmp_path):
     client.calls.clear()
     ingest_workspace(conn, client, "gravitate", me=None)
     assert _history_calls_for(client, "D0SLACKBOT")
+
+
+# --- "Retrying cannot help" and "nobody can help" are different questions -----
+#
+# missing_scope and restricted_action will not fix themselves, so retrying them
+# every run is pointless -- but the caller can fix them in two minutes, which
+# makes them exactly the loud, actionable fault this project exists to surface.
+# Setting them aside quietly would stop the corpus covering a whole class of
+# channel while `status` read green.
+
+def _blocked_client(error="missing_scope", detail="groups:history", channel="C0PRIVATE"):
+    pages = dict(DIRECTORY)
+    pages["conversations.list"] = [{"ok": True, "channels": [
+        {"id": channel, "name": "private-thing", "is_channel": True,
+         "is_private": True, "is_member": True},
+        {"id": "D1", "is_im": True, "user": "U03K2ABCD"},
+    ]}]
+    pages["conversations.replies"] = [{"ok": True, "messages": []}]
+    client = FakeSlack(pages)
+    original = client.call
+
+    def call(method, **params):
+        if method == "conversations.history":
+            client.calls.append((method, params))
+            if params.get("channel") == channel:
+                raise SlackError(error, detail=detail)
+            return {"ok": True, "messages": []}
+        return original(method, **params)
+
+    client.call = call
+    return client
+
+
+def test_a_missing_scope_is_recorded_as_blocked_and_names_the_scope(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = _blocked_client()
+    report = ingest_workspace(conn, client, "gravitate", me=None)
+
+    row = conn.execute(
+        "SELECT status, detail FROM sync_state WHERE channel_id = 'C0PRIVATE'"
+    ).fetchone()
+    assert row["status"] == "blocked"
+    assert "groups:history" in row["detail"]
+    assert [c for c, _ in report.channels_blocked] == ["C0PRIVATE"]
+    assert report.channels_failed == []
+    assert report.channels_unavailable == []
+
+
+def test_a_blocked_channel_is_not_retried_every_run(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client = _blocked_client()
+    ingest_workspace(conn, client, "gravitate", me=None)
+
+    client.calls.clear()
+    ingest_workspace(conn, client, "gravitate", me=None)
+    assert _history_calls_for(client, "C0PRIVATE") == []
+    assert _history_calls_for(client, "D1")

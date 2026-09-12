@@ -16,34 +16,49 @@ import httpx
 API = "https://slack.com/api/"
 AUTH_ERRORS = {"invalid_auth", "token_revoked", "account_inactive", "not_authed"}
 
-# Errors that say "this will never work", as opposed to "try later". The
-# Slackbot DM answers channel_not_found to conversations.history for the life
-# of the workspace; retrying it every run and counting it as an outstanding
-# fault is a health signal that can never reach green, which teaches everyone
-# to ignore the one that matters. Lives here so the scheduler and any future
-# caller classify the same way.
-PERMANENT_ERRORS = {
+# "Will retrying work" and "can the user do anything about it" are different
+# questions, and conflating them is how a corpus either cries wolf forever or
+# goes quietly incomplete. Three categories, not two. Lives here so the
+# scheduler and any future caller classify the same way.
+#
+# Permanent and nobody's to fix: the Slackbot DM answers channel_not_found to
+# conversations.history for the life of the workspace. Retrying it every run
+# and counting it as an outstanding fault is a health signal that can never
+# reach green, which teaches everyone to ignore the one that matters.
+UNAVAILABLE_ERRORS = {
     "channel_not_found",
     "is_archived",
     "not_in_channel",
     "method_not_supported_for_channel_type",
-    "missing_scope",
-    "restricted_action",
     "user_not_found",
 }
+
+# Permanent until someone acts, and the someone is the user. Retrying is
+# pointless -- a scope does not appear on its own -- but hiding it would stop
+# the corpus covering a whole class of channel while status read green, which
+# is confident incompleteness with a timer on it.
+BLOCKED_ERRORS = {"missing_scope", "restricted_action"}
 MAX_RETRIES = 5
 
 
 class SlackError(Exception):
-    def __init__(self, code: str, *, retryable: bool = False) -> None:
+    def __init__(self, code: str, *, retryable: bool = False, detail: str = "") -> None:
         super().__init__(code)
         self.code = code
         self.retryable = retryable
+        # What Slack said beyond the code -- for missing_scope, the scope it
+        # wanted. Surfacing it is the difference between a remedy and a guess.
+        self.detail = detail
 
     @property
-    def permanent(self) -> bool:
-        """Whether another attempt could ever succeed."""
-        return self.code in PERMANENT_ERRORS
+    def unavailable(self) -> bool:
+        """A fact about the world, which no one here can change."""
+        return self.code in UNAVAILABLE_ERRORS
+
+    @property
+    def blocked(self) -> bool:
+        """Retrying cannot help, but the user can."""
+        return self.code in BLOCKED_ERRORS
 
 
 class AuthError(SlackError):
@@ -91,6 +106,8 @@ class HttpSlackClient:
             code = body.get("error", "unknown")
             if code in AUTH_ERRORS:
                 raise AuthError(code)
+            if code in BLOCKED_ERRORS:
+                raise SlackError(code, detail=body.get("needed", ""))
             if code == "ratelimited":
                 self._sleep(2.0 * (attempt + 1))
                 last_error_type = "ratelimit"
@@ -135,7 +152,9 @@ class FakeSlack:
         body = queue.pop(0) if len(queue) > 1 else queue[0]
         if not body.get("ok", True):
             code = body.get("error", "unknown")
-            raise AuthError(code) if code in AUTH_ERRORS else SlackError(code)
+            if code in AUTH_ERRORS:
+                raise AuthError(code)
+            raise SlackError(code, detail=body.get("needed", ""))
         return body
 
     def paginate(self, method: str, key: str, **params: Any) -> Iterator[dict]:
