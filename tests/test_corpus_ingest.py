@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sherpa.corpus.db import open_db
 from sherpa.corpus.ingest import (
     THREAD_SWEEP_PER_CHANNEL_CAP,
+    TIER_BUDGET_SHARE,
     THREAD_SWEEP_WINDOW_SECONDS,
     ingest_workspace,
     message_id,
@@ -1046,8 +1047,12 @@ def test_the_report_names_how_many_channels_have_never_been_synced(tmp_path):
                               now=TickingClock())
     assert report.channels_never_synced == 0
 
-    conn.execute("DELETE FROM sync_state WHERE channel_id = 'D03'")
-    conn.execute("DELETE FROM backfill_state WHERE channel_id = 'D03'")
+    # Two channels lose their state, and a spent budget still buys each tier
+    # one channel -- so exactly one of them is reached and the other is still
+    # waiting when the report is written.
+    for channel_id in ("D02", "D03"):
+        conn.execute("DELETE FROM sync_state WHERE channel_id = ?", (channel_id,))
+        conn.execute("DELETE FROM backfill_state WHERE channel_id = ?", (channel_id,))
     conn.commit()
     report = ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=0.0,
                               now=TickingClock())
@@ -1070,11 +1075,14 @@ def _mixed_workspace(im_count: int, mpim_count: int):
         {"id": f"D{i:04d}DIRECT", "is_im": True, "user": "U03K2ABCD"}
         for i in range(im_count)
     ]
+    # The higher tiers carry real backlog, as they do live -- a 5,657-message
+    # DM does not finish in one run. A fixture where they empty quickly lets
+    # the lower tiers run on the leftovers and hides the bug entirely.
     histories = {
         channel["id"]: SlackHistory([
             {"ts": f"{1700000000 + i}.000100", "user": "U03K2ABCD",
              "text": f"{channel['id']}-m{i}"}
-            for i in range(2)
+            for i in range(2 if "LURKED" in channel["id"] else 500)
         ])
         for channel in channels
     }
@@ -1204,3 +1212,132 @@ def test_the_per_channel_cap_still_bounds_a_prioritised_sweep(tmp_path):
                      now=lambda: 1700009100.0)
 
     assert len(_swept(client)) <= THREAD_SWEEP_PER_CHANNEL_CAP
+
+
+# --- The scheduler, at the scale it actually runs at --------------------------
+#
+# Three starvation bugs have now shipped from this scheduler: no ordering at
+# all, then an alphabetical tiebreak that put every group DM ahead of every 1:1
+# DM, then budget arithmetic that summed to 1.2x and left the last tier with a
+# deadline already in the past. Every one of them was invisible to the tests
+# because the fixtures had a handful of channels and a generous budget, which
+# is the one regime where a broken scheduler looks fine. This is the fixture
+# that regime hides from: several hundred channels of every kind, a budget that
+# covers a fraction of them, and the only question that matters -- is every
+# channel reached.
+
+def _every_kind_workspace():
+    channels = (
+        [{"id": f"D{i:04d}DIRECT", "is_im": True, "user": "U03K2ABCD"} for i in range(40)]
+        + [{"id": f"C{i:04d}GROUP", "is_mpim": True, "name": f"mpdm-{i}"} for i in range(60)]
+        + [{"id": f"C{i:04d}SPOKEN", "name": f"spoken-{i}", "is_channel": True,
+            "is_member": True} for i in range(30)]
+        + [{"id": f"C{i:04d}LURKED", "name": f"lurked-{i}", "is_channel": True,
+            "is_member": True} for i in range(70)]
+    )
+    # The higher tiers carry real backlog, as they do live -- a 5,657-message
+    # DM does not finish in one run. A fixture where they empty quickly lets
+    # the lower tiers run on the leftovers and hides the bug entirely.
+    histories = {
+        channel["id"]: SlackHistory([
+            {"ts": f"{1700000000 + i}.000100", "user": "U03K2ABCD",
+             "text": f"{channel['id']}-m{i}"}
+            for i in range(2 if "LURKED" in channel["id"] else 500)
+        ])
+        for channel in channels
+    }
+    client = client_serving(histories, channels=channels)
+    client._pages["conversations.members"] = [
+        {"ok": True, "members": ["U07JIMVOG", "U03K2ABCD"]}
+    ]
+    return client, channels
+
+
+def _make_tier_three(conn, channels):
+    """A channel is tier 3 only if Jim has posted in it."""
+    for channel in channels:
+        if "SPOKEN" not in channel["id"]:
+            continue
+        conn.execute(
+            "INSERT INTO messages (id, workspace, channel_id, channel_name, channel_kind,"
+            " ts, ts_raw, thread_ts, thread_ts_raw, author_id, author_name, is_me, text,"
+            " permalink, meta)"
+            " VALUES (?, 'gravitate', ?, 'spoken', 'public', 1.0, '1.000000', NULL, '',"
+            " 'U07JIMVOG', 'Jim Vogel', 1, 'mine', 'x', '{}')",
+            (f"gravitate:{channel['id']}:1.000000", channel["id"]),
+        )
+    conn.commit()
+
+
+def test_every_channel_of_every_kind_is_reached_under_a_tight_budget(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    client, channels = _every_kind_workspace()
+    _make_tier_three(conn, channels)
+
+    # A budget that covers a fraction of the work, which is the regime the
+    # earlier fixtures never put the scheduler in.
+    clock = TickingClock()
+    for _ in range(40):
+        ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=60.0, now=clock)
+
+    attempted = {
+        row[0]
+        for row in conn.execute(
+            "SELECT channel_id FROM sync_state WHERE workspace = 'gravitate'"
+            " AND attempted_at > 0"
+        )
+    }
+    missed = {c["id"] for c in channels} - attempted
+    assert not missed, f"{len(missed)} channels never attempted, e.g. {sorted(missed)[:5]}"
+
+    covered = {row[0] for row in conn.execute("SELECT DISTINCT channel_id FROM messages")}
+    assert {c["id"] for c in channels} <= covered
+
+
+def test_the_lowest_tier_is_attempted_even_when_earlier_tiers_are_hungry(tmp_path):
+    """The live symptom: #general, #random and 72 others sat at `never
+    attempted` through seven runs and 538k messages, because the shares summed
+    to 1.2 and tier 4's deadline was already in the past when it started."""
+    conn = open_db(tmp_path / "c.db")
+    client, channels = _every_kind_workspace()
+    _make_tier_three(conn, channels)
+
+    ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=60.0,
+                     now=TickingClock())
+
+    lurked = [c["id"] for c in channels if "LURKED" in c["id"]]
+    attempted = {
+        row[0]
+        for row in conn.execute(
+            "SELECT channel_id FROM sync_state WHERE attempted_at > 0"
+        )
+    }
+    assert attempted & set(lurked)
+
+
+def test_the_tier_shares_are_not_oversubscribed():
+    """An edit that oversubscribes them must fail loudly, not silently starve
+    whichever tier happens to run last."""
+    assert sum(TIER_BUDGET_SHARE.values()) == pytest.approx(1.0)
+    assert all(share > 0 for share in TIER_BUDGET_SHARE.values())
+
+
+def test_a_tier_that_finishes_early_hands_its_time_onward(tmp_path):
+    """Tier 1 has nothing to do, so tiers below it should get more than their
+    nominal share rather than the run simply ending sooner."""
+    conn = open_db(tmp_path / "c.db")
+    client, channels = _every_kind_workspace()
+    _make_tier_three(conn, channels)
+    conn.execute("DELETE FROM channels")  # rebuilt by the directory walk
+    conn.commit()
+
+    only_lurked = [c for c in channels if "LURKED" in c["id"]]
+    client._pages["conversations.list"] = [{"ok": True, "channels": only_lurked}]
+
+    ingest_workspace(conn, client, "gravitate", me=None, budget_seconds=200.0,
+                     now=TickingClock())
+
+    attempted = conn.execute(
+        "SELECT count(*) FROM sync_state WHERE attempted_at > 0"
+    ).fetchone()[0]
+    assert attempted > len(only_lurked) * TIER_BUDGET_SHARE[4]

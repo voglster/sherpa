@@ -54,7 +54,31 @@ SWEEP_LOW_PRIORITY_SHARE = 0.2
 # able to consume the whole run and leave lower tiers permanently unbackfilled.
 # 1:1 DMs get the largest guaranteed slice: fewest channels, highest value.
 # Every tier still gets its own, so no tier can be starved by a busier one.
+#
+# These are weights over the time REMAINING when each tier starts, not slices
+# of the original budget. Slicing the original was an arithmetic trap: the
+# directory walk took 0.2 off the top and these summed to 1.0, so the run was
+# oversubscribed by 20% and the last tier's deadline was already in the past
+# when it started -- `#general`, `#random` and 72 others sat at "never
+# attempted" through seven runs and 538k messages, and a larger --budget
+# scaled every share equally and changed nothing. Weighting the remainder
+# cannot oversubscribe by construction, and hands an early-finishing tier's
+# time to the tiers below it.
 TIER_BUDGET_SHARE = {1: 0.4, 2: 0.2, 3: 0.2, 4: 0.2}
+
+if abs(sum(TIER_BUDGET_SHARE.values()) - 1.0) > 1e-9 or any(
+    share <= 0 for share in TIER_BUDGET_SHARE.values()
+):  # pragma: no cover - a guard against editing the table wrong
+    raise ValueError(
+        "TIER_BUDGET_SHARE must be positive and sum to 1.0;"
+        f" got {TIER_BUDGET_SHARE} summing to {sum(TIER_BUDGET_SHARE.values())}"
+    )
+
+# Even with the clock already spent, every tier gets this long -- enough for one
+# channel to be attempted and commit a page. A tier reached with nothing left is
+# a tier that makes no progress ever, which is the whole failure being fixed
+# here; four tiers can overrun the budget by at most this times four.
+MIN_TIER_SECONDS = 5.0
 
 # The directory walk is part of the run, so it answers to the run's clock. Left
 # unbounded it spent about seven minutes of a two-minute budget on membership
@@ -104,9 +128,12 @@ def ingest_workspace(
     resolver = Resolver(conn, workspace, client)
     report = IngestReport(workspace=workspace)
 
-    for tier, channels in _channels_by_tier(conn, workspace).items():
-        share = TIER_BUDGET_SHARE.get(tier, 0.0)
-        tier_deadline = min(overall_deadline, now() + budget_seconds * share)
+    by_tier = _channels_by_tier(conn, workspace)
+    unstarted = dict(by_tier)
+
+    for tier, channels in by_tier.items():
+        tier_deadline = _tier_deadline(tier, unstarted, overall_deadline, now)
+        unstarted.pop(tier, None)
 
         for channel in channels:
             if now() >= tier_deadline:
@@ -169,6 +196,23 @@ def never_synced(conn: sqlite3.Connection, workspace: str) -> int:
         " AND b.channel_id IS NULL AND COALESCE(s.last_ts, 0) = 0",
         (workspace,),
     ).fetchone()[0]
+
+
+def _tier_deadline(tier: int, unstarted: dict, overall_deadline: float, now) -> float:
+    """This tier's share of what is actually left, not of what there once was.
+
+    Weighting the remainder means an earlier tier that finishes early hands its
+    time down, an earlier tier that overruns cannot zero out a later one, and
+    the shares cannot oversubscribe the run however they are edited. The floor
+    guarantees the invariant the last tier lost: every tier gets a non-zero
+    slice on every run, whatever the tiers above it did.
+    """
+    current = now()
+    remaining = max(overall_deadline - current, 0.0)
+    pending = sum(TIER_BUDGET_SHARE.get(other, 0.0) for other in unstarted)
+    weight = TIER_BUDGET_SHARE.get(tier, 0.0)
+    slice_seconds = remaining * (weight / pending) if pending else remaining
+    return current + max(slice_seconds, MIN_TIER_SECONDS)
 
 
 def _channels_by_tier(conn: sqlite3.Connection, workspace: str) -> dict[int, list[sqlite3.Row]]:
