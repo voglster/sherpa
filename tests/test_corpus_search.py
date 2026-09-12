@@ -506,3 +506,65 @@ def test_mine_does_not_count_a_message_from_the_channel_around_a_thread(corpus):
         )
     }
     assert thread_chunk not in mine
+
+
+def _equally_relevant_pair(conn, marker="distinctive_marker_term"):
+    """Two chunks carrying the same query term, five years apart."""
+    old, recent = 1593561600.000100, 1757606400.000100  # 2020-07 and 2025-09
+    for ts, channel in ((old, "DOLD"), (recent, "DNEW")):
+        insert(conn, ts, "Hunter Reeves", f"{marker} about the cli flag work",
+               channel=channel, name="Hunter Reeves")
+        insert(conn, ts + 60, "Jim Vogel", f"{marker} I'll take it", is_me=1,
+               channel=channel, name="Hunter Reeves")
+    conn.commit()
+    build_chunks(conn, "gravitate", "DOLD")
+    build_chunks(conn, "gravitate", "DNEW")
+    embed_pending(conn, FakeEmbedder())
+
+
+def test_of_two_equally_relevant_chunks_the_recent_one_ranks_first(corpus):
+    _equally_relevant_pair(corpus)
+    hits = search(corpus, "distinctive_marker_term", FakeEmbedder(), k=5,
+                  now=lambda: 1757700000.0)
+    assert hits
+    assert hits[0].channel == "DNEW"
+
+
+def test_a_substantially_stronger_old_match_still_wins(corpus):
+    """The prior breaks ties; it does not overrule relevance.
+
+    "Substantially stronger" is the shape that actually occurs: the old chunk
+    is the one genuinely about the topic, so both retrieval channels find it,
+    while the recent chunk mentions the words in passing and only BM25 sees
+    it. A chunk found twice scores roughly double one found once, which no
+    tie-break at this strength can touch.
+    """
+    old, recent = 1593561600.000100, 1757606400.000100
+    insert(corpus, old, "Hunter Reeves", "gravi cli flag work on the parser",
+           channel="DOLD2", name="Hunter Reeves")
+    insert(corpus, old + 60, "Jim Vogel", "gravi cli flag work, I'll take it",
+           is_me=1, channel="DOLD2", name="Hunter Reeves")
+    insert(corpus, recent, "Hunter Reeves", "lunch plans and the gravi work sometime",
+           channel="DNEW2", name="Hunter Reeves")
+    insert(corpus, recent + 60, "Jim Vogel", "sure, gravi work later", is_me=1,
+           channel="DNEW2", name="Hunter Reeves")
+    corpus.commit()
+    build_chunks(corpus, "gravitate", "DOLD2")
+    build_chunks(corpus, "gravitate", "DNEW2")
+    embed_pending(corpus, FakeEmbedder())
+
+    query = "gravi cli flag work"
+    old_chunk = corpus.execute(
+        "SELECT id FROM chunks WHERE channel_id = 'DOLD2'"
+    ).fetchone()[0]
+    corpus.execute("DELETE FROM chunks_vec WHERE chunk_id = ?", (old_chunk,))
+    corpus.execute(
+        "INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, ?)",
+        (old_chunk, struct.pack(f"{EMBED_DIM}f", *FLOOR_ORIGIN)),
+    )
+    corpus.commit()
+
+    embedder = ScriptedEmbedder({query: FLOOR_ORIGIN}, FLOOR_FAR)
+    hits = search(corpus, query, embedder, k=5, now=lambda: 1757700000.0)
+    assert hits
+    assert hits[0].channel == "DOLD2"

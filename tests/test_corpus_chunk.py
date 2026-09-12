@@ -348,3 +348,60 @@ def test_a_mentioned_person_counts_as_being_in_the_conversation(conn):
     build_chunks(conn, "w", "C1")
 
     assert "Hunter Reeves" in conn.execute("SELECT people FROM chunks").fetchone()[0]
+
+
+# --- Machine output is stored but not retrieved ------------------------------
+#
+# A third of the real corpus is alerts: Jira 11.6%, Optimus 10.3%, one unnamed
+# bot 8.0%. Bot messages are formulaic, so they saturate BM25 term matches and
+# cluster tightly in embedding space, and `search "gravi cli flag work"`
+# returned two Jira issue alerts instead of any human conversation. They can
+# never contain a commitment. They stay in `messages` -- nothing is discarded,
+# and a later rechunk can bring them back -- but they are not a retrieval unit.
+
+def bot_insert(conn, ts, author, text, *, author_id="B01T0JT986T", channel="C1", meta="{}"):
+    conn.execute(
+        "INSERT INTO messages (id, workspace, channel_id, channel_name, channel_kind, ts,"
+        " thread_ts, author_id, author_name, is_me, text, permalink, meta)"
+        " VALUES (?, 'w', ?, 'gravi-cli', 'public', ?, NULL, ?, ?, 0, ?, 'https://x', ?)",
+        (f"w:{channel}:{ts}", channel, ts, author_id, author, text, meta),
+    )
+
+
+def test_a_window_of_pure_bot_output_produces_no_chunk(conn):
+    for i in range(3):
+        bot_insert(conn, 1757606400.0 + i, "Jira",
+                   f"Cullen Denison created an Issue GSD-901{i} Flag missing")
+    conn.commit()
+    assert build_chunks(conn, "w", "C1") == 0
+    assert conn.execute("SELECT count(*) FROM messages").fetchone()[0] == 3
+
+
+def test_a_mixed_window_keeps_its_human_messages(conn):
+    bot_insert(conn, 1757606400.0, "Jira", "created an Issue GSD-9015 Flag missing")
+    insert(conn, 1757606460.0, "Jim Vogel", "I'll take the gravi cli flag work")
+    bot_insert(conn, 1757606520.0, "Jira", "created an Issue GSD-9016 Flag missing")
+    conn.commit()
+    build_chunks(conn, "w", "C1")
+
+    text = conn.execute("SELECT text FROM chunks").fetchone()[0]
+    assert "gravi cli flag work" in text
+    assert "GSD-9015" not in text
+
+
+def test_a_bot_is_recognised_by_its_users_row_not_only_its_id(conn):
+    """Slack lists app users in users.list with is_bot, so a bot can perfectly
+    well have a U-prefixed author id."""
+    conn.execute(
+        "INSERT INTO users (workspace, id, name, is_bot) VALUES ('w', 'U0OPTIMUS', 'Optimus', 1)"
+    )
+    bot_insert(conn, 1757606400.0, "Optimus", "deploy finished", author_id="U0OPTIMUS")
+    conn.commit()
+    assert build_chunks(conn, "w", "C1") == 0
+
+
+def test_a_bot_is_recognised_by_the_bot_id_in_its_payload(conn):
+    bot_insert(conn, 1757606400.0, "Someone", "build 4412 passed",
+               author_id="U0NORMAL", meta='{"bot_id": "B01T0JT986T"}')
+    conn.commit()
+    assert build_chunks(conn, "w", "C1") == 0

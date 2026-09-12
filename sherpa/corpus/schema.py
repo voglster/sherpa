@@ -211,6 +211,15 @@ COLUMN_ADDITIONS: list[tuple[str, str, str, str | None]] = [
     # is read on a slow cadence rather than once per channel per run. Rows that
     # already have members start the clock now; rows without one are due
     # immediately, since membership is what names a group DM.
+    # Slack lists app users in users.list with is_bot, so a bot can perfectly
+    # well have a U-prefixed id -- Jira and Optimus, 22% of the real corpus
+    # between them, both do.
+    # The backfill is the one-shot upgrade action for this change as a whole:
+    # bot output stopped being a retrieval unit, so every channel's windowing is
+    # out of date and the next sync rebuilds it. It runs in the same transaction
+    # as the column, exactly once.
+    ("users", "is_bot", "INTEGER NOT NULL DEFAULT 0",
+     "UPDATE sync_state SET needs_rechunk = 1"),
     ("channels", "members_fetched_at", "REAL NOT NULL DEFAULT 0",
      "UPDATE channels SET members_fetched_at = CAST(strftime('%s','now') AS REAL)"
      " WHERE member_ids <> '[]'"),

@@ -100,16 +100,18 @@ def sync_directory(
     for member in client.paginate("users.list", "members"):
         profile = member.get("profile", {})
         conn.execute(
-            "INSERT INTO users (workspace, id, name, display_name, is_me)"
-            " VALUES (?, ?, ?, ?, ?)"
+            "INSERT INTO users (workspace, id, name, display_name, is_me, is_bot)"
+            " VALUES (?, ?, ?, ?, ?, ?)"
             " ON CONFLICT (workspace, id) DO UPDATE SET"
-            " name = excluded.name, display_name = excluded.display_name, is_me = excluded.is_me",
+            " name = excluded.name, display_name = excluded.display_name,"
+            " is_me = excluded.is_me, is_bot = excluded.is_bot",
             (
                 workspace,
                 member["id"],
                 profile.get("real_name") or member.get("name") or member["id"],
                 profile.get("display_name", ""),
                 1 if member["id"] == me_id else 0,
+                1 if member.get("is_bot") or member["id"] == "USLACKBOT" else 0,
             ),
         )
 
@@ -371,7 +373,12 @@ def tier_for(channel_row, has_posted: bool) -> int:
 class Resolver:
     """ID to human name, cached per workspace for the life of one sync run."""
 
-    def __init__(self, conn: sqlite3.Connection, workspace: str) -> None:
+    def __init__(
+        self, conn: sqlite3.Connection, workspace: str, client: SlackClient | None = None
+    ) -> None:
+        self._conn = conn
+        self._workspace = workspace
+        self._client = client
         self._users = {
             row["id"]: row["name"]
             for row in conn.execute("SELECT id, name FROM users WHERE workspace = ?", (workspace,))
@@ -389,7 +396,35 @@ class Resolver:
         self.team_host = team_host(conn, workspace)
 
     def user_name(self, user_id: str) -> str:
-        return self._users.get(user_id, user_id)
+        """Resolve an author id, asking bots.info for the ones users.list omits.
+
+        Bots are not in users.list, so this fell through to the raw id and
+        `B01T0JT986T` appeared as an author name. Their messages are excluded
+        from chunks, but they are still stored, and the name is what shows up
+        in a `with` or `owed` transcript.
+        """
+        if user_id in self._users:
+            return self._users[user_id]
+        if not (self._client and user_id.startswith("B")):
+            return user_id
+
+        name = f"Unknown bot ({user_id})"
+        try:
+            bot = self._client.call("bots.info", bot=user_id).get("bot", {})
+            name = bot.get("name") or bot.get("app_id") or name
+        except AuthError:
+            raise
+        except SlackError:
+            pass  # cached below either way, so this is asked once, not per message
+
+        self._conn.execute(
+            "INSERT INTO users (workspace, id, name, display_name, is_me, is_bot)"
+            " VALUES (?, ?, ?, '', 0, 1)"
+            " ON CONFLICT (workspace, id) DO UPDATE SET name = excluded.name, is_bot = 1",
+            (self._workspace, user_id, name),
+        )
+        self._users[user_id] = name
+        return name
 
     def channel(self, channel_id: str) -> tuple[str, str]:
         name, kind = self._channels.get(channel_id, (channel_id, "public"))

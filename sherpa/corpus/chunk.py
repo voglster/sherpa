@@ -14,6 +14,15 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
+# Three ways a message is machine-generated: an app user listed by users.list
+# (Jira, Optimus), a bot id Slack never lists at all, and the bot_id the
+# payload itself carries.
+HUMAN_AUTHORED = (
+    "COALESCE(u.is_bot, 0) = 0"
+    " AND m.author_id NOT LIKE 'B%'"
+    " AND json_extract(m.meta, '$.bot_id') IS NULL"
+)
+
 GAP_SECONDS = 1800
 MAX_MESSAGES = 40
 OVERLAP = 2
@@ -125,7 +134,15 @@ def build_chunks(conn: sqlite3.Connection, workspace: str, channel_id: str) -> i
     the size of the resulting authoritative set, not a count of writes.
     """
     messages = conn.execute(
-        "SELECT * FROM messages WHERE workspace = ? AND channel_id = ? ORDER BY ts",
+        # Bot output is stored but never chunked: alerts are formulaic, so they
+        # saturate BM25 and cluster tightly in embedding space, crowding out the
+        # conversations this corpus exists to find -- and they cannot contain a
+        # commitment. Nothing is discarded; a later rechunk can bring them back.
+        "SELECT m.* FROM messages m"
+        " LEFT JOIN users u ON u.workspace = m.workspace AND u.id = m.author_id"
+        " WHERE m.workspace = ? AND m.channel_id = ?"
+        f" AND {HUMAN_AUTHORED}"
+        " ORDER BY m.ts",
         (workspace, channel_id),
     ).fetchall()
 

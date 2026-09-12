@@ -914,3 +914,39 @@ def test_the_directory_walk_answers_to_the_runs_budget(tmp_path):
 
     member_calls = [1 for method, _ in client.calls if method == "conversations.members"]
     assert 0 < len(member_calls) < 60
+
+
+def test_a_bot_author_is_named_rather_than_left_as_a_raw_id(tmp_path):
+    """Bots are absent from users.list, so resolution fell through to the raw
+    id and `B01T0JT986T` appeared as an author name. Excluded from chunks or
+    not, that name shows up in `messages` and in with/owed transcripts."""
+    conn = open_db(tmp_path / "c.db")
+    pages = dict(DIRECTORY)
+    pages["conversations.history"] = [{"ok": True, "messages": [
+        {"ts": "1757606400.000100", "bot_id": "B01T0JT986T",
+         "text": "Cullen Denison created an Issue GSD-9015"},
+    ]}]
+    pages["conversations.replies"] = [{"ok": True, "messages": []}]
+    pages["bots.info"] = [{"ok": True, "bot": {"id": "B01T0JT986T", "name": "Jira"}}]
+    ingest_workspace(conn, FakeSlack(pages), "gravitate", me=None)
+
+    assert conn.execute("SELECT author_name FROM messages").fetchone()[0] == "Jira"
+    assert conn.execute(
+        "SELECT is_bot FROM users WHERE id = 'B01T0JT986T'"
+    ).fetchone()[0] == 1
+
+
+def test_an_unresolvable_bot_is_asked_about_only_once(tmp_path):
+    conn = open_db(tmp_path / "c.db")
+    pages = dict(DIRECTORY)
+    pages["conversations.history"] = [{"ok": True, "messages": [
+        {"ts": "1757606400.000100", "bot_id": "B0GONE", "text": "one"},
+        {"ts": "1757606401.000100", "bot_id": "B0GONE", "text": "two"},
+    ]}]
+    pages["conversations.replies"] = [{"ok": True, "messages": []}]
+    pages["bots.info"] = [{"ok": False, "error": "bot_not_found"}]
+    client = FakeSlack(pages)
+    ingest_workspace(conn, client, "gravitate", me=None)
+
+    assert len([1 for method, _ in client.calls if method == "bots.info"]) == 1
+    assert "B0GONE" in conn.execute("SELECT author_name FROM messages").fetchone()[0]

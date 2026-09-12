@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import struct
+import time
 from dataclasses import dataclass
 
 from sherpa.corpus.chunk import format_script
@@ -20,6 +21,20 @@ from sherpa.corpus.embed import Embedder
 
 RRF_K = 60
 CANDIDATES = 50
+
+# A mild preference for recent conversation, applied to the fused score.
+#
+# The corpus spans five years, and "what did I promise" or "did I miss
+# anything" is almost never answered by a 2021 thread -- but sometimes it is,
+# so this is a tie-break, not a cutoff (`--since` is the cutoff, and it already
+# exists). Sizing: adjacent RRF ranks differ by about 1.5%, while a chunk found
+# by both BM25 and KNN scores roughly double a chunk found by one. A 5% ceiling
+# therefore reorders neighbours -- a recent chunk can pass an older one two or
+# three ranks above it -- and cannot come close to overturning a genuinely
+# stronger match. The half-life is deliberately long for the same reason: work
+# conversations stay live for months.
+RECENCY_WEIGHT = 0.05
+RECENCY_HALF_LIFE_DAYS = 180.0
 
 # A person is in a conversation whether or not they spoke in the window this
 # chunk covers. `people` is the conversation's roster plus everyone the window
@@ -299,6 +314,34 @@ def _fuse(*rankings: list[int]) -> list[tuple[int, float]]:
     return sorted(scores.items(), key=lambda pair: pair[1], reverse=True)
 
 
+def _recency_factor(end_ts: float, current: float) -> float:
+    age_days = max(current - end_ts, 0.0) / 86400.0
+    return 1.0 + RECENCY_WEIGHT * 0.5 ** (age_days / RECENCY_HALF_LIFE_DAYS)
+
+
+def _prefer_recent(conn, fused: list[tuple[int, float]], current: float) -> list[tuple[int, float]]:
+    """Re-rank the fused candidates, nudging recent conversation upward.
+
+    Applied after RRF rather than inside it, so it adjusts an ordering that
+    relevance has already decided instead of competing with it.
+    """
+    if not fused:
+        return fused
+    ids = [chunk_id for chunk_id, _ in fused]
+    ends = dict(
+        conn.execute(
+            "SELECT id, end_ts FROM chunks WHERE id IN ({})".format(",".join("?" * len(ids))),
+            ids,
+        )
+    )
+    adjusted = [
+        (chunk_id, score * _recency_factor(ends.get(chunk_id, current), current))
+        for chunk_id, score in fused
+    ]
+    adjusted.sort(key=lambda pair: pair[1], reverse=True)
+    return adjusted
+
+
 def search(
     conn: sqlite3.Connection,
     query: str,
@@ -307,11 +350,16 @@ def search(
     filters: Filters | None = None,
     k: int = 5,
     context: int = 3,
+    now=time.time,
 ) -> list[Hit]:
     filters = filters or Filters()
-    fused = _fuse(
-        _bm25_ranked(conn, query, filters),
-        _knn_ranked(conn, query, embedder, filters),
+    fused = _prefer_recent(
+        conn,
+        _fuse(
+            _bm25_ranked(conn, query, filters),
+            _knn_ranked(conn, query, embedder, filters),
+        ),
+        now(),
     )
 
     hits, covered = [], []

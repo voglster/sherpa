@@ -90,7 +90,7 @@ def ingest_workspace(
         now=now,
         deadline=min(overall_deadline, now() + budget_seconds * DIRECTORY_BUDGET_SHARE),
     )
-    resolver = Resolver(conn, workspace)
+    resolver = Resolver(conn, workspace, client)
     report = IngestReport(workspace=workspace)
 
     for tier, channels in _channels_by_tier(conn, workspace).items():
@@ -561,7 +561,7 @@ def _store(conn, resolver: Resolver, workspace: str, channel, raw: dict) -> int:
     text, mentions = resolver.render(raw["text"])
     meta = {
         key: raw[key]
-        for key in ("reactions", "files", "edited", "subtype", "reply_count")
+        for key in ("reactions", "files", "edited", "subtype", "reply_count", "bot_id")
         if key in raw
     }
     if mentions:
