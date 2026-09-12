@@ -83,7 +83,15 @@ from sherpa.corpus.embed import (
 )
 from sherpa.corpus.health import check, is_healthy, remedies, warnings
 from sherpa.corpus.ingest import ingest_workspace
-from sherpa.corpus.search import Filters, Hit, conversation_with, search, sent_to, thread_at
+from sherpa.corpus.search import (
+    Filters,
+    Hit,
+    conversation_with,
+    search,
+    sent_to,
+    term_coverage,
+    thread_at,
+)
 from sherpa.corpus.slack import AuthError, HttpSlackClient, SlackError
 
 RELATIVE = re.compile(r"^(\d+)([hdw])$")
@@ -246,7 +254,9 @@ def with_health(payload: dict, conn, config, stale_ok: bool) -> dict:
         return payload
     health = check(conn, config)
     if lines := warnings(health):
-        payload["warnings"] = lines
+        # Additive: a coverage caveat may already be here, and it is about a
+        # different kind of incompleteness than a stale or unembedded corpus.
+        payload["warnings"] = payload.get("warnings", []) + lines
         # Additive, not overwriting: cmd_with/cmd_owed may already have set a
         # pagination `help` hint (see more results with --limit N) before this
         # runs, and all of these hints are legitimate at once.
@@ -285,6 +295,7 @@ def cmd_search(args, config) -> int:
         channel=args.channel,
         since=parse_since(args.since) if args.since else None,
     )
+    coverage = term_coverage(conn, args.query)
     try:
         hits = search(
             conn,
@@ -294,6 +305,7 @@ def cmd_search(args, config) -> int:
             k=args.k,
             context=args.context,
             knn_distance_floor=config.knn_distance_floor,
+            coverage=coverage,
         )
     except EmbeddingError as error:
         notify("Slack corpus: embedding gateway down", error.detail)
@@ -303,9 +315,25 @@ def cmd_search(args, config) -> int:
         )
 
     payload = {"query": args.query, "count": len(hits), "results": render(hits)}
-    if not hits:
+    missing = ", ".join(coverage.missing)
+    if coverage.nothing_present:
+        # Not "nothing was close enough" -- no conversation in the corpus
+        # contains these words at all, so there is nothing here to find and
+        # anything returned would be a topical neighbour of a subject nobody
+        # ever discussed.
+        payload["results"] = []
+        payload["note"] = (
+            f"no conversation in the corpus mentions {missing}"
+            " — this topic is not in the corpus at all"
+        )
+    elif not hits:
         payload["results"] = []
         payload["note"] = f"no conversations matched {args.query!r}"
+    elif coverage.missing:
+        payload["warnings"] = [
+            f"no conversation mentions {missing}"
+            " — the results below are topically related and may not answer the question"
+        ]
     emit(with_health(payload, conn, config, args.stale_ok), as_json=args.json)
     return 0
 

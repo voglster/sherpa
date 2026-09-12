@@ -217,6 +217,49 @@ def _bm25_ranked(conn, query: str, filters: Filters) -> list[int]:
     ]
 
 
+@dataclass
+class Coverage:
+    """How many chunks mention each of the query's substantive terms.
+
+    The adaptive floor answers "is anything semantically close to this". This
+    answers a different and more useful question: "does the corpus contain any
+    record of this thing at all". A well-formed question about a topic that was
+    never discussed -- "the acquisition of Northwind Logistics" -- sails
+    through any distance rule, because well-formed business English is close to
+    business Slack in embedding space whether or not the topic exists.
+    Embeddings measure topical similarity, not factual presence. Term counts
+    measure presence directly, and they are a fact about the corpus rather than
+    a guess about geometry.
+    """
+
+    counts: dict[str, int]
+
+    @property
+    def missing(self) -> list[str]:
+        return [term for term, count in self.counts.items() if not count]
+
+    @property
+    def nothing_present(self) -> bool:
+        """Every substantive term is absent, so there is nothing to find."""
+        return bool(self.counts) and not any(self.counts.values())
+
+
+def term_coverage(conn: sqlite3.Connection, query: str) -> Coverage:
+    """Count the chunks mentioning each substantive term of the query.
+
+    Uses `_substantive_terms` and the same quoting `_fts_query` uses, so this
+    cannot disagree with what BM25 actually searched for. FTS5's tokenizer
+    folds case, so the counts are case-insensitive by construction.
+    """
+    counts = {}
+    for term in _substantive_terms(query):
+        counts[term] = conn.execute(
+            "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH ?",
+            (_fts_query([term]),),
+        ).fetchone()[0]
+    return Coverage(counts=counts)
+
+
 def _substantive_terms(query: str) -> list[str]:
     """The words in a query that can actually discriminate between chunks.
 
@@ -431,8 +474,15 @@ def search(
     context: int = 3,
     now=time.time,
     knn_distance_floor: float = KNN_DISTANCE_FLOOR,
+    coverage: Coverage | None = None,
 ) -> list[Hit]:
     filters = filters or Filters()
+    # No term in the query appears anywhere in the corpus. Whatever the vector
+    # index would offer is a topical neighbour of a subject nobody has ever
+    # discussed, and handing that back is the confabulation this whole module
+    # guards against.
+    if (coverage or term_coverage(conn, query)).nothing_present:
+        return []
     fused = _prefer_recent(
         conn,
         _fuse(

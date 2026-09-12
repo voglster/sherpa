@@ -193,7 +193,9 @@ def test_search_with_no_matches_reports_a_definitive_empty_state(workspace, caps
 
 def test_search_embedding_error_notifies_and_exits_1(workspace, capsys, monkeypatch):
     config, _ = workspace
-    open_db(config.parent / "c.db").close()
+    # A seeded corpus and a covered query, so the gateway is actually reached:
+    # a query naming nothing the corpus contains is answered without it.
+    _seeded_db(config.parent / "c.db").close()
     monkeypatch.setattr(corpus_tool, "notify", lambda *a, **k: None)
 
     class _BrokenEmbedder:
@@ -202,7 +204,7 @@ def test_search_embedding_error_notifies_and_exits_1(workspace, capsys, monkeypa
 
     monkeypatch.setattr(corpus_tool, "make_embedder", lambda vault=None: _BrokenEmbedder())
     with pytest.raises(SystemExit) as caught:
-        corpus_tool.main(["search", "anything", "--config", str(config), "--stale-ok"])
+        corpus_tool.main(["search", "flag work", "--config", str(config), "--stale-ok"])
     assert caught.value.code == 1
     assert "gateway down" in capsys.readouterr().out
 
@@ -923,3 +925,45 @@ def test_a_blocked_channel_holds_status_red_and_names_the_remedy(workspace, caps
     assert payload["workspaces"][0]["blocked"] == 1
     assert any("groups:history" in line for line in payload["warnings"])
     assert any("SLACK_USER_TOKEN_GRAVITATE" in line for line in payload["help"])
+
+
+def test_search_names_the_terms_the_corpus_has_never_seen(workspace, capsys, monkeypatch):
+    config, _ = workspace
+    _seeded_db(config.parent / "c.db").close()
+    monkeypatch.setattr(corpus_tool, "make_embedder", lambda vault=None: FakeEmbedder())
+
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(["search", "flag work Northwind", "--config", str(config),
+                          "--stale-ok", "--json"])
+    assert caught.value.code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] >= 1
+    assert any("Northwind" in line for line in payload["warnings"])
+
+
+def test_search_for_an_entirely_absent_topic_answers_definitively(workspace, capsys, monkeypatch):
+    config, _ = workspace
+    _seeded_db(config.parent / "c.db").close()
+    monkeypatch.setattr(corpus_tool, "make_embedder", lambda vault=None: FakeEmbedder())
+
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(["search", "the acquisition of Northwind Logistics",
+                          "--config", str(config), "--stale-ok", "--json"])
+    assert caught.value.code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 0
+    assert payload["results"] == []
+    assert "Northwind" in payload["note"]
+
+
+def test_a_fully_covered_query_carries_no_coverage_warning(workspace, capsys, monkeypatch):
+    config, _ = workspace
+    _seeded_db(config.parent / "c.db").close()
+    monkeypatch.setattr(corpus_tool, "make_embedder", lambda vault=None: FakeEmbedder())
+
+    with pytest.raises(SystemExit) as caught:
+        corpus_tool.main(["search", "flag work", "--config", str(config),
+                          "--stale-ok", "--json"])
+    assert caught.value.code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert not any("mention" in line for line in payload.get("warnings", []))

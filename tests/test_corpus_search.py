@@ -25,6 +25,7 @@ from sherpa.corpus.search import (
     conversation_with,
     search,
     sent_to,
+    term_coverage,
     thread_at,
 )
 
@@ -220,7 +221,10 @@ def test_hard_filter_finds_true_nearest_within_filter_not_global_topn(tmp_path):
     conn.execute("UPDATE chunks SET embedded = 1 WHERE id = ?", (allowed_chunk_id,))
     conn.commit()
 
-    query = "distinctive_query_term_not_in_corpus"
+    # "monday" is in the filtered chunk, so the query is not short-circuited by
+    # term coverage; BM25 still cannot answer it, because a two-term query
+    # needs both terms present. The vector channel is what has to find this.
+    query = "monday distinctive_query_term_not_in_corpus"
     embedder = ScriptedEmbedder({query: query_vector}, _vector_at_distance(0.05))
     hits = search(conn, query, embedder, filters=Filters(person="Hunter Reeves"), k=5)
     assert any("the real answer is monday" in hit.transcript for hit in hits)
@@ -309,16 +313,20 @@ def test_the_floor_sits_inside_the_measured_gap():
 def test_knn_only_hit_beyond_the_floor_is_dropped(floor_corpus):
     """No BM25 match, and the only vector candidate sits where a nonsense query
     landed in the real measurement: []."""
-    embedder = ScriptedEmbedder({"nothing_like_this_corpus": FLOOR_FAR}, FLOOR_ORIGIN)
-    assert search(floor_corpus, "nothing_like_this_corpus", embedder, filters=Filters(), k=5) == []
+    embedder = ScriptedEmbedder({"gardening nothing_like_this_corpus": FLOOR_FAR}, FLOOR_ORIGIN)
+    assert search(
+        floor_corpus, "gardening nothing_like_this_corpus", embedder, filters=Filters(), k=5
+    ) == []
 
 
 def test_knn_only_hit_within_the_floor_is_returned(floor_corpus):
     """No BM25 match, but the candidate is as far as the worst real match
     observed, so it must still count -- this is the half of the calibration
     that a too-aggressive floor breaks."""
-    embedder = ScriptedEmbedder({"nothing_like_this_corpus": FLOOR_NEAR}, FLOOR_ORIGIN)
-    hits = search(floor_corpus, "nothing_like_this_corpus", embedder, filters=Filters(), k=5)
+    embedder = ScriptedEmbedder({"gardening nothing_like_this_corpus": FLOOR_NEAR}, FLOOR_ORIGIN)
+    hits = search(
+        floor_corpus, "gardening nothing_like_this_corpus", embedder, filters=Filters(), k=5
+    )
     assert hits
 
 
@@ -596,11 +604,12 @@ def test_a_substantially_stronger_old_match_still_wins(corpus):
 def test_the_floor_is_configurable_per_corpus(floor_corpus):
     """The right value depends on the embedding model and the corpus, so it has
     to be tunable without a code change."""
-    embedder = ScriptedEmbedder({"nothing_like_this_corpus": FLOOR_FAR}, FLOOR_ORIGIN)
-    assert search(floor_corpus, "nothing_like_this_corpus", embedder, k=5) == []
+    embedder = ScriptedEmbedder({"gardening nothing_like_this_corpus": FLOOR_FAR}, FLOOR_ORIGIN)
+    query = "gardening nothing_like_this_corpus"
+    assert search(floor_corpus, query, embedder, k=5) == []
 
     hits = search(
-        floor_corpus, "nothing_like_this_corpus", embedder, k=5,
+        floor_corpus, query, embedder, k=5,
         knn_distance_floor=BEST_NONSENSE_MATCH + 0.01,
     )
     assert hits
@@ -659,6 +668,11 @@ def _candidate(conn, distance, *, chunk_id, text):
         (chunk_id, struct.pack(f"{EMBED_DIM}f", *_vector_at_distance(distance))),
     )
     conn.execute(
+        "INSERT INTO chunks_fts (rowid, chunk_id, header, text, participants)"
+        " VALUES (?, ?, 'DM between Jim Vogel and Hunter Davis', ?, 'Hunter Davis')",
+        (chunk_id, chunk_id, text),
+    )
+    conn.execute(
         "INSERT INTO messages (id, workspace, channel_id, channel_name, channel_kind, ts,"
         " author_id, author_name, is_me, text, permalink)"
         " VALUES (?, 'gravitate', 'real', 'Hunter Davis', 'im', 0, 'U', 'Hunter Davis', 0,"
@@ -690,8 +704,10 @@ def test_a_hit_indistinguishable_from_background_is_rejected_at_any_scale(
         tmp_path / "c.db", hit_distance=nonsense_distance,
         hit_text="womp womp", **scale
     )
-    embedder = ScriptedEmbedder({"wibble zorp frobnicate": FLOOR_ORIGIN}, FLOOR_ORIGIN)
-    assert search(conn, "wibble zorp frobnicate", embedder, k=5) == []
+    # One covered term ("womp"), so this measures the distance rule rather
+    # than the term-coverage short circuit, which has its own tests.
+    embedder = ScriptedEmbedder({"womp wibble zorp": FLOOR_ORIGIN}, FLOOR_ORIGIN)
+    assert search(conn, "womp wibble zorp", embedder, k=5) == []
 
 
 @pytest.mark.parametrize("scale,hit_distance", [(SMALL, 0.90), (LARGE, 0.85)])
@@ -700,6 +716,52 @@ def test_a_genuine_match_survives_at_any_scale(tmp_path, scale, hit_distance):
         tmp_path / "c.db", hit_distance=hit_distance,
         hit_text="the schema I promised on thursday", **scale
     )
-    embedder = ScriptedEmbedder({"schema promise": FLOOR_ORIGIN}, FLOOR_ORIGIN)
-    hits = search(conn, "schema promise", embedder, k=5)
+    embedder = ScriptedEmbedder({"schema promised": FLOOR_ORIGIN}, FLOOR_ORIGIN)
+    hits = search(conn, "schema promised", embedder, k=5)
     assert any("schema I promised" in hit.transcript for hit in hits)
+
+
+# --- "We have no record of this" is a different question from "nothing is close"
+#
+# Made-up words were the wrong test. A well-formed question about a topic the
+# corpus has never held -- "the acquisition of Northwind Logistics" -- returns
+# three confident transcripts, because business English is genuinely close to
+# business Slack in embedding space whether or not the topic exists. Embeddings
+# measure topical similarity, not factual presence, and no distance rule fixes
+# that. Term presence does, and it is a fact rather than a geometric guess:
+# Northwind 0, relocation 0, Berlin 0, against gravi 1036 and burner 882.
+
+def test_term_coverage_counts_each_substantive_term(corpus):
+    coverage = term_coverage(corpus, "the Northwind acquisition and the schema")
+    assert coverage.counts["schema"] > 0
+    assert coverage.counts["Northwind"] == 0
+    assert coverage.missing == ["Northwind", "acquisition"]
+
+
+def test_term_coverage_is_case_insensitive_and_ignores_stopwords(corpus):
+    coverage = term_coverage(corpus, "What about the SCHEMA")
+    assert list(coverage.counts) == ["SCHEMA"]
+    assert coverage.counts["SCHEMA"] > 0
+    assert coverage.missing == []
+
+
+def test_a_query_with_no_substantive_terms_makes_no_coverage_claim(corpus):
+    coverage = term_coverage(corpus, "what about the same")
+    assert coverage.counts == {}
+    assert not coverage.nothing_present
+
+
+def test_a_query_whose_every_term_is_absent_finds_nothing(corpus):
+    """Not "nothing is close enough" -- nothing is there at all."""
+    coverage = term_coverage(corpus, "Northwind Logistics acquisition")
+    assert coverage.nothing_present
+    assert search(corpus, "Northwind Logistics acquisition", FakeEmbedder(), k=5) == []
+
+
+def test_a_partially_covered_query_still_returns_results(corpus):
+    """"Tokyo" appearing 23 times while "relocation" appears zero is genuinely
+    ambiguous. The honest answer is results plus a caveat, not silence."""
+    coverage = term_coverage(corpus, "gravi cli relocation")
+    assert coverage.missing == ["relocation"]
+    assert not coverage.nothing_present
+    assert search(corpus, "gravi cli relocation", FakeEmbedder(), k=5)
