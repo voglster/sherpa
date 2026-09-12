@@ -10,8 +10,10 @@ distances are not on comparable scales; RRF is rank-only and sidesteps that.
 
 from __future__ import annotations
 
+import random
 import re
 import sqlite3
+import statistics
 import struct
 import time
 from dataclasses import dataclass
@@ -66,29 +68,50 @@ IN_CLAUSE_LIMIT = 900
 # match." Left alone, that means a query about something the corpus has never
 # discussed still comes back with confident-looking transcripts, and a
 # downstream agent reading them can confabulate a commitment that was never
-# made. So a KNN-only hit (one BM25 did not also surface) only counts if its
-# distance clears this floor; an exact-token BM25 hit is never subject to it.
+# made. So a KNN-only hit (one BM25 did not also surface) has to clear a bar;
+# an exact-token BM25 hit is never subject to it.
 #
-# CALIBRATION. L2 distance against `chunks_vec` (vec0's default metric), for
-# `nomic-embed-text` (768-dim) over a 277k-message corpus, 600 chunks sampled
-# per query:
+# THE BAR IS RELATIVE, because an absolute one cannot hold. The more chunks
+# there are, the closer the nearest neighbour of ANY query is, including a
+# meaningless one: 0.96 rejected nonsense at 44k chunks and admitted it at 72k,
+# the same way 1.2 admitted everything before that. Re-tuning the constant as
+# the corpus grows is a treadmill that ends with the guard doing nothing.
 #
-#   worst true match, over 5 real queries      0.948
-#   best nonsense match, over 3 nonsense ones  0.982
+# So each query is measured against its own background: sample a few hundred
+# random chunks, take the mean and spread of their distances from the query
+# vector, and accept a vector-only hit only if it is BACKGROUND_SIGMA standard
+# deviations below that mean. The question becomes "does this stand out from
+# noise for this query", which is scale-invariant by construction -- as the
+# corpus grows the background mean moves down and the bar moves with it.
 #
-# 0.96 sits inside that gap: it admits every true match observed and rejects
-# every nonsense query observed. The previous value of 1.2 was a guess, and the
-# measurement shows it sat above the noise floor entirely -- it admitted
-# everything, including pure nonsense, and never once did the job it exists for.
+# CALIBRATION. L2 distances against `chunks_vec` for `nomic-embed-text`
+# (768-dim), measured over a live 625k-message corpus, 600 random chunks
+# sampled per query:
 #
-# The margin is thin: 0.034, from eight queries. A legitimate weak semantic
-# match could plausibly exceed 0.96. That trade is deliberate -- BM25 handles
-# exact-token queries independently and bypasses this floor, so a missed weak
-# semantic match is recoverable by keyword while a confidently wrong answer is
-# not. If real searches start coming back empty when they should not, THIS IS
-# THE FIRST THING TO RAISE, and `knn_distance_floor` in corpus.toml raises it
-# without a code change. The value depends on the embedding model and the
-# corpus, so a different model needs a fresh measurement, not this number.
+#   background over random chunks    mean ~1.12, p1 ~0.96-1.05, p5 ~0.99-1.09
+#   nearest true match, real queries      0.867 - 0.948   (~3.4-5.1 sigma below)
+#   nearest match, nonsense queries       0.982 - 1.013   (~2.1-2.8 sigma below)
+#
+# 3.0 sigma sits inside that separation. The margin is real but not wide, and
+# it rests on the same eight queries the absolute number did -- what changed is
+# that the rule no longer decays as the corpus grows. If real searches start
+# coming back empty, lower BACKGROUND_SIGMA first.
+BACKGROUND_SIGMA = 3.0
+
+# Enough samples for a stable mean and spread, few enough to stay cheap: the
+# cost is 200 L2 distances in Python, about 25ms, and flat in corpus size.
+# Deleted ids simply drop out of the sample; MIN_BACKGROUND_SAMPLE covers the
+# case where too many do.
+BACKGROUND_SAMPLE = 200
+
+# Below this many usable samples the distribution means nothing, and on a
+# corpus that small a linear scan of it is the whole corpus anyway. The
+# absolute floor takes over -- it is the fallback, not the decider.
+MIN_BACKGROUND_SAMPLE = 30
+
+# Fallback bar, and the value `knn_distance_floor` in corpus.toml overrides.
+# Only consulted when the background sample is unusable (a new or tiny corpus,
+# or vectors so uniform they have no spread).
 KNN_DISTANCE_FLOOR = 0.96
 
 # A BM25 hit counts only if the chunk carries at least this many of the query's
@@ -280,6 +303,7 @@ def _knn_ranked(
     but a chunk only vector search surfaces must actually be close.
     """
     vector = embedder.embed([query])[0]
+    bar = _relevance_bar(conn, vector, floor)
 
     if not _filters_active(filters):
         packed = struct.pack(f"{len(vector)}f", *vector)
@@ -287,7 +311,7 @@ def _knn_ranked(
             "SELECT chunk_id, distance FROM chunks_vec WHERE embedding MATCH ? AND k = ? ORDER BY distance",
             [packed, CANDIDATES],
         ).fetchall()
-        return [row[0] for row in rows if row[1] <= floor][:CANDIDATES]
+        return [row[0] for row in rows if row[1] <= bar][:CANDIDATES]
 
     clause, params = _where(filters)
     allowed = [row[0] for row in conn.execute(f"SELECT c.id FROM chunks c WHERE {clause}", params).fetchall()]
@@ -295,7 +319,56 @@ def _knn_ranked(
         return []
 
     rows = _knn_within_allowed(conn, vector, allowed)
-    return [row[0] for row in rows if row[1] <= floor][:CANDIDATES]
+    return [row[0] for row in rows if row[1] <= bar][:CANDIDATES]
+
+
+def _relevance_bar(conn, vector: list[float], floor: float) -> float:
+    """How close a vector hit must be to count, for THIS query.
+
+    Sampled rather than assumed: the distances from this query to a few hundred
+    random chunks describe what an unrelated chunk looks like for it, and a
+    real match has to stand out from that. An absolute threshold answers a
+    different question -- "is this number small" -- whose meaning drifts as the
+    corpus grows and the nearest neighbour of everything gets closer.
+    """
+    # Random ids rather than `ORDER BY random()`, which scans the whole table
+    # and would put a cost that grows with the corpus on every query -- the
+    # same treadmill in a different place. Probing ids is index lookups, flat
+    # in corpus size. Ids that no longer exist simply drop out, which is what
+    # the oversampling covers.
+    top = conn.execute("SELECT max(id) FROM chunks").fetchone()[0] or 0
+    if top < MIN_BACKGROUND_SAMPLE:
+        return floor
+    sample = random.sample(range(1, top + 1), min(BACKGROUND_SAMPLE, top))
+    distances = [distance for _, distance in _distances_to(conn, vector, sample)]
+    if len(distances) < MIN_BACKGROUND_SAMPLE:
+        return floor
+
+    spread = statistics.pstdev(distances)
+    if spread <= 0:
+        return floor
+    return statistics.fmean(distances) - BACKGROUND_SIGMA * spread
+
+
+def _distances_to(conn, vector: list[float], chunk_ids: list[int]) -> list[tuple[int, float]]:
+    """L2 distance from `vector` to each stored embedding, by primary key."""
+    embeddings: dict[int, bytes] = {}
+    for start in range(0, len(chunk_ids), IN_CLAUSE_LIMIT):
+        batch = chunk_ids[start : start + IN_CLAUSE_LIMIT]
+        placeholders = ",".join("?" * len(batch))
+        for chunk_id, blob in conn.execute(
+            f"SELECT chunk_id, embedding FROM chunks_vec WHERE chunk_id IN ({placeholders})", batch
+        ):
+            embeddings[chunk_id] = blob
+
+    dim = len(vector)
+    scored = []
+    for chunk_id, blob in embeddings.items():
+        candidate = struct.unpack(f"{dim}f", blob)
+        scored.append(
+            (chunk_id, sum((a - b) ** 2 for a, b in zip(vector, candidate)) ** 0.5)
+        )
+    return scored
 
 
 def _knn_within_allowed(conn, vector: list[float], allowed: list[int]) -> list[tuple[int, float]]:
@@ -307,21 +380,7 @@ def _knn_within_allowed(conn, vector: list[float], allowed: list[int]) -> list[t
     in Python. See _knn_ranked's docstring for why sqlite-vec's own MATCH + IN
     form cannot be used for this instead.
     """
-    embeddings: dict[int, bytes] = {}
-    for start in range(0, len(allowed), IN_CLAUSE_LIMIT):
-        batch = allowed[start : start + IN_CLAUSE_LIMIT]
-        placeholders = ",".join("?" * len(batch))
-        for chunk_id, blob in conn.execute(
-            f"SELECT chunk_id, embedding FROM chunks_vec WHERE chunk_id IN ({placeholders})", batch
-        ):
-            embeddings[chunk_id] = blob
-
-    dim = len(vector)
-    scored = []
-    for chunk_id, blob in embeddings.items():
-        candidate = struct.unpack(f"{dim}f", blob)
-        distance = sum((a - b) ** 2 for a, b in zip(vector, candidate)) ** 0.5
-        scored.append((chunk_id, distance))
+    scored = _distances_to(conn, vector, allowed)
     scored.sort(key=lambda pair: pair[1])
     return scored[:CANDIDATES]
 

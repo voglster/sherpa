@@ -16,6 +16,7 @@ from sherpa.corpus.chunk import build_chunks
 from sherpa.corpus.db import EMBED_DIM, open_db
 from sherpa.corpus.embed import FakeEmbedder, embed_pending
 from sherpa.corpus.search import (
+    BACKGROUND_SAMPLE,
     Filters,
     _hydrate,
     _where,
@@ -342,7 +343,12 @@ def test_unfiltered_search_uses_native_knn_not_the_allowed_lookup(corpus):
     vector_statements = [s for s in statements if "chunks_vec" in s]
     assert vector_statements
     assert any("MATCH" in s for s in vector_statements)
-    assert all("IN (" not in s for s in vector_statements)
+    # The background sample fetches embeddings by primary key too, but it is
+    # bounded by BACKGROUND_SAMPLE -- what must not happen is an unbounded
+    # scan standing in for the ANN index.
+    for statement in vector_statements:
+        if "MATCH" not in statement:
+            assert statement.count("?") <= BACKGROUND_SAMPLE
 
 
 def test_filtered_search_uses_the_allowed_lookup_not_native_knn(corpus):
@@ -598,3 +604,102 @@ def test_the_floor_is_configurable_per_corpus(floor_corpus):
         knn_distance_floor=BEST_NONSENSE_MATCH + 0.01,
     )
     assert hits
+
+
+# --- The guard must not drift with corpus size -------------------------------
+#
+# An absolute distance floor gets weaker as the corpus grows: the more chunks
+# there are, the closer the nearest neighbour of ANY query is, including a
+# query with no meaning. Calibrated at 44k chunks it rejected nonsense; at 72k
+# the same nonsense came back with results. Re-tuning the constant is a
+# treadmill that ends where 1.2 ended -- a guard that quietly does nothing.
+#
+# These fixtures model what actually happens as a corpus grows: the background
+# distribution and the nearest nonsense match shift down together, so the
+# absolute floor is crossed while the shape of the distribution is unchanged.
+
+def _seed_background(conn, count, *, centre, spread, start_id=1000):
+    """`count` chunks whose distances from the origin spread around `centre`."""
+    rows, vectors = [], []
+    for index in range(count):
+        offset = ((index % 21) - 10) / 10.0 * spread
+        chunk_id = start_id + index
+        rows.append((chunk_id, f"bg{chunk_id}a", f"bg{chunk_id}b", f"hash{chunk_id}"))
+        vectors.append((chunk_id, struct.pack(f"{EMBED_DIM}f", *_vector_at_distance(centre + offset))))
+    conn.executemany(
+        "INSERT INTO chunks (id, workspace, channel_id, start_ts, end_ts, participants,"
+        " people, msg_first_id, msg_last_id, header, text, content_hash, embedded)"
+        " VALUES (?, 'gravitate', 'noise', 0, 0, 'Nobody', 'Nobody', ?, ?, 'h', 't', ?, 1)",
+        rows,
+    )
+    conn.executemany("INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, ?)", vectors)
+    # Background chunks hydrate like any other, or an admitted hit would be
+    # dropped for having no messages and the fixture would pass for the wrong
+    # reason.
+    conn.executemany(
+        "INSERT INTO messages (id, workspace, channel_id, channel_name, channel_kind, ts,"
+        " author_id, author_name, is_me, text, permalink)"
+        " VALUES (?, 'gravitate', 'noise', 'noise', 'public', 0, 'U', 'Or Zoarets', 0,"
+        " 'womp womp', 'https://x')",
+        [(row[1],) for row in rows],
+    )
+    conn.commit()
+
+
+def _candidate(conn, distance, *, chunk_id, text):
+    conn.execute(
+        "INSERT INTO chunks (id, workspace, channel_id, start_ts, end_ts, participants,"
+        " people, msg_first_id, msg_last_id, header, text, content_hash, embedded)"
+        " VALUES (?, 'gravitate', 'real', 0, 0, 'Hunter Davis', 'Hunter Davis', ?, ?,"
+        " 'DM between Jim Vogel and Hunter Davis', ?, ?, 1)",
+        (chunk_id, f"c{chunk_id}a", f"c{chunk_id}b", text, f"hash{chunk_id}"),
+    )
+    conn.execute(
+        "INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?, ?)",
+        (chunk_id, struct.pack(f"{EMBED_DIM}f", *_vector_at_distance(distance))),
+    )
+    conn.execute(
+        "INSERT INTO messages (id, workspace, channel_id, channel_name, channel_kind, ts,"
+        " author_id, author_name, is_me, text, permalink)"
+        " VALUES (?, 'gravitate', 'real', 'Hunter Davis', 'im', 0, 'U', 'Hunter Davis', 0,"
+        " ?, 'https://x')",
+        (f"c{chunk_id}a", text),
+    )
+    conn.commit()
+
+
+def _corpus_at_scale(path, *, chunks, centre, spread, hit_distance, hit_text):
+    conn = open_db(path)
+    _seed_background(conn, chunks, centre=centre, spread=spread)
+    _candidate(conn, hit_distance, chunk_id=7, text=hit_text)
+    return conn
+
+
+SMALL = dict(chunks=400, centre=1.12, spread=0.10)
+LARGE = dict(chunks=4000, centre=1.05, spread=0.10)
+
+
+@pytest.mark.parametrize("scale,nonsense_distance", [(SMALL, 0.99), (LARGE, 0.95)])
+def test_a_hit_indistinguishable_from_background_is_rejected_at_any_scale(
+    tmp_path, scale, nonsense_distance
+):
+    """At the larger scale the nonsense candidate sits BELOW the absolute floor
+    of 0.96 -- which is exactly how the old guard stopped working -- while
+    still being unremarkable against its own query's background."""
+    conn = _corpus_at_scale(
+        tmp_path / "c.db", hit_distance=nonsense_distance,
+        hit_text="womp womp", **scale
+    )
+    embedder = ScriptedEmbedder({"wibble zorp frobnicate": FLOOR_ORIGIN}, FLOOR_ORIGIN)
+    assert search(conn, "wibble zorp frobnicate", embedder, k=5) == []
+
+
+@pytest.mark.parametrize("scale,hit_distance", [(SMALL, 0.90), (LARGE, 0.85)])
+def test_a_genuine_match_survives_at_any_scale(tmp_path, scale, hit_distance):
+    conn = _corpus_at_scale(
+        tmp_path / "c.db", hit_distance=hit_distance,
+        hit_text="the schema I promised on thursday", **scale
+    )
+    embedder = ScriptedEmbedder({"schema promise": FLOOR_ORIGIN}, FLOOR_ORIGIN)
+    hits = search(conn, "schema promise", embedder, k=5)
+    assert any("schema I promised" in hit.transcript for hit in hits)
