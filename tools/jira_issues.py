@@ -964,6 +964,19 @@ def translate_jira_error(status_code: int, body: str, *, fallback: str) -> str:
     return fallback
 
 
+def _echo_remote_body(text: str) -> None:
+    """Echo a Jira response body to stderr, bounded.
+
+    `tool_run` hands a tool's stderr back to the calling model verbatim and
+    uncapped (`sherpa/server.py`), so an oversized or hostile body from
+    whatever host `JIRA_URL` happens to resolve to would land whole in that
+    model's context. The body is still worth showing — it is usually the only
+    detail Jira offers about a failure — so it is bounded rather than dropped.
+    """
+    body, note = truncate(text)
+    print(body + (note or ""), file=sys.stderr)
+
+
 def _assert_authenticated(client: httpx.Client) -> None:
     """Fail loudly when Jira is treating the caller as anonymous.
 
@@ -987,7 +1000,7 @@ def _assert_authenticated(client: httpx.Client) -> None:
         return
     if resp.status_code not in (401, 403):
         return
-    print(resp.text, file=sys.stderr)
+    _echo_remote_body(resp.text)
     fail(
         "not authenticated to Jira: this empty result is an auth failure, not an empty query",
         help=(
@@ -1024,7 +1037,7 @@ def _search_execute(client: httpx.Client, jql: str, max_results: int) -> tuple[l
         fail("could not reach Jira: network error", help="check network connectivity and JIRA_URL in the vault")
 
     if resp.status_code != 200:
-        print(resp.text, file=sys.stderr)
+        _echo_remote_body(resp.text)
         reason = translate_jira_error(resp.status_code, resp.text, fallback="search request failed")
         usage = resp.status_code in (400, 401, 403)
         help_text = (
