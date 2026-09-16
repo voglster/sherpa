@@ -373,3 +373,34 @@ def test_non_empty_page_never_pays_for_the_auth_probe():
     client = _FakeClient([_FakeResponse(200, {"issues": [ISSUE], "isLast": True})])
     jira_issues._search_execute(client, "project = KB", 20)
     assert client.get_calls == 0
+
+
+def test_oversized_auth_error_body_does_not_reach_the_caller_whole(capsys):
+    """stderr is handed to the calling model verbatim, so a remote body has to
+    be bounded before it gets there."""
+    client = _FakeClient([_FakeResponse(200, EMPTY_PAGE)],
+                         whoami=_FakeResponse(401, text="x" * 50_000))
+    with pytest.raises(SystemExit):
+        jira_issues._search_execute(client, "project = KB", 20)
+    err = capsys.readouterr().err
+    assert len(err) < 2_000
+    assert "truncated" in err
+
+
+def test_oversized_search_failure_body_is_bounded_too(capsys):
+    client = _FakeClient([_FakeResponse(500, text="y" * 50_000)])
+    with pytest.raises(SystemExit):
+        jira_issues._search_execute(client, "project = KB", 20)
+    err = capsys.readouterr().err
+    assert len(err) < 2_000
+    assert "truncated" in err
+
+
+def test_short_bodies_are_passed_through_unchanged(capsys):
+    client = _FakeClient([_FakeResponse(200, EMPTY_PAGE)],
+                         whoami=_FakeResponse(401, text="Client must be authenticated."))
+    with pytest.raises(SystemExit):
+        jira_issues._search_execute(client, "project = KB", 20)
+    err = capsys.readouterr().err
+    assert "Client must be authenticated." in err
+    assert "truncated" not in err
