@@ -8,6 +8,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import httpx
 import pytest
 
 _SPEC = importlib.util.spec_from_file_location(
@@ -74,14 +75,24 @@ class _FakeResponse:
 
 
 class _FakeClient:
-    def __init__(self, responses):
+    def __init__(self, responses, whoami=None):
         self._responses = list(responses)
+        self._whoami = whoami
         self.calls = 0
+        self.get_calls = 0
 
     def post(self, url, json=None):
         response = self._responses[self.calls]
         self.calls += 1
         return response
+
+    def get(self, url, params=None):
+        self.get_calls += 1
+        if isinstance(self._whoami, Exception):
+            raise self._whoami
+        if self._whoami is None:
+            raise AssertionError(f"unexpected GET {url}")
+        return self._whoami
 
 
 def test_isLast_true_reports_exact_total_without_a_second_call():
@@ -321,3 +332,44 @@ def test_validated_adf_refuses_an_invalid_document(monkeypatch, capsys):
 
     assert exit_info.value.code == 2
     assert "Foo" in capsys.readouterr().err
+
+
+AUTHED = _FakeResponse(200, {"emailAddress": "jane@example.com"})
+ANON = _FakeResponse(401, text="Client must be authenticated to access this resource.")
+EMPTY_PAGE = {"issues": [], "isLast": True}
+
+
+def test_unauthenticated_empty_page_fails_instead_of_reporting_zero_matches():
+    """Jira answers an anonymous search with 200 and an empty list. Reporting
+    that as a legitimately empty result is the bug this guards."""
+    client = _FakeClient([_FakeResponse(200, EMPTY_PAGE)], whoami=ANON)
+    with pytest.raises(SystemExit) as excinfo:
+        jira_issues._search_execute(client, "project = KB", 20)
+    assert excinfo.value.code == 2
+
+
+def test_authenticated_empty_page_is_still_a_real_empty_result():
+    client = _FakeClient([_FakeResponse(200, EMPTY_PAGE)], whoami=AUTHED)
+    issues, total, total_is_exact = jira_issues._search_execute(client, "project = KB", 20)
+    assert (issues, total, total_is_exact) == ([], 0, True)
+
+
+def test_forbidden_is_treated_as_an_auth_failure_too():
+    client = _FakeClient([_FakeResponse(200, EMPTY_PAGE)],
+                         whoami=_FakeResponse(403, text="Forbidden"))
+    with pytest.raises(SystemExit):
+        jira_issues._search_execute(client, "project = KB", 20)
+
+
+def test_unreachable_auth_probe_does_not_fail_a_legitimate_empty_result():
+    """A probe that cannot complete must not turn an empty search into an error."""
+    client = _FakeClient([_FakeResponse(200, EMPTY_PAGE)],
+                         whoami=httpx.ConnectError("boom"))
+    issues, total, _ = jira_issues._search_execute(client, "project = KB", 20)
+    assert (issues, total) == ([], 0)
+
+
+def test_non_empty_page_never_pays_for_the_auth_probe():
+    client = _FakeClient([_FakeResponse(200, {"issues": [ISSUE], "isLast": True})])
+    jira_issues._search_execute(client, "project = KB", 20)
+    assert client.get_calls == 0

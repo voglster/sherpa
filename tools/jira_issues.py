@@ -964,6 +964,41 @@ def translate_jira_error(status_code: int, body: str, *, fallback: str) -> str:
     return fallback
 
 
+def _assert_authenticated(client: httpx.Client) -> None:
+    """Fail loudly when Jira is treating the caller as anonymous.
+
+    `/rest/api/3/search/jql` answers an unauthenticated request with
+    `200 {"issues": [], "isLast": true}` — at the call site, indistinguishable
+    from a well-formed query that genuinely matched nothing. Reporting that as
+    "0 issues matched" tells the caller those issues do not exist when the
+    truth is that the credentials were rejected, and the accompanying hint
+    ("broaden the JQL") sends them in exactly the wrong direction. So an empty
+    page is confirmed against `/rest/api/3/myself`, which does answer an
+    anonymous request with 401, before it is believed.
+
+    The probe runs only when a page comes back empty, so an ordinary search
+    costs nothing. A probe that cannot complete — network error, non-JSON body
+    — must never turn a legitimately empty result into a failure, so it
+    degrades to silence rather than propagating.
+    """
+    try:
+        resp = client.get("/rest/api/3/myself")
+    except httpx.HTTPError:
+        return
+    if resp.status_code not in (401, 403):
+        return
+    print(resp.text, file=sys.stderr)
+    fail(
+        "not authenticated to Jira: this empty result is an auth failure, not an empty query",
+        help=(
+            "check JIRA_USERNAME and JIRA_API_TOKEN in the vault; a token that is "
+            "expired, revoked, or issued for a site other than JIRA_URL is rejected "
+            "without an error on the search endpoint"
+        ),
+        usage=True,
+    )
+
+
 def _search_execute(client: httpx.Client, jql: str, max_results: int) -> tuple[list[dict], int, bool]:
     """Fetch a page of issues, the query's total, and whether that total is exact.
 
@@ -1001,6 +1036,9 @@ def _search_execute(client: httpx.Client, jql: str, max_results: int) -> tuple[l
 
     data = resp.json()
     issues = data.get("issues", [])
+
+    if not issues:
+        _assert_authenticated(client)
 
     if data.get("isLast", False):
         return issues, len(issues), True
