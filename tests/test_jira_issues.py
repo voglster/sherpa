@@ -404,3 +404,79 @@ def test_short_bodies_are_passed_through_unchanged(capsys):
     err = capsys.readouterr().err
     assert "Client must be authenticated." in err
     assert "truncated" not in err
+
+
+# ---------------------------------------------------------------------------
+# /user/search degrades the same way /search/jql does: 200 [] when the caller
+# is anonymous, which reads as "no such user" rather than "token rejected".
+# ---------------------------------------------------------------------------
+
+
+class _FakeUserClient:
+    """Context-manager client for the _resolve_account_id path."""
+
+    def __init__(self, users, whoami=None):
+        self._users = users
+        self._whoami = whoami
+        self.myself_calls = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url, params=None):
+        if url.endswith("/rest/api/3/myself"):
+            self.myself_calls += 1
+            if self._whoami is None:
+                raise AssertionError("unexpected auth probe")
+            return self._whoami
+        assert url.endswith("/rest/api/3/user/search")
+        return _FakeResponse(200, self._users)
+
+
+def _no_cache(monkeypatch):
+    monkeypatch.setattr(jira_issues, "_load_user_cache", lambda: {})
+    monkeypatch.setattr(jira_issues, "_save_user_cache", lambda cache: None)
+
+
+def test_empty_user_list_from_an_unauthenticated_client_fails_as_auth(monkeypatch, capsys):
+    _no_cache(monkeypatch)
+    client = _FakeUserClient([], whoami=ANON)
+    monkeypatch.setattr(jira_issues, "_client", lambda: client)
+    with pytest.raises(SystemExit) as excinfo:
+        jira_issues._resolve_account_id("jane")
+    assert excinfo.value.code == 2
+    assert "not authenticated" in capsys.readouterr().out
+
+
+def test_empty_user_list_while_authenticated_still_reports_no_users(monkeypatch, capsys):
+    _no_cache(monkeypatch)
+    client = _FakeUserClient([], whoami=AUTHED)
+    monkeypatch.setattr(jira_issues, "_client", lambda: client)
+    with pytest.raises(SystemExit) as excinfo:
+        jira_issues._resolve_account_id("ghost")
+    assert excinfo.value.code == 2
+    assert "No users found" in capsys.readouterr().err
+
+
+def test_a_matched_user_never_pays_for_the_auth_probe(monkeypatch):
+    _no_cache(monkeypatch)
+    client = _FakeUserClient([{"accountId": "a1", "displayName": "Jane", "emailAddress": "j@x.com"}])
+    monkeypatch.setattr(jira_issues, "_client", lambda: client)
+    assert jira_issues._resolve_account_id("jane") == "a1"
+    assert client.myself_calls == 0
+
+
+def test_multiple_matches_still_ask_the_caller_to_refine(monkeypatch, capsys):
+    _no_cache(monkeypatch)
+    client = _FakeUserClient([
+        {"accountId": "a1", "displayName": "Jane Doe", "emailAddress": "jane@x.com"},
+        {"accountId": "a2", "displayName": "Jane Roe", "emailAddress": "janer@x.com"},
+    ])
+    monkeypatch.setattr(jira_issues, "_client", lambda: client)
+    with pytest.raises(SystemExit):
+        jira_issues._resolve_account_id("jane")
+    assert "Multiple users match" in capsys.readouterr().err
+    assert client.myself_calls == 0

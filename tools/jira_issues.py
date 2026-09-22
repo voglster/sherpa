@@ -865,6 +865,11 @@ def _resolve_account_id(query: str) -> str:
             print(f"Failed to search users: {resp.status_code} {resp.text}", file=sys.stderr)
             sys.exit(2)
         users = resp.json()
+        if not users:
+            # `/user/search` is the other endpoint that answers an
+            # unauthenticated request with an empty 200, so "no such user" and
+            # "the token was rejected" arrive here looking identical.
+            _assert_authenticated(client, misread_as="an unknown user")
 
     if not users:
         print(f"No users found for '{query}'", file=sys.stderr)
@@ -977,11 +982,12 @@ def _echo_remote_body(text: str) -> None:
     print(body + (note or ""), file=sys.stderr)
 
 
-def _assert_authenticated(client: httpx.Client) -> None:
+def _assert_authenticated(client: httpx.Client, *, misread_as: str = "an empty query") -> None:
     """Fail loudly when Jira is treating the caller as anonymous.
 
     `/rest/api/3/search/jql` answers an unauthenticated request with
-    `200 {"issues": [], "isLast": true}` — at the call site, indistinguishable
+    `200 {"issues": [], "isLast": true}`, and `/rest/api/3/user/search` with
+    `200 []` — at the call site, both are indistinguishable
     from a well-formed query that genuinely matched nothing. Reporting that as
     "0 issues matched" tells the caller those issues do not exist when the
     truth is that the credentials were rejected, and the accompanying hint
@@ -1002,11 +1008,11 @@ def _assert_authenticated(client: httpx.Client) -> None:
         return
     _echo_remote_body(resp.text)
     fail(
-        "not authenticated to Jira: this empty result is an auth failure, not an empty query",
+        f"not authenticated to Jira: this empty result is an auth failure, not {misread_as}",
         help=(
             "check JIRA_USERNAME and JIRA_API_TOKEN in the vault; a token that is "
-            "expired, revoked, or issued for a site other than JIRA_URL is rejected "
-            "without an error on the search endpoint"
+            "expired, revoked, or issued for a site other than JIRA_URL comes back "
+            "as an empty 200 rather than an error"
         ),
         usage=True,
     )
