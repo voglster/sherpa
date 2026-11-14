@@ -122,9 +122,10 @@ REAL_TOOLS = sorted((_ROOT / "tools").glob("*.py"))
 #   notify  — takes the message as its first positional, so it has no subcommand to
 #             put in argv[0], and argv[0] may not be a placeholder.
 #   reindex — takes no arguments at all, so there is likewise no subcommand.
+#   piper   — like notify, the message is the first positional; no subcommand.
 #
 # Anything else missing `operations` is a gap, and fails here.
-UNDECLARABLE = {"fleet", "notify", "reindex"}
+UNDECLARABLE = {"fleet", "notify", "piper", "reindex"}
 
 
 @pytest.mark.parametrize("script", REAL_TOOLS, ids=lambda p: p.stem)
